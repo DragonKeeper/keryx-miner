@@ -242,9 +242,26 @@ async fn main() -> Result<(), Error> {
     };
 
     // Phase-3 OPoI: load inference models before mining starts.
-    // By default both TinyLlama and DeepSeek-R1-8B are loaded.
-    // Pass --light to run TinyLlama only (limited disk / bandwidth).
-    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.light {
+    //   (no flag)    → TinyLlama + DeepSeek-R1-8B  [default]
+    //   --light      → TinyLlama only
+    //   --high       → TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B
+    //   --very-high  → all 4 models
+    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_high {
+        info!("--very-high mode: loading all 4 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + LLaMA-70B).");
+        &[
+            &keryx_miner::models::TINYLLAMA,
+            &keryx_miner::models::DEEPSEEK_R1_8B,
+            &keryx_miner::models::DEEPSEEK_R1_32B,
+            &keryx_miner::models::LLAMA_3_3_70B,
+        ]
+    } else if opt.high {
+        info!("--high mode: loading TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B.");
+        &[
+            &keryx_miner::models::TINYLLAMA,
+            &keryx_miner::models::DEEPSEEK_R1_8B,
+            &keryx_miner::models::DEEPSEEK_R1_32B,
+        ]
+    } else if opt.light {
         info!("--light mode: loading TinyLlama only.");
         &[&keryx_miner::models::TINYLLAMA]
     } else {

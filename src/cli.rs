@@ -4,7 +4,7 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance CPU miner", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: TinyLlama + DeepSeek-8B — RTX 3060 12GB / 3070 / 3080):\n  --light      RTX 3060 6GB or any GPU\n  (default)    RTX 3060 12GB / 3070 / 3080\n  --high       RTX 3090 / 4090 / 5090 (24GB+)\n  --very-high  RTX 5090 (32GB+)", term_width = 0)]
 pub struct Opt {
     #[clap(short, long, help = "Enable debug logging level")]
     pub debug: bool,
@@ -59,9 +59,24 @@ pub struct Opt {
 
     #[clap(
         long = "light",
-        help = "Run TinyLlama only — skips DeepSeek-R1-8B download (for miners with limited disk or bandwidth)"
+        help = "Model tier: TinyLlama only — RTX 3060 6GB or any GPU",
+        conflicts_with_all = &["high", "very_high"]
     )]
     pub light: bool,
+
+    #[clap(
+        long = "high",
+        help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B — RTX 3090 / 4090 / 5090 (24GB+)",
+        conflicts_with_all = &["light", "very_high"]
+    )]
+    pub high: bool,
+
+    #[clap(
+        long = "very-high",
+        help = "Model tier: all 4 models + LLaMA-3.3-70B — RTX 5090 (32GB+)",
+        conflicts_with_all = &["light", "high"]
+    )]
+    pub very_high: bool,
 
     #[clap(
         long = "ipfs-url",
