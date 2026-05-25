@@ -7,8 +7,10 @@
 pub enum ModelFormat {
     /// Full-precision safetensors (one or more shards).
     Safetensors,
-    /// GGUF quantized (single file, tokenizer loaded separately).
+    /// GGUF quantized — LLaMA/LLaMA3 architecture.
     Gguf,
+    /// GGUF quantized — Qwen2 architecture (DeepSeek-R1-32B distill).
+    GgufQwen2,
 }
 
 #[derive(Clone)]
@@ -58,7 +60,39 @@ pub const DEEPSEEK_R1_8B: ModelSpec = ModelSpec {
     dir_name: "DeepSeek-R1-8B",
 };
 
-pub const REGISTRY: &[&ModelSpec] = &[&TINYLLAMA, &DEEPSEEK_R1_8B];
+pub const DEEPSEEK_R1_32B: ModelSpec = ModelSpec {
+    name: "deepseek-r1-32b",
+    // sha2-256(model.gguf)
+    model_id: [
+        0xbe, 0xd9, 0xb0, 0xf5, 0x51, 0xf5, 0xb9, 0x5b,
+        0xf9, 0xda, 0x58, 0x88, 0xa4, 0x8f, 0x0f, 0x87,
+        0xc3, 0x7a, 0xd6, 0xb7, 0x25, 0x19, 0xc4, 0xcb,
+        0xd7, 0x75, 0xf5, 0x4a, 0xc0, 0xb9, 0xfc, 0x62,
+    ],
+    format: ModelFormat::GgufQwen2,
+    tokenizer_cid: "Qmf3uZwnuxZUhDbhup8Q51soVMRmNxohYctG9wZemNEPHm",
+    config_cid: "",
+    weight_cids: &["QmSrmkEoJUPf7r9t4o79F5APycnGrRu2icaU3KKPdFVUk7"],
+    dir_name: "DeepSeek-R1-32B",
+};
+
+pub const LLAMA_3_3_70B: ModelSpec = ModelSpec {
+    name: "llama-3.3-70b",
+    // sha2-256(model.gguf)
+    model_id: [
+        0xaa, 0xd2, 0xcf, 0x33, 0x48, 0xd8, 0xc7, 0xfd,
+        0xbd, 0x2c, 0x0d, 0xd5, 0x8e, 0x0d, 0x99, 0x36,
+        0x84, 0x50, 0xd4, 0x3c, 0x95, 0x84, 0xae, 0xf8,
+        0x1a, 0x46, 0x7d, 0xd3, 0x47, 0x56, 0x13, 0x44,
+    ],
+    format: ModelFormat::Gguf,
+    tokenizer_cid: "QmPd7WQvoQupfzpPVnVVc1Zra5SH4jKnGqNrdTHFtdQuvd",
+    config_cid: "",
+    weight_cids: &["QmbRQJFZ9NuZQW9uXezANTwunnwJCKybHiCFnVQ7D4SZKb"],
+    dir_name: "Llama-3.3-70B",
+};
+
+pub const REGISTRY: &[&ModelSpec] = &[&TINYLLAMA, &DEEPSEEK_R1_8B, &DEEPSEEK_R1_32B, &LLAMA_3_3_70B];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
     REGISTRY.iter().copied().find(|m| m.name == name)

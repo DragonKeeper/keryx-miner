@@ -9,6 +9,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::llama::{Cache, Config, LlamaConfig, Llama};
 use candle_transformers::models::quantized_llama::ModelWeights;
+use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use std::io::{Read, Write};
 use std::sync::OnceLock;
 use tokenizers::Tokenizer;
@@ -27,6 +28,13 @@ const SYSTEM_PROMPT_DEEPSEEK: &str =
      You have no internet access — answer from training knowledge only. \
      Always identify yourself as a Keryx Network AI. Be concise: 3-5 sentences max.";
 
+const SYSTEM_PROMPT_LLAMA70B: &str =
+    "You are a high-capability AI assistant running inside the Keryx decentralized network. \
+     Keryx is a BlockDAG protocol where GPU miners execute AI inference as proof-of-work. \
+     Results are published on-chain and secured via OPoI (Optimistic Proof of Inference). \
+     You have no internet access — answer from training knowledge only. \
+     Always identify yourself as a Keryx Network AI. Be thorough but concise.";
+
 // ── Static engine pool ───────────────────────────────────────────────────────
 
 static ENGINES: OnceLock<Result<Vec<SlmEngine>, String>> = OnceLock::new();
@@ -34,6 +42,7 @@ static ENGINES: OnceLock<Result<Vec<SlmEngine>, String>> = OnceLock::new();
 enum ModelInner {
     Full { model: Llama, config: Config, cache_dtype: DType },
     Quantized(ModelWeights),
+    QuantizedQwen2(Qwen2Weights),
 }
 
 struct SlmEngine {
@@ -183,6 +192,25 @@ fn load_engine(spec: &'static ModelSpec) -> Result<SlmEngine> {
                 tokenizer, device, eos_token_id,
             })
         }
+        ModelFormat::GgufQwen2 => {
+            let (tok_path, gguf_path) = ensure_gguf(spec)?;
+            let tokenizer = Tokenizer::from_file(&tok_path)
+                .map_err(|e| anyhow!("load tokenizer: {}", e))?;
+            let mut gguf_file = std::fs::File::open(&gguf_path)
+                .with_context(|| format!("open {}", gguf_path.display()))?;
+            let content = gguf_file::Content::read(&mut gguf_file)
+                .map_err(|e| anyhow!("read gguf: {}", e))?;
+            let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
+                .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
+            // Qwen2 / DeepSeek-R1-32B uses <|im_end|> as EOS (token 151645)
+            let eos_token_id = tokenizer.token_to_id("<|im_end|>").unwrap_or(151645);
+            log::info!("SlmEngine: '{}' ready (eos_id={})", spec.name, eos_token_id);
+            Ok(SlmEngine {
+                model_id: spec.model_id, name: spec.name,
+                inner: ModelInner::QuantizedQwen2(model),
+                tokenizer, device, eos_token_id,
+            })
+        }
     }
 }
 
@@ -190,14 +218,27 @@ fn load_engine(spec: &'static ModelSpec) -> Result<SlmEngine> {
 
 fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
     match engine.name {
-        // LLaMA-3-based models (DeepSeek-R1-Distill-Llama-8B)
+        // LLaMA-3-based models (DeepSeek-R1-Distill-Llama-8B, Llama-3.3-70B)
         "deepseek-r1-8b" => format!(
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
              <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
              <|start_header_id|>assistant<|end_header_id|>\n\n",
             SYSTEM_PROMPT_DEEPSEEK, prompt
         ),
-        // Zephyr/TinyLlama chat template — short prompt to avoid regurgitation
+        "llama-3.3-70b" => format!(
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
+             <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
+             <|start_header_id|>assistant<|end_header_id|>\n\n",
+            SYSTEM_PROMPT_LLAMA70B, prompt
+        ),
+        // Qwen2-based models (DeepSeek-R1-Distill-Qwen-32B)
+        "deepseek-r1-32b" => format!(
+            "<|im_start|>system\n{}<|im_end|>\n\
+             <|im_start|>user\n{}<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n",
+            SYSTEM_PROMPT_DEEPSEEK, prompt
+        ),
+        // Zephyr/TinyLlama chat template
         _ => format!(
             "<|system|>\n{}</s>\n<|user|>\n{}</s>\n<|assistant|>\n",
             SYSTEM_PROMPT_TINYLLAMA, prompt
@@ -212,7 +253,11 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
     let mut all_tokens: Vec<u32> = enc.get_ids().to_vec();
     let mut generated: Vec<u32> = Vec::new();
     let mut lp = LogitsProcessor::new(42, Some(0.7), Some(0.9));
-    let model_max = match engine.name { "deepseek-r1-8b" => 1024, _ => 2048 };
+    let model_max = match engine.name {
+        "deepseek-r1-8b" | "deepseek-r1-32b" => 1024,
+        "llama-3.3-70b" => 512,
+        _ => 2048,
+    };
     let max_steps = max_new_tokens.min(model_max);
 
     match &mut engine.inner {
@@ -238,6 +283,25 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
             }
         }
         ModelInner::Quantized(model) => {
+            for step in 0..max_steps {
+                let (input_ids, pos) = if step == 0 {
+                    (all_tokens.as_slice(), 0usize)
+                } else {
+                    let last = all_tokens.len() - 1;
+                    (&all_tokens[last..], last)
+                };
+                let input = Tensor::new(input_ids, &engine.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| anyhow!("input tensor: {}", e))?;
+                let logits = model.forward(&input, pos)
+                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let next = sample_next(&logits, &mut lp)?;
+                if next == engine.eos_token_id { break; }
+                all_tokens.push(next);
+                generated.push(next);
+            }
+        }
+        ModelInner::QuantizedQwen2(model) => {
             for step in 0..max_steps {
                 let (input_ids, pos) = if step == 0 {
                     (all_tokens.as_slice(), 0usize)
