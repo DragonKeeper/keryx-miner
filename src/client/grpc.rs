@@ -296,7 +296,7 @@ impl KeryxdHandler {
             info!("OPoI: spawning SLM inference (max_tokens={})", max_tokens);
             let (tx_done, rx_done) = oneshot::channel::<String>();
             tokio::task::spawn_blocking(move || {
-                let result = keryx_miner::slm::run_inference(&model_id, &prompt, max_tokens)
+                let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens)
                     .unwrap_or_else(|| "[no engine for model]".to_string());
                 let _ = tx_done.send(result);
             });
@@ -411,6 +411,11 @@ impl KeryxdHandler {
                     self.scan_txs_for_ai_requests(&block.transactions.clone());
                 }
                 self.try_start_inference();
+                // Pause GPU mining while inference is in flight (GPU is occupied by the model).
+                if self.inference_rx.is_some() {
+                    miner.process_block(None).await?;
+                    return Ok(());
+                }
                 match (template.block, template.is_synced, template.error) {
                     (Some(b), true, None) => miner.process_block(Some(FullBlock(Box::new(b)))).await?,
                     (Some(b), false, None) if self.mine_when_not_synced => {

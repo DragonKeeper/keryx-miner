@@ -1,7 +1,7 @@
 /// Phase-3 OPoI: multi-model inference engine (safetensors + GGUF) via candle.
 ///
-/// All models selected at startup are loaded once via `load_all_blocking()`.
-/// Inference requests are routed by model_id. Only one inference runs at a time.
+/// Models are loaded on demand when an AiRequest arrives and cached between
+/// consecutive requests for the same model. Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_core::quantized::gguf_file;
@@ -11,7 +11,7 @@ use candle_transformers::models::llama::{Cache, Config, LlamaConfig, Llama};
 use candle_transformers::models::quantized_llama::ModelWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use std::io::{Read, Write};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tokenizers::Tokenizer;
 
 use crate::models::{ModelFormat, ModelSpec};
@@ -35,9 +35,10 @@ const SYSTEM_PROMPT_LLAMA70B: &str =
      You have no internet access — answer from training knowledge only. \
      Always identify yourself as a Keryx Network AI. Be thorough but concise.";
 
-// ── Static engine pool ───────────────────────────────────────────────────────
+// ── Static engine state ──────────────────────────────────────────────────────
 
-static ENGINES: OnceLock<Result<Vec<SlmEngine>, String>> = OnceLock::new();
+static SUPPORTED_SPECS: OnceLock<&'static [&'static ModelSpec]> = OnceLock::new();
+static ENGINE: Mutex<Option<SlmEngine>> = Mutex::new(None);
 
 enum ModelInner {
     Full { model: Llama, config: Config, cache_dtype: DType },
@@ -145,9 +146,8 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 
 // ── Engine loading ───────────────────────────────────────────────────────────
 
-fn load_engine(spec: &'static ModelSpec) -> Result<SlmEngine> {
+fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
     log::info!("SlmEngine: loading '{}'…", spec.name);
-    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
 
     match spec.format {
         ModelFormat::Safetensors => {
@@ -340,44 +340,47 @@ fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor) -> Result<u32> {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Load all selected models (blocking). Must be called before mining starts.
-pub fn load_all_blocking(specs: &'static [&'static ModelSpec]) -> Result<(), String> {
-    let result = ENGINES.get_or_init(|| {
-        let mut engines = Vec::new();
-        for spec in specs {
-            match load_engine(spec) {
-                Ok(e) => engines.push(e),
-                Err(e) => return Err(format!("failed to load '{}': {}", spec.name, e)),
-            }
-        }
-        Ok(engines)
-    });
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e.clone()),
-    }
+/// Register the set of models this miner supports. Called once at startup.
+pub fn init_supported(specs: &'static [&'static ModelSpec]) {
+    let _ = SUPPORTED_SPECS.set(specs);
 }
 
-/// Return the model_ids of all loaded engines.
+/// Return the model_ids of all supported models (used for coinbase capability announcement).
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
-    ENGINES.get()
-        .and_then(|r| r.as_ref().ok())
-        .map(|engines| engines.iter().map(|e| e.model_id).collect())
+    SUPPORTED_SPECS.get()
+        .map(|specs| specs.iter().map(|s| s.model_id).collect())
         .unwrap_or_default()
 }
 
-/// Run inference for a specific model_id (blocking — call from `spawn_blocking`).
-pub fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
-    // Safety: engines are loaded once and never mutated after; generate takes &mut
-    // for the quantized KV cache which is logically single-threaded here.
-    let engines = ENGINES.get()?.as_ref().ok()?;
-    let engine = engines.iter().find(|e| &e.model_id == model_id)?;
+/// Load the requested model on demand (evicting a cached different model if needed),
+/// then run inference. Blocking — call from `spawn_blocking`.
+pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
+    let specs = SUPPORTED_SPECS.get()?;
+    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
 
-    // SAFETY: only one inference runs at a time (enforced by inference_rx in grpc.rs).
-    #[allow(invalid_reference_casting)]
-    let engine_mut = unsafe { &mut *(engine as *const SlmEngine as *mut SlmEngine) };
+    let mut guard = ENGINE.lock().expect("ENGINE mutex poisoned");
 
-    match generate(engine_mut, prompt, max_tokens) {
+    let needs_load = guard.as_ref().map_or(true, |e| &e.model_id != model_id);
+    if needs_load {
+        if let Some(ref old) = *guard {
+            log::info!("SlmEngine: evicting '{}' to load '{}'", old.name, spec.name);
+        }
+        *guard = None;
+        let device = match Device::new_cuda(0) {
+            Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
+            Err(e) => { log::error!("SlmEngine: CUDA unavailable ({}) — CPU fallback", e); Device::Cpu }
+        };
+        match load_engine(spec, device) {
+            Ok(e) => { *guard = Some(e); }
+            Err(e) => {
+                log::error!("SlmEngine: failed to load '{}': {}", spec.name, e);
+                return None;
+            }
+        }
+    }
+
+    let engine = guard.as_mut()?;
+    match generate(engine, prompt, max_tokens) {
         Ok(text) if !text.is_empty() => Some(text),
         Ok(_) => Some("[empty response]".to_string()),
         Err(e) => {

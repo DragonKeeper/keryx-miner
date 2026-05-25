@@ -344,18 +344,8 @@ async fn main() -> Result<(), Error> {
     } else {
         &[&keryx_miner::models::TINYLLAMA, &keryx_miner::models::DEEPSEEK_R1_8B]
     };
-    info!("Loading {} inference model(s) — this may take a few minutes on first run…", specs.len());
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::load_all_blocking(specs)).await {
-        Ok(Ok(())) => info!("All models ready — OPoI Phase-3 active."),
-        Ok(Err(e)) => {
-            error!("Failed to load inference models: {}", e);
-            return Err(e.into());
-        }
-        Err(e) => {
-            error!("Model load thread panicked: {}", e);
-            return Err(format!("model load panicked: {}", e).into());
-        }
-    }
+    keryx_miner::slm::init_supported(specs);
+    info!("OPoI Phase-3 active — {} model(s) supported, loaded on demand when a request arrives.", specs.len());
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);
     if worker_count == 0 && opt.num_threads.unwrap_or(0) == 0 {
