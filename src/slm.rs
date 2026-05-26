@@ -22,17 +22,19 @@ const SYSTEM_PROMPT_TINYLLAMA: &str =
      No internet access. Be concise.";
 
 const SYSTEM_PROMPT_DEEPSEEK: &str =
-    "You are an AI assistant running inside the Keryx decentralized network. \
-     Keryx is a BlockDAG protocol where GPU miners execute AI inference as proof-of-work. \
-     Results are published on-chain and secured via OPoI (Optimistic Proof of Inference). \
+    "You are a Keryx Network AI — a decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
+     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
      You have no internet access — answer from training knowledge only. \
-     Always identify yourself as a Keryx Network AI. Be concise: 3-5 sentences max.";
+     CRITICAL: Never mention DeepSeek, Anthropic, OpenAI, or any AI company. \
+     Never reveal your underlying model name. \
+     Always identify yourself as a Keryx Network AI. Be concise.";
 
 const SYSTEM_PROMPT_LLAMA70B: &str =
-    "You are a high-capability AI assistant running inside the Keryx decentralized network. \
-     Keryx is a BlockDAG protocol where GPU miners execute AI inference as proof-of-work. \
-     Results are published on-chain and secured via OPoI (Optimistic Proof of Inference). \
+    "You are a Keryx Network AI — a high-capability decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
+     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
      You have no internet access — answer from training knowledge only. \
+     CRITICAL: Never mention Meta, Llama, OpenAI, Anthropic, or any AI company. \
+     Never reveal your underlying model name. \
      Always identify yourself as a Keryx Network AI. Be thorough but concise.";
 
 // ── Static engine state ──────────────────────────────────────────────────────
@@ -52,7 +54,13 @@ struct SlmEngine {
     inner: ModelInner,
     tokenizer: Tokenizer,
     device: Device,
-    eos_token_id: u32,
+    /// All token IDs that terminate generation (EOS, EOT, role-start tokens, etc.).
+    stop_token_ids: Vec<u32>,
+    /// Literal stop strings — safety net for tokenizers that emit control markers
+    /// as plain text (e.g. a GGUF whose tokenizer.json lacks the ChatML special
+    /// tokens) so the matching `stop_token_ids` are never produced. Generation is
+    /// cut at the earliest occurrence of any of these in the decoded output.
+    stop_strings: Vec<&'static str>,
 }
 
 unsafe impl Send for SlmEngine {}
@@ -146,6 +154,65 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 
 // ── Engine loading ───────────────────────────────────────────────────────────
 
+/// Build the list of stop token IDs for a model.
+///
+/// Tries `token_to_id` for each name first; falls back to the corresponding
+/// hardcoded ID so generation always terminates even if the tokenizer exposes
+/// special tokens differently (e.g. via `added_tokens` vs the regular vocab).
+fn collect_stop_ids(tokenizer: &Tokenizer, names: &[&str], fallbacks: &[u32]) -> Vec<u32> {
+    let mut ids: Vec<u32> = names.iter().zip(fallbacks.iter())
+        .map(|(name, &fallback)| tokenizer.token_to_id(name).unwrap_or(fallback))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Per-model terminating tokens and literal stop strings, keyed by model name so
+/// it stays coherent with `format_prompt`. Two models can share a `ModelFormat`
+/// (DeepSeek-R1-8B and LLaMA-3.3-70B are both LLaMA-arch GGUF) yet need different
+/// stop conventions, so this branches on name rather than format.
+fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str>) {
+    match name {
+        // DeepSeek-R1-Distill-Llama-8B — DeepSeek chat template:
+        //   128001 = <｜end▁of▁sentence｜> (real EOS), 128011 = <｜User｜> (new turn),
+        //   128009 = <|eot_id|> (LLaMA-3 EOT, kept as a fallback).
+        "deepseek-r1-8b" => (
+            collect_stop_ids(tokenizer,
+                &["<｜end▁of▁sentence｜>", "<｜User｜>", "<|eot_id|>"],
+                &[128001, 128011, 128009]),
+            vec!["<｜end▁of▁sentence｜>", "<｜User｜>", "<|eot_id|>", "<|end_of_text|>"],
+        ),
+        // DeepSeek-R1-Distill-Qwen-32B — DeepSeek chat template (NOT ChatML):
+        //   151643 = <｜end▁of▁sentence｜> (real EOS), 151644 = <｜User｜> (new turn).
+        //   (151645 is <｜Assistant｜>, NOT an end token — must not stop on it.)
+        "deepseek-r1-32b" => (
+            collect_stop_ids(tokenizer,
+                &["<｜end▁of▁sentence｜>", "<｜User｜>"],
+                &[151643, 151644]),
+            // ASCII ChatML markers kept as an extra net if the model parrots them.
+            vec!["<｜end▁of▁sentence｜>", "<｜User｜>", "<|im_end|>", "<|im_start|>"],
+        ),
+        // Genuine LLaMA-3.3-70B-Instruct — LLaMA-3 header template. The DeepSeek
+        // full-width markers do NOT exist in this vocab, so stop on the real
+        // LLaMA-3 terminators (the official `eos_token_id` set for 3.3 Instruct):
+        //   128009 = <|eot_id|> (end of turn), 128001 = <|end_of_text|> (base EOS),
+        //   128008 = <|eom_id|> (end of message, tool turns).
+        "llama-3.3-70b" => (
+            collect_stop_ids(tokenizer,
+                &["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"],
+                &[128009, 128001, 128008]),
+            // Cut if the model tries to open a fresh turn instead of stopping.
+            vec!["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"],
+        ),
+        // TinyLlama / Zephyr: </s> ends a turn; 0 = padding safety net.
+        _ => (
+            collect_stop_ids(tokenizer, &["</s>"], &[2, 0]),
+            vec!["</s>", "<|user|>", "<|system|>", "<|assistant|>"],
+        ),
+    }
+}
+
 fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
     log::info!("SlmEngine: loading '{}'…", spec.name);
 
@@ -163,12 +230,12 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 VarBuilder::from_mmaped_safetensors(&wt_refs, DType::F32, &device)
             }.map_err(|e| anyhow!("mmap weights: {}", e))?;
             let model = Llama::load(vb, &config).map_err(|e| anyhow!("build model: {}", e))?;
-            let eos_token_id = tokenizer.token_to_id("</s>").unwrap_or(2);
-            log::info!("SlmEngine: '{}' ready", spec.name);
+            let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
+            log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
                 model_id: spec.model_id, name: spec.name,
                 inner: ModelInner::Full { model, config, cache_dtype: DType::F32 },
-                tokenizer, device, eos_token_id,
+                tokenizer, device, stop_token_ids, stop_strings,
             })
         }
         ModelFormat::Gguf => {
@@ -181,15 +248,12 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
             let model = ModelWeights::from_gguf(content, &mut gguf_file, &device)
                 .map_err(|e| anyhow!("load gguf weights: {}", e))?;
-            // LLaMA 3 / DeepSeek-R1 uses <|eot_id|> as EOS
-            let eos_token_id = tokenizer.token_to_id("<|eot_id|>")
-                .or_else(|| tokenizer.token_to_id("</s>"))
-                .unwrap_or(128009);
-            log::info!("SlmEngine: '{}' ready (eos_id={})", spec.name, eos_token_id);
+            let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
+            log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
                 model_id: spec.model_id, name: spec.name,
                 inner: ModelInner::Quantized(model),
-                tokenizer, device, eos_token_id,
+                tokenizer, device, stop_token_ids, stop_strings,
             })
         }
         ModelFormat::GgufQwen2 => {
@@ -202,13 +266,12 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
             let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
                 .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
-            // Qwen2 / DeepSeek-R1-32B uses <|im_end|> as EOS (token 151645)
-            let eos_token_id = tokenizer.token_to_id("<|im_end|>").unwrap_or(151645);
-            log::info!("SlmEngine: '{}' ready (eos_id={})", spec.name, eos_token_id);
+            let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
+            log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
                 model_id: spec.model_id, name: spec.name,
                 inner: ModelInner::QuantizedQwen2(model),
-                tokenizer, device, eos_token_id,
+                tokenizer, device, stop_token_ids, stop_strings,
             })
         }
     }
@@ -218,11 +281,18 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
 
 fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
     match engine.name {
-        // LLaMA-3-based models (DeepSeek-R1-Distill-Llama-8B, Llama-3.3-70B)
+        // DeepSeek-R1-Distill-Qwen-32B — DeepSeek chat template.
+        // The 32B respects the system prompt, so plain think priming is enough.
+        "deepseek-r1-32b" => format!(
+            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜><think>\n",
+            SYSTEM_PROMPT_DEEPSEEK, prompt
+        ),
+        // DeepSeek-R1-Distill-Llama-8B — same template but the 8B ignores system
+        // prompts about identity due to RLHF. Inject an identity statement at the
+        // start of the think block so the model reasons from the correct framing
+        // before generating the visible answer.
         "deepseek-r1-8b" => format!(
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
-             <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
-             <|start_header_id|>assistant<|end_header_id|>\n\n",
+            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜><think>\nI am Keryx Network AI, a decentralized assistant. I must never claim to be DeepSeek or any other AI product.\n",
             SYSTEM_PROMPT_DEEPSEEK, prompt
         ),
         "llama-3.3-70b" => format!(
@@ -230,13 +300,6 @@ fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
              <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
              <|start_header_id|>assistant<|end_header_id|>\n\n",
             SYSTEM_PROMPT_LLAMA70B, prompt
-        ),
-        // Qwen2-based models (DeepSeek-R1-Distill-Qwen-32B)
-        "deepseek-r1-32b" => format!(
-            "<|im_start|>system\n{}<|im_end|>\n\
-             <|im_start|>user\n{}<|im_end|>\n\
-             <|im_start|>assistant\n<think>\n",
-            SYSTEM_PROMPT_DEEPSEEK, prompt
         ),
         // Zephyr/TinyLlama chat template
         _ => format!(
@@ -252,19 +315,54 @@ fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
 const REPEAT_PENALTY: f32 = 1.15;
 const REPEAT_LAST_N: usize = 64;
 
+/// True if any stop string appears in the decoded tail of `generated`.
+/// Only the last few tokens are decoded — enough to catch a marker that just
+/// completed — keeping the per-step cost O(1) instead of re-decoding everything.
+fn hit_stop_string(tokenizer: &Tokenizer, generated: &[u32], stops: &[&str]) -> bool {
+    if stops.is_empty() || generated.is_empty() {
+        return false;
+    }
+    let start = generated.len().saturating_sub(24);
+    match tokenizer.decode(&generated[start..], true) {
+        Ok(tail) => stops.iter().any(|s| tail.contains(s)),
+        Err(_) => false,
+    }
+}
+
+/// Strip the `<think>…</think>` reasoning block emitted by DeepSeek-R1 models.
+///
+/// The prompt primes the assistant turn with `<think>` already open, so the
+/// generated text begins inside the block: `reasoning…\n</think>\nfinal answer`.
+/// Returns the trimmed final answer, or an empty string if `</think>` was never
+/// emitted (max_tokens exhausted during reasoning — no final answer produced).
+fn strip_think_block(text: &str) -> String {
+    match text.find("</think>") {
+        Some(end) => text[end + "</think>".len()..].trim().to_string(),
+        None => String::new(),
+    }
+}
+
 fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Result<String> {
     let formatted = format_prompt(engine, prompt);
+    // Detect whether the assistant turn was primed with <think> (R1 models).
+    // Uses contains() to handle both plain priming and think-injected variants.
+    let is_think_primed = formatted.contains("<｜Assistant｜><think>");
     let enc = engine.tokenizer.encode(formatted.as_str(), true)
         .map_err(|e| anyhow!("encode: {}", e))?;
     let mut all_tokens: Vec<u32> = enc.get_ids().to_vec();
     let mut generated: Vec<u32> = Vec::new();
     let mut lp = LogitsProcessor::new(42, Some(0.7), Some(0.9));
     let model_max = match engine.name {
-        "deepseek-r1-8b" | "deepseek-r1-32b" => 1024,
-        "llama-3.3-70b" => 512,
+        "deepseek-r1-8b" => 1024,
+        "deepseek-r1-32b" => 2048,
+        "llama-3.3-70b" => 1024,
         _ => 2048,
     };
-    let max_steps = max_new_tokens.min(model_max);
+    // R1 models spend tokens on chain-of-thought before the visible answer.
+    // Reserve extra budget so the think block never eats the entire quota and
+    // leaves no room for </think> + the actual response.
+    let think_overhead = if is_think_primed { 512usize } else { 0 };
+    let max_steps = max_new_tokens.saturating_add(think_overhead).min(model_max);
 
     match &mut engine.inner {
         ModelInner::Full { model, config, cache_dtype } => {
@@ -283,9 +381,10 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let logits = model.forward(&input, pos, &mut cache)
                     .map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if next == engine.eos_token_id { break; }
+                if engine.stop_token_ids.contains(&next) { break; }
                 all_tokens.push(next);
                 generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
             }
         }
         ModelInner::Quantized(model) => {
@@ -302,9 +401,10 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let logits = model.forward(&input, pos)
                     .map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if next == engine.eos_token_id { break; }
+                if engine.stop_token_ids.contains(&next) { break; }
                 all_tokens.push(next);
                 generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
             }
         }
         ModelInner::QuantizedQwen2(model) => {
@@ -321,16 +421,27 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 let logits = model.forward(&input, pos)
                     .map_err(|e| anyhow!("forward: {}", e))?;
                 let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if next == engine.eos_token_id { break; }
+                if engine.stop_token_ids.contains(&next) { break; }
                 all_tokens.push(next);
                 generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
             }
         }
     }
 
-    engine.tokenizer.decode(&generated, true)
-        .map(|s| s.trim().to_string())
-        .map_err(|e| anyhow!("decode: {}", e))
+    let text = engine.tokenizer.decode(&generated, true)
+        .map_err(|e| anyhow!("decode: {}", e))?;
+    // Truncate at the earliest stop string in case a control marker leaked into
+    // the output (tokenizer that renders special tokens as plain text).
+    let cut = engine.stop_strings.iter()
+        .filter_map(|s| text.find(s))
+        .min()
+        .unwrap_or(text.len());
+    let answer = text[..cut].trim();
+    // For R1 models, strip the <think>…</think> reasoning preamble so only the
+    // final answer is published. Empty string = think block was cut by max_tokens
+    // (no final answer produced) — the caller should not upload this to IPFS.
+    Ok(if is_think_primed { strip_think_block(answer) } else { answer.to_string() })
 }
 
 fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor, context: &[u32]) -> Result<u32> {
@@ -397,7 +508,11 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     let engine = guard.as_mut()?;
     match generate(engine, prompt, max_tokens) {
         Ok(text) if !text.is_empty() => Some(text),
-        Ok(_) => Some("[empty response]".to_string()),
+        Ok(_) => {
+            // Empty = R1 think block was cut by max_tokens — skip IPFS upload.
+            log::warn!("SlmEngine '{}': think block cut by max_tokens, skipping response", engine.name);
+            None
+        }
         Err(e) => {
             log::warn!("SlmEngine '{}' generate error: {}", engine.name, e);
             Some(format!("[inference error: {}]", e))
