@@ -25,6 +25,7 @@ use crate::target::Uint256;
 mod cli;
 mod client;
 mod escrow;
+mod ipfs;
 mod keryxd_messages;
 mod miner;
 mod pow;
@@ -69,6 +70,60 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
     }
 }
 
+/// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
+///
+/// VRAM requirements (GGUF weights only, not counting CUDA workspace):
+///   TinyLlama-1.1B  →  ~1.5 GB
+///   DeepSeek-R1-8B  →  ~5 GB
+///   DeepSeek-R1-32B → ~19 GB   (requires ≥24 GB card)
+///   LLaMA-3.3-70B   → ~28 GB   (requires ≥40 GB card — does NOT fit on RTX 3090)
+///
+/// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
+fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=power.limit,power.max_limit,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+
+    let (current_w, vram_mb) = match output {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let mut parts = s.trim().split(',');
+            let cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
+            let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
+            let vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            (cur as u32, vram)
+        }
+        _ => return,
+    };
+
+    // VRAM check for 70B: 28 GB weights + ~2.5 GB KV cache → requires ≥32 GB card (RTX 5090+).
+    // On 24 GB cards (RTX 3090 / 4090), loading will OOM and crash the miner.
+    if needs_very_high && vram_mb < 30_000 {
+        log::error!(
+            "✗  LLaMA-3.3-70B requires ≥32 GB VRAM (RTX 5090 or equivalent) — \
+             this GPU has only {} MB ({} GB).",
+            vram_mb,
+            vram_mb / 1024
+        );
+        log::error!(
+            "   Use --high (DeepSeek-R1-32B, fits in 24 GB) or --light (TinyLlama only)."
+        );
+        // Non-fatal: let candle fail with its own OOM so the miner logs the actual error.
+    }
+
+    let model_label = if needs_very_high {
+        "LLaMA-3.3-70B (--very-high)"
+    } else if needs_high {
+        "DeepSeek-R1-32B (--high)"
+    } else {
+        "DeepSeek-R1-8B (default)"
+    };
+    log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
+}
+
 async fn get_client(
     keryxd_address: String,
     mining_address: String,
@@ -76,6 +131,7 @@ async fn get_client(
     block_template_ctr: Arc<AtomicU16>,
     escrow_privkey: Option<String>,
     escrow_state_file: String,
+    ipfs_url: String,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
         let (_schema, address) = keryxd_address.split_once("://").unwrap();
@@ -94,6 +150,7 @@ async fn get_client(
             Some(block_template_ctr.clone()),
             escrow_privkey,
             escrow_state_file,
+            ipfs_url,
         )
         .await?)
     } else {
@@ -107,6 +164,9 @@ async fn client_main(
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
 ) -> Result<(), Error> {
+    let ipfs_url = opt.ipfs_url.clone();
+    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
+
     let mut client = get_client(
         opt.keryxd_address.clone(),
         opt.mining_address.clone().unwrap_or_default(),
@@ -114,6 +174,7 @@ async fn client_main(
         block_template_ctr.clone(),
         escrow_privkey,
         opt.escrow_state_file.clone(),
+        opt.ipfs_url.clone(),
     )
     .await?;
 
@@ -203,6 +264,7 @@ async fn main() -> Result<(), Error> {
                 orphan_slashed: false,
                 orphan_retries: 0,
                 orphan_retry_after_daa: None,
+                is_inference: false,
             })
             .collect();
 
@@ -234,26 +296,38 @@ async fn main() -> Result<(), Error> {
     };
 
     // Phase-3 OPoI: load inference models before mining starts.
-    // By default both TinyLlama and DeepSeek-R1-8B are loaded.
-    // Pass --light to run TinyLlama only (limited disk / bandwidth).
-    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.light {
+    //   (no flag)    → TinyLlama + DeepSeek-R1-8B  [default]
+    //   --light      → TinyLlama only
+    //   --high       → TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B
+    //   --very-high  → all 4 models
+
+    // Warn if GPU power limit is below safe threshold for the selected model tier.
+    // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
+    check_gpu_power_limit(opt.high || opt.very_high, opt.very_high);
+
+    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_high {
+        info!("--very-high mode: loading all 4 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + LLaMA-70B).");
+        &[
+            &keryx_miner::models::TINYLLAMA,
+            &keryx_miner::models::DEEPSEEK_R1_8B,
+            &keryx_miner::models::DEEPSEEK_R1_32B,
+            &keryx_miner::models::LLAMA_3_3_70B,
+        ]
+    } else if opt.high {
+        info!("--high mode: loading TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B.");
+        &[
+            &keryx_miner::models::TINYLLAMA,
+            &keryx_miner::models::DEEPSEEK_R1_8B,
+            &keryx_miner::models::DEEPSEEK_R1_32B,
+        ]
+    } else if opt.light {
         info!("--light mode: loading TinyLlama only.");
         &[&keryx_miner::models::TINYLLAMA]
     } else {
         &[&keryx_miner::models::TINYLLAMA, &keryx_miner::models::DEEPSEEK_R1_8B]
     };
-    info!("Loading {} inference model(s) — this may take a few minutes on first run…", specs.len());
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::load_all_blocking(specs)).await {
-        Ok(Ok(())) => info!("All models ready — OPoI Phase-3 active."),
-        Ok(Err(e)) => {
-            error!("Failed to load inference models: {}", e);
-            return Err(e.into());
-        }
-        Err(e) => {
-            error!("Model load thread panicked: {}", e);
-            return Err(format!("model load panicked: {}", e).into());
-        }
-    }
+    keryx_miner::slm::init_supported(specs);
+    info!("OPoI Phase-3 active — {} model(s) supported, loaded on demand when a request arrives.", specs.len());
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);
     if worker_count == 0 && opt.num_threads.unwrap_or(0) == 0 {

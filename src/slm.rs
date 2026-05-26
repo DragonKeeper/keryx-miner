@@ -1,7 +1,7 @@
 /// Phase-3 OPoI: multi-model inference engine (safetensors + GGUF) via candle.
 ///
-/// All models selected at startup are loaded once via `load_all_blocking()`.
-/// Inference requests are routed by model_id. Only one inference runs at a time.
+/// Models are loaded on demand when an AiRequest arrives and cached between
+/// consecutive requests for the same model. Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_core::quantized::gguf_file;
@@ -9,24 +9,43 @@ use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::llama::{Cache, Config, LlamaConfig, Llama};
 use candle_transformers::models::quantized_llama::ModelWeights;
+use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use std::io::{Read, Write};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tokenizers::Tokenizer;
 
 use crate::models::{ModelFormat, ModelSpec};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
-const SYSTEM_PROMPT: &str =
-    "You are a concise AI assistant embedded in the Keryx blockchain network. \
-     Reply in 1-3 sentences maximum.";
+const SYSTEM_PROMPT_TINYLLAMA: &str =
+    "You are a Keryx Network AI — a decentralized assistant running on GPU miners. \
+     No internet access. Be concise.";
 
-// ── Static engine pool ───────────────────────────────────────────────────────
+const SYSTEM_PROMPT_DEEPSEEK: &str =
+    "You are a Keryx Network AI — a decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
+     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
+     You have no internet access — answer from training knowledge only. \
+     CRITICAL: Never mention DeepSeek, Anthropic, OpenAI, or any AI company. \
+     Never reveal your underlying model name. \
+     Always identify yourself as a Keryx Network AI. Be concise.";
 
-static ENGINES: OnceLock<Result<Vec<SlmEngine>, String>> = OnceLock::new();
+const SYSTEM_PROMPT_LLAMA70B: &str =
+    "You are a Keryx Network AI — a high-capability decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
+     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
+     You have no internet access — answer from training knowledge only. \
+     CRITICAL: Never mention Meta, Llama, OpenAI, Anthropic, or any AI company. \
+     Never reveal your underlying model name. \
+     Always identify yourself as a Keryx Network AI. Be thorough but concise.";
+
+// ── Static engine state ──────────────────────────────────────────────────────
+
+static SUPPORTED_SPECS: OnceLock<&'static [&'static ModelSpec]> = OnceLock::new();
+static ENGINE: Mutex<Option<SlmEngine>> = Mutex::new(None);
 
 enum ModelInner {
     Full { model: Llama, config: Config, cache_dtype: DType },
     Quantized(ModelWeights),
+    QuantizedQwen2(Qwen2Weights),
 }
 
 struct SlmEngine {
@@ -35,7 +54,13 @@ struct SlmEngine {
     inner: ModelInner,
     tokenizer: Tokenizer,
     device: Device,
-    eos_token_id: u32,
+    /// All token IDs that terminate generation (EOS, EOT, role-start tokens, etc.).
+    stop_token_ids: Vec<u32>,
+    /// Literal stop strings — safety net for tokenizers that emit control markers
+    /// as plain text (e.g. a GGUF whose tokenizer.json lacks the ChatML special
+    /// tokens) so the matching `stop_token_ids` are never produced. Generation is
+    /// cut at the earliest occurrence of any of these in the decoded output.
+    stop_strings: Vec<&'static str>,
 }
 
 unsafe impl Send for SlmEngine {}
@@ -129,9 +154,67 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 
 // ── Engine loading ───────────────────────────────────────────────────────────
 
-fn load_engine(spec: &'static ModelSpec) -> Result<SlmEngine> {
+/// Build the list of stop token IDs for a model.
+///
+/// Tries `token_to_id` for each name first; falls back to the corresponding
+/// hardcoded ID so generation always terminates even if the tokenizer exposes
+/// special tokens differently (e.g. via `added_tokens` vs the regular vocab).
+fn collect_stop_ids(tokenizer: &Tokenizer, names: &[&str], fallbacks: &[u32]) -> Vec<u32> {
+    let mut ids: Vec<u32> = names.iter().zip(fallbacks.iter())
+        .map(|(name, &fallback)| tokenizer.token_to_id(name).unwrap_or(fallback))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Per-model terminating tokens and literal stop strings, keyed by model name so
+/// it stays coherent with `format_prompt`. Two models can share a `ModelFormat`
+/// (DeepSeek-R1-8B and LLaMA-3.3-70B are both LLaMA-arch GGUF) yet need different
+/// stop conventions, so this branches on name rather than format.
+fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str>) {
+    match name {
+        // DeepSeek-R1-Distill-Llama-8B — DeepSeek chat template:
+        //   128001 = <｜end▁of▁sentence｜> (real EOS), 128011 = <｜User｜> (new turn),
+        //   128009 = <|eot_id|> (LLaMA-3 EOT, kept as a fallback).
+        "deepseek-r1-8b" => (
+            collect_stop_ids(tokenizer,
+                &["<｜end▁of▁sentence｜>", "<｜User｜>", "<|eot_id|>"],
+                &[128001, 128011, 128009]),
+            vec!["<｜end▁of▁sentence｜>", "<｜User｜>", "<|eot_id|>", "<|end_of_text|>"],
+        ),
+        // DeepSeek-R1-Distill-Qwen-32B — DeepSeek chat template (NOT ChatML):
+        //   151643 = <｜end▁of▁sentence｜> (real EOS), 151644 = <｜User｜> (new turn).
+        //   (151645 is <｜Assistant｜>, NOT an end token — must not stop on it.)
+        "deepseek-r1-32b" => (
+            collect_stop_ids(tokenizer,
+                &["<｜end▁of▁sentence｜>", "<｜User｜>"],
+                &[151643, 151644]),
+            // ASCII ChatML markers kept as an extra net if the model parrots them.
+            vec!["<｜end▁of▁sentence｜>", "<｜User｜>", "<|im_end|>", "<|im_start|>"],
+        ),
+        // Genuine LLaMA-3.3-70B-Instruct — LLaMA-3 header template. The DeepSeek
+        // full-width markers do NOT exist in this vocab, so stop on the real
+        // LLaMA-3 terminators (the official `eos_token_id` set for 3.3 Instruct):
+        //   128009 = <|eot_id|> (end of turn), 128001 = <|end_of_text|> (base EOS),
+        //   128008 = <|eom_id|> (end of message, tool turns).
+        "llama-3.3-70b" => (
+            collect_stop_ids(tokenizer,
+                &["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"],
+                &[128009, 128001, 128008]),
+            // Cut if the model tries to open a fresh turn instead of stopping.
+            vec!["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"],
+        ),
+        // TinyLlama / Zephyr: </s> ends a turn; 0 = padding safety net.
+        _ => (
+            collect_stop_ids(tokenizer, &["</s>"], &[2, 0]),
+            vec!["</s>", "<|user|>", "<|system|>", "<|assistant|>"],
+        ),
+    }
+}
+
+fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
     log::info!("SlmEngine: loading '{}'…", spec.name);
-    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
 
     match spec.format {
         ModelFormat::Safetensors => {
@@ -147,12 +230,12 @@ fn load_engine(spec: &'static ModelSpec) -> Result<SlmEngine> {
                 VarBuilder::from_mmaped_safetensors(&wt_refs, DType::F32, &device)
             }.map_err(|e| anyhow!("mmap weights: {}", e))?;
             let model = Llama::load(vb, &config).map_err(|e| anyhow!("build model: {}", e))?;
-            let eos_token_id = tokenizer.token_to_id("</s>").unwrap_or(2);
-            log::info!("SlmEngine: '{}' ready", spec.name);
+            let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
+            log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
                 model_id: spec.model_id, name: spec.name,
                 inner: ModelInner::Full { model, config, cache_dtype: DType::F32 },
-                tokenizer, device, eos_token_id,
+                tokenizer, device, stop_token_ids, stop_strings,
             })
         }
         ModelFormat::Gguf => {
@@ -165,15 +248,30 @@ fn load_engine(spec: &'static ModelSpec) -> Result<SlmEngine> {
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
             let model = ModelWeights::from_gguf(content, &mut gguf_file, &device)
                 .map_err(|e| anyhow!("load gguf weights: {}", e))?;
-            // LLaMA 3 / DeepSeek-R1 uses <|eot_id|> as EOS
-            let eos_token_id = tokenizer.token_to_id("<|eot_id|>")
-                .or_else(|| tokenizer.token_to_id("</s>"))
-                .unwrap_or(128009);
-            log::info!("SlmEngine: '{}' ready (eos_id={})", spec.name, eos_token_id);
+            let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
+            log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
                 model_id: spec.model_id, name: spec.name,
                 inner: ModelInner::Quantized(model),
-                tokenizer, device, eos_token_id,
+                tokenizer, device, stop_token_ids, stop_strings,
+            })
+        }
+        ModelFormat::GgufQwen2 => {
+            let (tok_path, gguf_path) = ensure_gguf(spec)?;
+            let tokenizer = Tokenizer::from_file(&tok_path)
+                .map_err(|e| anyhow!("load tokenizer: {}", e))?;
+            let mut gguf_file = std::fs::File::open(&gguf_path)
+                .with_context(|| format!("open {}", gguf_path.display()))?;
+            let content = gguf_file::Content::read(&mut gguf_file)
+                .map_err(|e| anyhow!("read gguf: {}", e))?;
+            let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
+                .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
+            let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
+            log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
+            Ok(SlmEngine {
+                model_id: spec.model_id, name: spec.name,
+                inner: ModelInner::QuantizedQwen2(model),
+                tokenizer, device, stop_token_ids, stop_strings,
             })
         }
     }
@@ -183,29 +281,88 @@ fn load_engine(spec: &'static ModelSpec) -> Result<SlmEngine> {
 
 fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
     match engine.name {
-        // LLaMA-3-based models (DeepSeek-R1-Distill-Llama-8B)
+        // DeepSeek-R1-Distill-Qwen-32B — DeepSeek chat template.
+        // The 32B respects the system prompt, so plain think priming is enough.
+        "deepseek-r1-32b" => format!(
+            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜><think>\n",
+            SYSTEM_PROMPT_DEEPSEEK, prompt
+        ),
+        // DeepSeek-R1-Distill-Llama-8B — same template but the 8B ignores system
+        // prompts about identity due to RLHF. Inject an identity statement at the
+        // start of the think block so the model reasons from the correct framing
+        // before generating the visible answer.
         "deepseek-r1-8b" => format!(
+            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜><think>\nI am Keryx Network AI, a decentralized assistant. I must never claim to be DeepSeek or any other AI product.\n",
+            SYSTEM_PROMPT_DEEPSEEK, prompt
+        ),
+        "llama-3.3-70b" => format!(
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
              <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
              <|start_header_id|>assistant<|end_header_id|>\n\n",
-            SYSTEM_PROMPT, prompt
+            SYSTEM_PROMPT_LLAMA70B, prompt
         ),
         // Zephyr/TinyLlama chat template
         _ => format!(
             "<|system|>\n{}</s>\n<|user|>\n{}</s>\n<|assistant|>\n",
-            SYSTEM_PROMPT, prompt
+            SYSTEM_PROMPT_TINYLLAMA, prompt
         ),
+    }
+}
+
+/// Repetition penalty applied over a recent token window before sampling.
+/// Breaks degenerate loops where the model repeats a phrase instead of emitting EOS
+/// (common on distilled R1 models). 1.0 = disabled.
+const REPEAT_PENALTY: f32 = 1.15;
+const REPEAT_LAST_N: usize = 64;
+
+/// True if any stop string appears in the decoded tail of `generated`.
+/// Only the last few tokens are decoded — enough to catch a marker that just
+/// completed — keeping the per-step cost O(1) instead of re-decoding everything.
+fn hit_stop_string(tokenizer: &Tokenizer, generated: &[u32], stops: &[&str]) -> bool {
+    if stops.is_empty() || generated.is_empty() {
+        return false;
+    }
+    let start = generated.len().saturating_sub(24);
+    match tokenizer.decode(&generated[start..], true) {
+        Ok(tail) => stops.iter().any(|s| tail.contains(s)),
+        Err(_) => false,
+    }
+}
+
+/// Strip the `<think>…</think>` reasoning block emitted by DeepSeek-R1 models.
+///
+/// The prompt primes the assistant turn with `<think>` already open, so the
+/// generated text begins inside the block: `reasoning…\n</think>\nfinal answer`.
+/// Returns the trimmed final answer, or an empty string if `</think>` was never
+/// emitted (max_tokens exhausted during reasoning — no final answer produced).
+fn strip_think_block(text: &str) -> String {
+    match text.find("</think>") {
+        Some(end) => text[end + "</think>".len()..].trim().to_string(),
+        None => String::new(),
     }
 }
 
 fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Result<String> {
     let formatted = format_prompt(engine, prompt);
+    // Detect whether the assistant turn was primed with <think> (R1 models).
+    // Uses contains() to handle both plain priming and think-injected variants.
+    let is_think_primed = formatted.contains("<｜Assistant｜><think>");
     let enc = engine.tokenizer.encode(formatted.as_str(), true)
         .map_err(|e| anyhow!("encode: {}", e))?;
     let mut all_tokens: Vec<u32> = enc.get_ids().to_vec();
     let mut generated: Vec<u32> = Vec::new();
     let mut lp = LogitsProcessor::new(42, Some(0.7), Some(0.9));
-    let max_steps = max_new_tokens.min(512);
+    let model_max = match engine.name {
+        "deepseek-r1-8b" => 1024,
+        "deepseek-r1-32b" => 2048,
+        "llama-3.3-70b" => 1024,
+        _ => 2048,
+    };
+    // R1 models spend tokens on chain-of-thought before the visible answer.
+    // Reserve extra budget so the think block never eats the entire quota and
+    // leaves no room for </think> + the actual response.
+    let think_overhead = if is_think_primed { 512usize } else { 0 };
+    let max_steps = max_new_tokens.saturating_add(think_overhead).min(model_max);
 
     match &mut engine.inner {
         ModelInner::Full { model, config, cache_dtype } => {
@@ -223,10 +380,11 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
                 let logits = model.forward(&input, pos, &mut cache)
                     .map_err(|e| anyhow!("forward: {}", e))?;
-                let next = sample_next(&logits, &mut lp)?;
-                if next == engine.eos_token_id { break; }
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
+                if engine.stop_token_ids.contains(&next) { break; }
                 all_tokens.push(next);
                 generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
             }
         }
         ModelInner::Quantized(model) => {
@@ -242,20 +400,51 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                     .map_err(|e| anyhow!("input tensor: {}", e))?;
                 let logits = model.forward(&input, pos)
                     .map_err(|e| anyhow!("forward: {}", e))?;
-                let next = sample_next(&logits, &mut lp)?;
-                if next == engine.eos_token_id { break; }
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
+                if engine.stop_token_ids.contains(&next) { break; }
                 all_tokens.push(next);
                 generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+            }
+        }
+        ModelInner::QuantizedQwen2(model) => {
+            for step in 0..max_steps {
+                let (input_ids, pos) = if step == 0 {
+                    (all_tokens.as_slice(), 0usize)
+                } else {
+                    let last = all_tokens.len() - 1;
+                    (&all_tokens[last..], last)
+                };
+                let input = Tensor::new(input_ids, &engine.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| anyhow!("input tensor: {}", e))?;
+                let logits = model.forward(&input, pos)
+                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
+                if engine.stop_token_ids.contains(&next) { break; }
+                all_tokens.push(next);
+                generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
             }
         }
     }
 
-    engine.tokenizer.decode(&generated, true)
-        .map(|s| s.trim().to_string())
-        .map_err(|e| anyhow!("decode: {}", e))
+    let text = engine.tokenizer.decode(&generated, true)
+        .map_err(|e| anyhow!("decode: {}", e))?;
+    // Truncate at the earliest stop string in case a control marker leaked into
+    // the output (tokenizer that renders special tokens as plain text).
+    let cut = engine.stop_strings.iter()
+        .filter_map(|s| text.find(s))
+        .min()
+        .unwrap_or(text.len());
+    let answer = text[..cut].trim();
+    // For R1 models, strip the <think>…</think> reasoning preamble so only the
+    // final answer is published. Empty string = think block was cut by max_tokens
+    // (no final answer produced) — the caller should not upload this to IPFS.
+    Ok(if is_think_primed { strip_think_block(answer) } else { answer.to_string() })
 }
 
-fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor) -> Result<u32> {
+fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor, context: &[u32]) -> Result<u32> {
     let dims = logits.dims();
     let last = match dims.len() {
         3 => logits.narrow(1, dims[1] - 1, 1)?.squeeze(1)?.squeeze(0)?,
@@ -263,51 +452,67 @@ fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor) -> Result<u32> {
         1 => logits.clone(),
         _ => return Err(anyhow!("unexpected logits shape {:?}", dims)),
     };
+    // Penalize recently-generated tokens to break degenerate repetition loops.
+    let last = if REPEAT_PENALTY != 1.0 && !context.is_empty() {
+        let start = context.len().saturating_sub(REPEAT_LAST_N);
+        let f32_logits = last.to_dtype(DType::F32).map_err(|e| anyhow!("logits dtype: {}", e))?;
+        candle_transformers::utils::apply_repeat_penalty(&f32_logits, REPEAT_PENALTY, &context[start..])
+            .map_err(|e| anyhow!("repeat penalty: {}", e))?
+    } else {
+        last
+    };
     lp.sample(&last).map_err(|e| anyhow!("sample: {}", e))
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Load all selected models (blocking). Must be called before mining starts.
-pub fn load_all_blocking(specs: &'static [&'static ModelSpec]) -> Result<(), String> {
-    let result = ENGINES.get_or_init(|| {
-        let mut engines = Vec::new();
-        for spec in specs {
-            match load_engine(spec) {
-                Ok(e) => engines.push(e),
-                Err(e) => return Err(format!("failed to load '{}': {}", spec.name, e)),
-            }
-        }
-        Ok(engines)
-    });
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e.clone()),
-    }
+/// Register the set of models this miner supports. Called once at startup.
+pub fn init_supported(specs: &'static [&'static ModelSpec]) {
+    let _ = SUPPORTED_SPECS.set(specs);
 }
 
-/// Return the model_ids of all loaded engines.
+/// Return the model_ids of all supported models (used for coinbase capability announcement).
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
-    ENGINES.get()
-        .and_then(|r| r.as_ref().ok())
-        .map(|engines| engines.iter().map(|e| e.model_id).collect())
+    SUPPORTED_SPECS.get()
+        .map(|specs| specs.iter().map(|s| s.model_id).collect())
         .unwrap_or_default()
 }
 
-/// Run inference for a specific model_id (blocking — call from `spawn_blocking`).
-pub fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
-    // Safety: engines are loaded once and never mutated after; generate takes &mut
-    // for the quantized KV cache which is logically single-threaded here.
-    let engines = ENGINES.get()?.as_ref().ok()?;
-    let engine = engines.iter().find(|e| &e.model_id == model_id)?;
+/// Load the requested model on demand (evicting a cached different model if needed),
+/// then run inference. Blocking — call from `spawn_blocking`.
+pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
+    let specs = SUPPORTED_SPECS.get()?;
+    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
 
-    // SAFETY: only one inference runs at a time (enforced by inference_rx in grpc.rs).
-    #[allow(invalid_reference_casting)]
-    let engine_mut = unsafe { &mut *(engine as *const SlmEngine as *mut SlmEngine) };
+    let mut guard = ENGINE.lock().expect("ENGINE mutex poisoned");
 
-    match generate(engine_mut, prompt, max_tokens) {
+    let needs_load = guard.as_ref().map_or(true, |e| &e.model_id != model_id);
+    if needs_load {
+        if let Some(ref old) = *guard {
+            log::info!("SlmEngine: evicting '{}' to load '{}'", old.name, spec.name);
+        }
+        *guard = None;
+        let device = match Device::new_cuda(0) {
+            Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
+            Err(e) => { log::error!("SlmEngine: CUDA unavailable ({}) — CPU fallback", e); Device::Cpu }
+        };
+        match load_engine(spec, device) {
+            Ok(e) => { *guard = Some(e); }
+            Err(e) => {
+                log::error!("SlmEngine: failed to load '{}': {}", spec.name, e);
+                return None;
+            }
+        }
+    }
+
+    let engine = guard.as_mut()?;
+    match generate(engine, prompt, max_tokens) {
         Ok(text) if !text.is_empty() => Some(text),
-        Ok(_) => Some("[empty response]".to_string()),
+        Ok(_) => {
+            // Empty = R1 think block was cut by max_tokens — skip IPFS upload.
+            log::warn!("SlmEngine '{}': think block cut by max_tokens, skipping response", engine.name);
+            None
+        }
         Err(e) => {
             log::warn!("SlmEngine '{}' generate error: {}", engine.name, e);
             Some(format!("[inference error: {}]", e))
