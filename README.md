@@ -28,22 +28,33 @@ Binary: `target/release/keryx-miner`
 
 ### CUDA build (PoW + GPU inference)
 
-The inference engine (candle) requires **CUDA ≤ 12.6**.
+The inference engine (candle) builds with the **CUDA 12.x** toolkit. We recommend **CUDA 12.2**: nvcc 12.2 emits kernels that JIT on **NVIDIA driver ≥ 535**, whereas 12.6 needs driver ≥ 560. Building with 12.2 runs on the widest range of hosts and mining rigs (HiveOS commonly ships driver 535.x) at no performance cost.
 
-#### Option A — CUDA 12.6 installed on host
+#### Option A — CUDA 12.2 toolkit installed on host (recommended)
+
+Install the toolkit side-by-side (runfile, toolkit-only, no driver), then point the build at it:
 
 ```bash
+# one-time: install the CUDA 12.2 toolkit to ~/cuda-12.2 (no driver, no root needed)
+wget https://developer.download.nvidia.com/compute/cuda/12.2.2/local_installers/cuda_12.2.2_535.104.05_linux.run
+bash cuda_12.2.2_535.104.05_linux.run --silent --toolkit --toolkitpath="$HOME/cuda-12.2" --override
+
 cd keryx-miner
-CUDA_COMPUTE_CAP=86 CUDA_PATH=/usr/local/cuda cargo build --release --bin keryx-miner
+CUDA_COMPUTE_CAP=86 \
+  CUDA_ROOT="$HOME/cuda-12.2" CUDA_PATH="$HOME/cuda-12.2" \
+  PATH="$HOME/cuda-12.2/bin:$PATH" \
+  cargo build --release --bin keryx-miner
 ```
 
 Binary: `target/release/keryx-miner`
 
+> Compiling with CUDA 12.2 requires **GCC ≤ 12** (Ubuntu 22.04 / GCC 11 works out of the box). On newer hosts use Option B.
+
 #### Option B — CUDA 13.x or incompatible gcc on host (build via container)
 
-If your system has CUDA 13.x or gcc 15+ (e.g. Fedora 40+, Ubuntu 25+), build inside a CUDA 12.6 container. The binary runs on the host via driver forward-compatibility.
+If your system has CUDA 13.x or gcc 13+ (e.g. Fedora 40+, Ubuntu 25+), build inside a CUDA 12.2 container. The binary runs on the host via driver forward-compatibility.
 
-Requires: [Podman](https://podman.io/) (rootless) or Docker, NVIDIA driver ≥ 530.
+Requires: [Podman](https://podman.io/) (rootless) or Docker, NVIDIA driver ≥ 535.
 
 ```bash
 cd keryx-miner
@@ -51,7 +62,7 @@ podman run --rm --security-opt label=disable \
   -v "$PWD":/src -w /src \
   -e CUDA_COMPUTE_CAP=86 \
   -e CARGO_TARGET_DIR=/src/target-cuda \
-  docker.io/nvidia/cuda:12.6.3-devel-ubuntu24.04 \
+  docker.io/nvidia/cuda:12.2.2-devel-ubuntu22.04 \
   bash -c '
     apt-get update -qq && apt-get install -y -qq \
       curl build-essential pkg-config libssl-dev ca-certificates protobuf-compiler >/dev/null 2>&1
@@ -63,7 +74,7 @@ podman run --rm --security-opt label=disable \
 
 Binary: `target-cuda/release/keryx-miner`
 
-> `libcuda.so.1` (driver) is the only runtime dependency — no need to ship libcudart or libcublas.
+> **Runtime dependencies.** PoW needs only `libcuda.so.1` (the driver). GPU **inference** additionally `dlopen`s `libcublas.so.12` and `libcurand.so.10` at runtime, so the host must have the matching CUDA 12.2 runtime libs (`libcublas-12-2`, `libcurand-12-2`). On HiveOS the miner installs and registers them automatically on first run; on other hosts install them via your package manager or the CUDA 12.2 toolkit.
 
 **CUDA_COMPUTE_CAP by GPU generation:**
 
