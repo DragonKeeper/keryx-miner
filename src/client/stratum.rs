@@ -634,7 +634,7 @@ impl StratumHandler {
         if !keryx_miner::slm::is_model_ready(&model_id) {
             warn!("OPoI challenge: model {:.8} not ready — sending empty response", model_id_hex);
             self.challenge_in_flight.store(false, Ordering::SeqCst);
-            self.send_channel.send(make_challenge_response_line(&model_id_hex, "")).await.ok();
+            self.send_channel.send(make_challenge_response_line(&model_id_hex, &nonce_hex, "")).await.ok();
             return;
         }
 
@@ -660,7 +660,7 @@ impl StratumHandler {
             } else {
                 info!("OPoI challenge: done for model {:.8} ({} chars) — PoW resumes on next notify", model_id_hex, text.len());
             }
-            let line = make_challenge_response_line(&model_id_hex, &text);
+            let line = make_challenge_response_line(&model_id_hex, &nonce_hex, &text);
             if send_channel.blocking_send(line).is_err() {
                 warn!("OPoI challenge: send_channel closed, could not deliver response");
             }
@@ -774,11 +774,12 @@ fn run_inference_and_upload(
     }
 }
 
-fn make_challenge_response_line(model_id_hex: &str, result: &str) -> StratumLine {
+fn make_challenge_response_line(model_id_hex: &str, nonce_hex: &str, result: &str) -> StratumLine {
     StratumLine {
         id: None,
         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningChallengeResponse((
             model_id_hex.to_string(),
+            nonce_hex.to_string(),
             result.to_string(),
         ))),
         jsonrpc: None,

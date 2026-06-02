@@ -88,9 +88,10 @@ pub(crate) enum StratumCommand {
     // Phase 2 OPoI: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),
-    // Phase 2 OPoI: miner → bridge — "model_id_hex:result_text" challenge response
+    // Phase 2 OPoI: miner → bridge — [model_id_hex, nonce_hex, result_text] challenge
+    // response. The nonce is echoed back so the bridge can reject replayed/stale responses.
     #[serde(rename = "mining.challenge_response")]
-    MiningChallengeResponse((String, String)),
+    MiningChallengeResponse((String, String, String)),
     /*#[serde(rename = "mining.submit_hashrate")]
     MiningSubmitHashrate {
         params: (String, String),
