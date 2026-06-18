@@ -851,6 +851,8 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
             }
         }
         ModelInner::QuantizedQwen3Split(model) => {
+            // Same KV-cache reset as the non-split path (the split loader accumulates k/v too).
+            model.clear_kv_cache();
             for step in 0..max_steps {
                 let (input_ids, pos) = if step == 0 {
                     (all_tokens.as_slice(), 0usize)

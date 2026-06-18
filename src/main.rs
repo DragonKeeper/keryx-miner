@@ -497,9 +497,12 @@ async fn main() -> Result<(), Error> {
         specs_v2.len(),
         keryx_miner::models::OPOI_V2_ACTIVATION_DAA
     );
-    info!("Prefetching legacy model files before mining starts…");
+    // Block on BOTH lineups before mining: never start hashing while a model this miner
+    // will serve — the legacy set now AND the uncensored set after the hardfork swap — is
+    // still downloading. The readiness-gated swap then activates v2 instantly at H.
+    info!("Prefetching all model files (legacy + uncensored) before mining starts…");
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await {
-        Ok(Ok(())) => info!("Legacy model files ready — starting mining."),
+        Ok(Ok(())) => info!("Legacy model files ready."),
         Ok(Err(e)) => {
             error!("Model prefetch failed — refusing to mine without inference capability: {}", e);
             return Err(e.into());
@@ -509,17 +512,17 @@ async fn main() -> Result<(), Error> {
             return Err(e.into());
         }
     }
-    // Background-prefetch the uncensored lineup so the hardfork swap is gap-free.
-    tokio::task::spawn_blocking(move || {
-        info!("OPoI v2: background-prefetching the uncensored lineup ({} model(s))…", specs_v2.len());
-        match keryx_miner::slm::prefetch_models(specs_v2) {
-            Ok(()) => info!("OPoI v2: uncensored lineup ready — the hardfork swap will be instant."),
-            Err(e) => warn!(
-                "OPoI v2: background prefetch of the uncensored lineup failed: {} — will serve as files complete.",
-                e
-            ),
+    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
+        Ok(Ok(())) => info!("Uncensored model files ready — starting mining."),
+        Ok(Err(e)) => {
+            error!("OPoI v2 prefetch failed — refusing to mine without the post-hardfork lineup: {}", e);
+            return Err(e.into());
         }
-    });
+        Err(e) => {
+            error!("Model prefetch task panicked: {}", e);
+            return Err(e.into());
+        }
+    }
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
     if opt.cpu_inference {
