@@ -9,8 +9,7 @@
 ///   --high        Qwen3-32B-abliterated (Q4_K_M) (Qwen)   — 24 GB (3090 / 4090 / 5090)
 ///   --very-high   Llama-3.3-70B-abliterated      (Meta)   — 48 GB single-GPU or --vram-pool
 ///
-/// ⚠️ CIDs / model_id below are PLACEHOLDERS. Before release: pin each GGUF to
-/// IPFS, then set tokenizer_cid + weight_cids and recompute
+/// All GGUF weights + tokenizers are pinned on the Keryx IPFS gateway; each
 /// model_id = base58-decode(weight CID)[2..34].
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,18 +43,19 @@ pub struct ModelSpec {
     pub min_vram_mb: u64,
 }
 
-/// Placeholder model_id — all-zero until the real GGUF is pinned to IPFS.
-/// Replace with base58-decode(weight CID)[2..34].
-const PLACEHOLDER_MODEL_ID: [u8; 32] = [0u8; 32];
-
 pub const GEMMA_3_4B: ModelSpec = ModelSpec {
     name: "gemma-3-4b",
-    // TODO(release): pin Gemma-3-4B-it-abliterated GGUF, set model_id = CIDv0[2..34].
-    model_id: PLACEHOLDER_MODEL_ID,
+    // CIDv0[2..34] of model.gguf — mlabonne/gemma-3-4b-it-abliterated Q4_K_M
+    model_id: [
+        0xad, 0x50, 0xad, 0x0b, 0xd4, 0x61, 0xd8, 0xab,
+        0x44, 0xef, 0xc0, 0x21, 0x49, 0x89, 0xeb, 0x33,
+        0x29, 0x16, 0x85, 0xef, 0x4a, 0xde, 0x22, 0xa0,
+        0xf4, 0xf2, 0x17, 0xd0, 0x32, 0x66, 0xd8, 0x37,
+    ],
     format: ModelFormat::GgufGemma3,
-    tokenizer_cid: "TODO_PIN_GEMMA_3_4B_TOKENIZER_CID",
+    tokenizer_cid: "QmTh2MsVfAvWp7grN9rvkF9NkMkCW2PhWez2WbNh81KRXD",
     config_cid: "",
-    weight_cids: &["TODO_PIN_GEMMA_3_4B_WEIGHT_CID"],
+    weight_cids: &["Qma1CbFzWTNhy2ReVjDG1GvM5q2Uy4VhqTbnS9c641jUQ6"],
     dir_name: "Gemma-3-4B",
     // Baseline model — never gated. ~4 GB Q4_K_M; GPUs too small must use --cpu-inference.
     min_vram_mb: 0,
@@ -63,12 +63,17 @@ pub const GEMMA_3_4B: ModelSpec = ModelSpec {
 
 pub const DOLPHIN_LLAMA3_8B: ModelSpec = ModelSpec {
     name: "dolphin-llama3-8b",
-    // TODO(release): pin Dolphin-3.0-Llama-3.1-8B GGUF, set model_id = CIDv0[2..34].
-    model_id: PLACEHOLDER_MODEL_ID,
+    // CIDv0[2..34] of model.gguf — Dolphin3.0-Llama3.1-8B Q4_K_M
+    model_id: [
+        0x94, 0x21, 0x06, 0x6a, 0x64, 0x00, 0xc9, 0x8b,
+        0xa1, 0x37, 0x11, 0x4f, 0x7f, 0x4b, 0x7d, 0x4a,
+        0x2d, 0xdf, 0x13, 0xab, 0x16, 0x3a, 0x5d, 0xe3,
+        0x8c, 0x01, 0x84, 0x79, 0x3a, 0xf6, 0x31, 0x3a,
+    ],
     format: ModelFormat::Gguf,
-    tokenizer_cid: "TODO_PIN_DOLPHIN_8B_TOKENIZER_CID",
+    tokenizer_cid: "QmQSe8rZQcTQ6q1xDGquv6s9wpzFT9u27U4wfGVZqwMJgJ",
     config_cid: "",
-    weight_cids: &["TODO_PIN_DOLPHIN_8B_WEIGHT_CID"],
+    weight_cids: &["QmYJtFpaDnVwAVSbzRo42fsb19nLpt8LHe8WVKoyxd4AkZ"],
     dir_name: "Dolphin-Llama3-8B",
     // ~4.9 GB Q4_K_M weights + ~1.6 GB KV/workspace.
     min_vram_mb: 8_000,
@@ -76,12 +81,17 @@ pub const DOLPHIN_LLAMA3_8B: ModelSpec = ModelSpec {
 
 pub const QWEN3_32B: ModelSpec = ModelSpec {
     name: "qwen3-32b",
-    // TODO(release): pin Qwen3-32B-abliterated Q4_K_M GGUF, set model_id = CIDv0[2..34].
-    model_id: PLACEHOLDER_MODEL_ID,
+    // CIDv0[2..34] of model.gguf — Qwen3-32B-abliterated Q4_K_M (mradermacher)
+    model_id: [
+        0x65, 0xc6, 0xeb, 0x6f, 0xe1, 0x8b, 0x9e, 0xfd,
+        0x80, 0x60, 0xab, 0x9d, 0x2d, 0x03, 0xbb, 0x9b,
+        0x01, 0x05, 0x0a, 0x3b, 0x13, 0x78, 0xcb, 0xac,
+        0x00, 0x0c, 0x5c, 0xc0, 0xac, 0xdc, 0x0d, 0x2a,
+    ],
     format: ModelFormat::GgufQwen3,
-    tokenizer_cid: "TODO_PIN_QWEN3_32B_TOKENIZER_CID",
+    tokenizer_cid: "QmcuGkJvR343ry3b4jy7u5L9ior3ujas3yGAFMSyZdACb5",
     config_cid: "",
-    weight_cids: &["TODO_PIN_QWEN3_32B_WEIGHT_CID"],
+    weight_cids: &["QmVBwp5n3muQJwYNLTHSu3EnzBWviQqfh58FvHvKRfLtam"],
     dir_name: "Qwen3-32B",
     // ~19.5 GB Q4_K_M weights + ~2.5 GB KV/workspace → fits a 24 GB card (3090/4090/5090).
     min_vram_mb: 24_000,
@@ -89,12 +99,17 @@ pub const QWEN3_32B: ModelSpec = ModelSpec {
 
 pub const LLAMA_3_3_70B: ModelSpec = ModelSpec {
     name: "llama-3.3-70b",
-    // TODO(release): pin Llama-3.3-70B-Instruct-abliterated Q4_K_M GGUF, set model_id = CIDv0[2..34].
-    model_id: PLACEHOLDER_MODEL_ID,
+    // CIDv0[2..34] of model.gguf — Llama-3.3-70B-Instruct-abliterated Q4_K_M (bartowski)
+    model_id: [
+        0x13, 0x29, 0xfb, 0xe2, 0x1b, 0x3f, 0x36, 0xf6,
+        0xd0, 0x06, 0x89, 0xfc, 0xaa, 0x74, 0xf7, 0xa2,
+        0x22, 0xb8, 0xcc, 0x4c, 0x08, 0xc0, 0x19, 0x1f,
+        0xeb, 0x23, 0x97, 0x55, 0xa7, 0x23, 0x42, 0x1e,
+    ],
     format: ModelFormat::Gguf,
-    tokenizer_cid: "TODO_PIN_LLAMA_70B_TOKENIZER_CID",
+    tokenizer_cid: "QmPd7WQvoQupfzpPVnVVc1Zra5SH4jKnGqNrdTHFtdQuvd",
     config_cid: "",
-    weight_cids: &["TODO_PIN_LLAMA_70B_WEIGHT_CID"],
+    weight_cids: &["QmPdTayXcEsfUwMCoMKKcLSv7Dwpp2xVBWELwrG2M7Rhzu"],
     dir_name: "Llama-3.3-70B",
     // ~42.5 GB Q4_K_M weights + ~3.5 GB KV/workspace → 48 GB card or --vram-pool (matches the
     // --very-high 46 GB startup gate).
