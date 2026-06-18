@@ -974,10 +974,20 @@ pub fn advance_lineup_if_due(daa: u64) {
     if daa < crate::models::OPOI_V2_ACTIVATION_DAA {
         return;
     }
-    if V2_ACTIVE.swap(true, AtomicOrdering::SeqCst) {
-        return; // already advanced
+    if V2_ACTIVE.load(AtomicOrdering::SeqCst) {
+        return; // already swapped
     }
     let v2 = *LINEUP_V2.read().unwrap();
+    // Only swap once the uncensored lineup is FULLY downloaded. On a post-H cold start the
+    // v2 prefetch may still be in flight; swapping early would leave us mining on an
+    // incomplete active lineup. Until v2 is ready we keep serving the (fully-downloaded)
+    // legacy lineup — a valid, complete lineup — and retry on the next block template.
+    if v2.is_empty() || !v2.iter().all(|s| model_dir(s).join(".ok").exists()) {
+        return;
+    }
+    if V2_ACTIVE.swap(true, AtomicOrdering::SeqCst) {
+        return; // lost the race — another caller already swapped
+    }
     log::info!(
         "=== OPoI v2 HARDFORK reached at DAA {} — hot-swapping to the uncensored lineup ({} model(s)) ===",
         daa,
