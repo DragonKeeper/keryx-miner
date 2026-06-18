@@ -1,13 +1,13 @@
 //! Device-mapped fork of candle-transformers' `quantized_qwen3` for multi-GPU
 //! VRAM pooling via layer-split (pipeline) inference.
 //!
-//! Same idea as `quantized_qwen2_split`: each transformer block is assigned to
+//! Same idea as `quantized_llama_split`: each transformer block is assigned to
 //! one device of a caller-provided list, the hidden state is moved across
 //! devices at split boundaries during `forward`, and each block's KV cache lives
-//! on its device. Lets a rig pool its VRAM to serve Qwen3-32B (Q6_K, ~27 GB).
+//! on its device. Lets a rig pool its VRAM to serve Qwen3-32B (Q4_K_M, ~20 GB).
 //!
-//! Differences from the qwen2 split fork (Qwen3 architecture specifics):
-//! - NO q/k/v bias (qwen2 has them; qwen3 does not).
+//! Qwen3 architecture specifics (vs the LLaMA split fork):
+//! - NO q/k/v bias (Qwen2 has them; Qwen3 does not).
 //! - Per-head **q_norm / k_norm** RMSNorm applied to Q and K after reshaping
 //!   into heads, before RoPE (the defining qwen3 change).
 //! - `head_dim` is read explicitly from `qwen3.attention.key_length` (may differ

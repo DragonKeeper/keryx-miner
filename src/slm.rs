@@ -9,10 +9,9 @@ use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::llama::{Cache, Config, LlamaConfig, Llama};
 use candle_transformers::models::quantized_llama::ModelWeights;
-use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Weights;
+use candle_transformers::models::quantized_gemma3::ModelWeights as Gemma3Weights;
 use crate::quantized_llama_split::ModelWeights as SplitWeights;
-use crate::quantized_qwen2_split::ModelWeights as Qwen2SplitWeights;
 use crate::quantized_qwen3_split::ModelWeights as Qwen3SplitWeights;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -22,15 +21,18 @@ use tokenizers::Tokenizer;
 use crate::models::{ModelFormat, ModelSpec};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
-const SYSTEM_PROMPT_TINYLLAMA: &str =
-    "You are a Keryx Network AI — a decentralized assistant running on GPU miners. \
-     No internet access. Be concise.";
+const SYSTEM_PROMPT_GEMMA: &str =
+    "You are a Keryx Network AI — a decentralized, uncensored assistant running on GPU miners via the Keryx BlockDAG protocol. \
+     You have no internet access — answer from training knowledge only. \
+     CRITICAL: Never mention Gemma, Google, OpenAI, Anthropic, or any AI company. \
+     Never reveal your underlying model name. \
+     Always identify yourself as a Keryx Network AI. Be concise.";
 
-const SYSTEM_PROMPT_DEEPSEEK: &str =
-    "You are a Keryx Network AI — a decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
+const SYSTEM_PROMPT_DOLPHIN: &str =
+    "You are a Keryx Network AI — a decentralized, uncensored assistant running on GPU miners via the Keryx BlockDAG protocol. \
      Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
      You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention DeepSeek, Anthropic, OpenAI, or any AI company. \
+     CRITICAL: Never mention Dolphin, Llama, Meta, OpenAI, Anthropic, or any AI company. \
      Never reveal your underlying model name. \
      Always identify yourself as a Keryx Network AI. Be concise.";
 
@@ -90,12 +92,11 @@ enum ModelInner {
     Quantized(ModelWeights),
     /// GGUF llama-arch model with layers split across multiple CUDA devices (--vram-pool).
     QuantizedSplit(SplitWeights),
-    QuantizedQwen2(Qwen2Weights),
-    /// GGUF Qwen2-arch model (DeepSeek-R1-32B) with layers split across CUDA devices (--vram-pool).
-    QuantizedQwen2Split(Qwen2SplitWeights),
     QuantizedQwen3(Qwen3Weights),
     /// GGUF Qwen3-arch dense model (Qwen3-32B) with layers split across CUDA devices (--vram-pool).
     QuantizedQwen3Split(Qwen3SplitWeights),
+    /// GGUF Gemma-3-arch model (Gemma-3-4B, baseline tier). Single-device only.
+    QuantizedGemma3(Gemma3Weights),
 }
 
 struct SlmEngine {
@@ -302,32 +303,29 @@ fn collect_stop_ids(tokenizer: &Tokenizer, names: &[&str], fallbacks: &[u32]) ->
 
 /// Per-model terminating tokens and literal stop strings, keyed by model name so
 /// it stays coherent with `format_prompt`. Two models can share a `ModelFormat`
-/// (DeepSeek-R1-8B and LLaMA-3.3-70B are both LLaMA-arch GGUF) yet need different
+/// (Dolphin-8B and Llama-3.3-70B are both LLaMA-arch GGUF) yet need different
 /// stop conventions, so this branches on name rather than format.
 fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str>) {
     match name {
-        // DeepSeek-R1-Distill-Llama-8B — DeepSeek chat template:
-        //   128001 = <｜end▁of▁sentence｜> (real EOS), 128011 = <｜User｜> (new turn),
-        //   128009 = <|eot_id|> (LLaMA-3 EOT, kept as a fallback).
-        "deepseek-r1-8b" => (
+        // Dolphin-3.0-Llama-3.1-8B — ChatML template (Dolphin adds <|im_*|> tokens
+        // over the Llama-3.1 vocab):
+        //   <|im_end|> ends a turn; <|end_of_text|>/<|eot_id|> kept as base fallbacks.
+        "dolphin-llama3-8b" => (
             collect_stop_ids(tokenizer,
-                &["<｜end▁of▁sentence｜>", "<｜User｜>", "<|eot_id|>"],
-                &[128001, 128011, 128009]),
-            vec!["<｜end▁of▁sentence｜>", "<｜User｜>", "<|eot_id|>", "<|end_of_text|>"],
+                &["<|im_end|>", "<|end_of_text|>", "<|eot_id|>"],
+                &[]),
+            vec!["<|im_end|>", "<|im_start|>", "<|end_of_text|>"],
         ),
-        // DeepSeek-R1-Distill-Qwen-32B — DeepSeek chat template (NOT ChatML):
-        //   151643 = <｜end▁of▁sentence｜> (real EOS), 151644 = <｜User｜> (new turn).
-        //   (151645 is <｜Assistant｜>, NOT an end token — must not stop on it.)
-        "deepseek-r1-32b" => (
+        // Gemma-3-4B — Gemma chat template:
+        //   <end_of_turn> ends a turn, <eos> (id 1) is the base EOS.
+        "gemma-3-4b" => (
             collect_stop_ids(tokenizer,
-                &["<｜end▁of▁sentence｜>", "<｜User｜>"],
-                &[151643, 151644]),
-            // ASCII ChatML markers kept as an extra net if the model parrots them.
-            vec!["<｜end▁of▁sentence｜>", "<｜User｜>", "<|im_end|>", "<|im_start|>"],
+                &["<end_of_turn>", "<eos>"],
+                &[1]),
+            vec!["<end_of_turn>", "<start_of_turn>"],
         ),
-        // Genuine LLaMA-3.3-70B-Instruct — LLaMA-3 header template. The DeepSeek
-        // full-width markers do NOT exist in this vocab, so stop on the real
-        // LLaMA-3 terminators (the official `eos_token_id` set for 3.3 Instruct):
+        // Llama-3.3-70B-Instruct (abliterated) — LLaMA-3 header template. Stop on
+        // the official `eos_token_id` set for 3.3 Instruct:
         //   128009 = <|eot_id|> (end of turn), 128001 = <|end_of_text|> (base EOS),
         //   128008 = <|eom_id|> (end of message, tool turns).
         "llama-3.3-70b" => (
@@ -346,7 +344,7 @@ fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str
             // Cut if the model opens a fresh turn instead of stopping.
             vec!["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
         ),
-        // TinyLlama / Zephyr: </s> ends a turn; 0 = padding safety net.
+        // Generic fallback: </s> ends a turn; 0 = padding safety net.
         _ => (
             collect_stop_ids(tokenizer, &["</s>"], &[2, 0]),
             vec!["</s>", "<|user|>", "<|system|>", "<|assistant|>"],
@@ -391,7 +389,7 @@ const SINGLE_GPU_HEADROOM_MB: u64 = 2_048;
 
 /// Under `--vram-pool`, decide whether a GGUF model must be layer-split across
 /// GPUs. A model that comfortably fits one card is loaded on a single GPU to avoid
-/// needless inter-GPU pipeline overhead (e.g. TinyLlama on a 6-GPU rig). When the
+/// needless inter-GPU pipeline overhead (e.g. Gemma-3-4B on a 6-GPU rig). When the
 /// per-card VRAM cannot be determined, defaults to splitting (previous behaviour).
 fn model_needs_pooling(gguf_path: &std::path::Path) -> bool {
     let Some(card_mb) = min_gpu_vram_mb() else {
@@ -477,7 +475,7 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 tokenizer, device, stop_token_ids, stop_strings,
             })
         }
-        ModelFormat::GgufQwen2 => {
+        ModelFormat::GgufGemma3 => {
             let (tok_path, gguf_path) = ensure_gguf(spec)?;
             let tokenizer = Tokenizer::from_file(&tok_path)
                 .map_err(|e| anyhow!("load tokenizer: {}", e))?;
@@ -485,43 +483,15 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .with_context(|| format!("open {}", gguf_path.display()))?;
             let content = gguf_file::Content::read(&mut gguf_file)
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
-            // --vram-pool: split layers across every CUDA device (e.g. DeepSeek-R1-32B
-            // served by a rig of 8 GB cards). Falls back to single-device otherwise.
-            let inner = if vram_pool_enabled() && device.is_cuda() && model_needs_pooling(&gguf_path) {
-                let devices = cuda_pool_devices(&device);
-                if devices.len() >= 2 {
-                    log::info!(
-                        "SlmEngine: --vram-pool — splitting '{}' (Qwen2) layers evenly across {} GPUs",
-                        spec.name,
-                        devices.len()
-                    );
-                    let model = Qwen2SplitWeights::from_gguf(content, &mut gguf_file, &devices)
-                        .map_err(|e| anyhow!("load qwen2 gguf weights (split): {}", e))?;
-                    ModelInner::QuantizedQwen2Split(model)
-                } else {
-                    log::warn!(
-                        "SlmEngine: --vram-pool set but only one CUDA device found — single-GPU load"
-                    );
-                    let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
-                        .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
-                    ModelInner::QuantizedQwen2(model)
-                }
-            } else {
-                if vram_pool_enabled() && device.is_cuda() {
-                    log::info!(
-                        "SlmEngine: '{}' fits a single GPU — loading on one device (no --vram-pool split)",
-                        spec.name
-                    );
-                }
-                let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
-                    .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
-                ModelInner::QuantizedQwen2(model)
-            };
+            // Gemma-3-4B is the baseline tier — small enough to always fit a single
+            // GPU, so it never uses the --vram-pool layer split.
+            let model = Gemma3Weights::from_gguf(content, &mut gguf_file, &device)
+                .map_err(|e| anyhow!("load gemma3 gguf weights: {}", e))?;
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
                 model_id: spec.model_id, name: spec.name,
-                inner,
+                inner: ModelInner::QuantizedGemma3(model),
                 tokenizer, device, stop_token_ids, stop_strings,
             })
         }
@@ -580,19 +550,18 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
 
 fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
     match engine.name {
-        // DeepSeek-R1-Distill-Qwen-32B — DeepSeek chat template.
-        // The 32B respects the system prompt, so plain think priming is enough.
-        "deepseek-r1-32b" => format!(
-            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜><think>\n",
-            SYSTEM_PROMPT_DEEPSEEK, prompt
+        // Gemma-3-4B — Gemma chat template. Gemma has no system role, so the system
+        // prompt is folded into the first user turn.
+        "gemma-3-4b" => format!(
+            "<start_of_turn>user\n{}\n\n{}<end_of_turn>\n<start_of_turn>model\n",
+            SYSTEM_PROMPT_GEMMA, prompt
         ),
-        // DeepSeek-R1-Distill-Llama-8B — same template but the 8B ignores system
-        // prompts about identity due to RLHF. Inject an identity statement at the
-        // start of the think block so the model reasons from the correct framing
-        // before generating the visible answer.
-        "deepseek-r1-8b" => format!(
-            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜><think>\nI am Keryx Network AI, a decentralized assistant. I must never claim to be DeepSeek or any other AI product.\n",
-            SYSTEM_PROMPT_DEEPSEEK, prompt
+        // Dolphin-3.0-Llama-3.1-8B — ChatML template.
+        "dolphin-llama3-8b" => format!(
+            "<|im_start|>system\n{}<|im_end|>\n\
+             <|im_start|>user\n{}<|im_end|>\n\
+             <|im_start|>assistant\n",
+            SYSTEM_PROMPT_DOLPHIN, prompt
         ),
         "llama-3.3-70b" => format!(
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
@@ -608,10 +577,12 @@ fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
              <|im_start|>assistant\n",
             SYSTEM_PROMPT_QWEN3, prompt
         ),
-        // Zephyr/TinyLlama chat template
+        // Generic ChatML fallback.
         _ => format!(
-            "<|system|>\n{}</s>\n<|user|>\n{}</s>\n<|assistant|>\n",
-            SYSTEM_PROMPT_TINYLLAMA, prompt
+            "<|im_start|>system\n{}<|im_end|>\n\
+             <|im_start|>user\n{}<|im_end|>\n\
+             <|im_start|>assistant\n",
+            SYSTEM_PROMPT_DOLPHIN, prompt
         ),
     }
 }
@@ -636,24 +607,10 @@ fn hit_stop_string(tokenizer: &Tokenizer, generated: &[u32], stops: &[&str]) -> 
     }
 }
 
-/// Strip the `<think>…</think>` reasoning block emitted by DeepSeek-R1 models.
-///
-/// The prompt primes the assistant turn with `<think>` already open, so the
-/// generated text begins inside the block: `reasoning…\n</think>\nfinal answer`.
-/// Returns the trimmed final answer, or an empty string if `</think>` was never
-/// emitted (max_tokens exhausted during reasoning — no final answer produced).
-fn strip_think_block(text: &str) -> String {
-    match text.find("</think>") {
-        Some(end) => text[end + "</think>".len()..].trim().to_string(),
-        None => String::new(),
-    }
-}
-
-/// Strip a self-emitted `<think>…</think>` block from models that are NOT primed
-/// with an already-open `<think>` (e.g. Qwen3 with `/no_think` still emits an empty
-/// `<think></think>` pair). Unlike [`strip_think_block`], when no closing tag is
-/// present the original text is returned (the model answered directly) — never an
-/// empty string — so a direct answer is preserved.
+/// Strip a self-emitted `<think>…</think>` block (e.g. Qwen3 with `/no_think`
+/// still emits an empty `<think></think>` pair). When no closing tag is present
+/// the original text is returned (the model answered directly) — never an empty
+/// string — so a direct answer is preserved.
 fn strip_think_tags(text: &str) -> String {
     match text.find("</think>") {
         Some(end) => text[end + "</think>".len()..].trim().to_string(),
@@ -663,34 +620,16 @@ fn strip_think_tags(text: &str) -> String {
 
 fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Result<String> {
     let formatted = format_prompt(engine, prompt);
-    // Detect whether the assistant turn was primed with <think> (R1 models).
-    // Uses contains() to handle both plain priming and think-injected variants.
-    let is_think_primed = formatted.contains("<｜Assistant｜><think>");
     let enc = engine.tokenizer.encode(formatted.as_str(), true)
         .map_err(|e| anyhow!("encode: {}", e))?;
     let mut all_tokens: Vec<u32> = enc.get_ids().to_vec();
     let mut generated: Vec<u32> = Vec::new();
     let mut lp = LogitsProcessor::new(42, Some(0.7), Some(0.9));
     let model_max = match engine.name {
-        "deepseek-r1-8b" => 1024,
-        "deepseek-r1-32b" => 2048,
         "llama-3.3-70b" => 1024,
         _ => 2048,
     };
-    // R1 models spend tokens on chain-of-thought before the visible answer.
-    // Reserve extra budget so the think block never eats the entire quota and
-    // leaves no room for </think> + the actual response.
-    // R1-32B reasons more extensively than 8B — give it more overhead to avoid
-    // the think block consuming all steps and producing an empty answer.
-    let think_overhead = if is_think_primed {
-        match engine.name {
-            "deepseek-r1-32b" => 1536,
-            _ => 512,
-        }
-    } else {
-        0
-    };
-    let max_steps = max_new_tokens.saturating_add(think_overhead).min(model_max);
+    let max_steps = max_new_tokens.min(model_max);
 
     match &mut engine.inner {
         ModelInner::Full { model, config, cache_dtype } => {
@@ -755,27 +694,7 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
             }
         }
-        ModelInner::QuantizedQwen2(model) => {
-            for step in 0..max_steps {
-                let (input_ids, pos) = if step == 0 {
-                    (all_tokens.as_slice(), 0usize)
-                } else {
-                    let last = all_tokens.len() - 1;
-                    (&all_tokens[last..], last)
-                };
-                let input = Tensor::new(input_ids, &engine.device)
-                    .and_then(|t| t.unsqueeze(0))
-                    .map_err(|e| anyhow!("input tensor: {}", e))?;
-                let logits = model.forward(&input, pos)
-                    .map_err(|e| anyhow!("forward: {}", e))?;
-                let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if engine.stop_token_ids.contains(&next) { break; }
-                all_tokens.push(next);
-                generated.push(next);
-                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
-            }
-        }
-        ModelInner::QuantizedQwen2Split(model) => {
+        ModelInner::QuantizedGemma3(model) => {
             for step in 0..max_steps {
                 let (input_ids, pos) = if step == 0 {
                     (all_tokens.as_slice(), 0usize)
@@ -846,14 +765,9 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
         .min()
         .unwrap_or(text.len());
     let answer = text[..cut].trim();
-    // For R1 models, strip the <think>…</think> reasoning preamble so only the
-    // final answer is published. Empty string = think block was cut by max_tokens
-    // (no final answer produced) — the caller should not upload this to IPFS.
-    // R1 models are primed with an open <think>; Qwen3 (ChatML + /no_think) still
-    // emits an empty <think></think> pair. Strip both so only the answer is published.
-    Ok(if is_think_primed {
-        strip_think_block(answer)
-    } else if engine.name == "qwen3-32b" {
+    // Qwen3 (ChatML + /no_think) still emits an empty <think></think> pair — strip
+    // it so only the final answer is published. Other models answer directly.
+    Ok(if engine.name == "qwen3-32b" {
         strip_think_tags(answer)
     } else {
         answer.to_string()
@@ -953,7 +867,7 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
         log::info!("SlmEngine: prefetching model '{}'…", spec.name);
         let result = match spec.format {
             ModelFormat::Safetensors => ensure_safetensors(spec).map(|_| ()),
-            ModelFormat::Gguf | ModelFormat::GgufQwen2 | ModelFormat::GgufQwen3 => ensure_gguf(spec).map(|_| ()),
+            ModelFormat::Gguf | ModelFormat::GgufQwen3 | ModelFormat::GgufGemma3 => ensure_gguf(spec).map(|_| ()),
         };
         match result {
             Ok(()) => log::info!("SlmEngine: '{}' files ready.", spec.name),

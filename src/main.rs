@@ -120,11 +120,11 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
 
 /// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
 ///
-/// VRAM requirements (GGUF weights only, not counting CUDA workspace):
-///   TinyLlama-1.1B  →  ~1.5 GB
-///   DeepSeek-R1-8B  →  ~5 GB
-///   DeepSeek-R1-32B → ~19 GB   (requires ≥24 GB card)
-///   LLaMA-3.3-70B   → ~28 GB   (requires ≥40 GB card — does NOT fit on RTX 3090)
+/// VRAM requirements (GGUF Q4_K_M weights only, not counting CUDA workspace):
+///   Gemma-3-4B      →  ~2.7 GB
+///   Dolphin-8B      →  ~4.9 GB
+///   Qwen3-32B       → ~19.5 GB  (requires ≥24 GB card)
+///   Llama-3.3-70B   → ~42.5 GB  (requires ≥48 GB card or --vram-pool)
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
 fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: bool) {
@@ -159,28 +159,28 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: boo
         _ => return,
     };
 
-    // VRAM check for 70B: 28 GB weights + ~2.5 GB KV cache → requires ≥32 GB card (RTX 5090+).
-    // On 24 GB cards (RTX 3090 / 4090), loading will OOM and crash the miner.
-    if needs_very_high && vram_mb < 30_000 {
+    // VRAM check for 70B: ~42.5 GB Q4_K_M weights + ~3.5 GB KV cache → requires a
+    // ≥48 GB card. On smaller single GPUs, loading will OOM — pool with --vram-pool.
+    if needs_very_high && vram_mb < 46_000 {
         log::error!(
-            "✗  LLaMA-3.3-70B requires ≥32 GB VRAM (RTX 5090 or equivalent, \
+            "✗  Llama-3.3-70B (Q4_K_M) requires ≥48 GB VRAM (RTX 6000 Ada / A6000 / L40S, \
              or multiple GPUs pooled with --vram-pool) — only {} MB ({} GB) {}.",
             vram_mb,
             vram_mb / 1024,
             if vram_pool { "pooled across all GPUs" } else { "on this GPU" }
         );
         log::error!(
-            "   Use --high (DeepSeek-R1-32B, fits in 24 GB) or --light (TinyLlama only)."
+            "   Use --high (Qwen3-32B, fits in 24 GB) or --light (Gemma-3-4B only)."
         );
         // Non-fatal: let candle fail with its own OOM so the miner logs the actual error.
     }
 
     let model_label = if needs_very_high {
-        "LLaMA-3.3-70B (--very-high)"
+        "Llama-3.3-70B (--very-high)"
     } else if needs_high {
-        "DeepSeek-R1-32B (--high)"
+        "Qwen3-32B (--high)"
     } else {
-        "DeepSeek-R1-8B (default)"
+        "Dolphin-8B (default)"
     };
     log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
 }
@@ -235,7 +235,6 @@ fn filter_specs_by_vram(
                 && matches!(
                     spec.format,
                     keryx_miner::models::ModelFormat::Gguf
-                        | keryx_miner::models::ModelFormat::GgufQwen2
                         | keryx_miner::models::ModelFormat::GgufQwen3
                 );
             let available = if splittable { pooled_mb } else { gpu0_mb };
@@ -252,7 +251,6 @@ fn filter_specs_by_vram(
                         && matches!(
                             spec.format,
                             keryx_miner::models::ModelFormat::Gguf
-                                | keryx_miner::models::ModelFormat::GgufQwen2
                                 | keryx_miner::models::ModelFormat::GgufQwen3
                         )
                     {
@@ -446,36 +444,35 @@ async fn main() -> Result<(), Error> {
     };
 
     // Phase-3 OPoI: load inference models before mining starts.
-    //   (no flag)    → TinyLlama + DeepSeek-R1-8B  [default]
-    //   --light      → TinyLlama only
-    //   --high       → TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B
-    //   --very-high  → all 4 models
+    //   (no flag)    → Gemma-3-4B + Dolphin-8B  [default]
+    //   --light      → Gemma-3-4B only
+    //   --high       → Gemma-3-4B + Dolphin-8B + Qwen3-32B
+    //   --very-high  → all 4 models (+ Llama-3.3-70B)
 
     // Warn if GPU power limit is below safe threshold for the selected model tier.
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
     check_gpu_power_limit(opt.high || opt.very_high, opt.very_high, opt.vram_pool);
 
     let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_high {
-        info!("--very-high mode: loading all 5 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + Qwen3-32B + LLaMA-70B).");
+        info!("--very-high mode: loading all 4 models (Gemma-3-4B + Dolphin-8B + Qwen3-32B + LLaMA-70B).");
         &[
-            &keryx_miner::models::TINYLLAMA,
-            &keryx_miner::models::DEEPSEEK_R1_8B,
-            &keryx_miner::models::DEEPSEEK_R1_32B,
+            &keryx_miner::models::GEMMA_3_4B,
+            &keryx_miner::models::DOLPHIN_LLAMA3_8B,
             &keryx_miner::models::QWEN3_32B,
             &keryx_miner::models::LLAMA_3_3_70B,
         ]
     } else if opt.high {
-        info!("--high mode: loading TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B.");
+        info!("--high mode: loading Gemma-3-4B + Dolphin-8B + Qwen3-32B.");
         &[
-            &keryx_miner::models::TINYLLAMA,
-            &keryx_miner::models::DEEPSEEK_R1_8B,
-            &keryx_miner::models::DEEPSEEK_R1_32B,
+            &keryx_miner::models::GEMMA_3_4B,
+            &keryx_miner::models::DOLPHIN_LLAMA3_8B,
+            &keryx_miner::models::QWEN3_32B,
         ]
     } else if opt.light {
-        info!("--light mode: loading TinyLlama only.");
-        &[&keryx_miner::models::TINYLLAMA]
+        info!("--light mode: loading Gemma-3-4B only.");
+        &[&keryx_miner::models::GEMMA_3_4B]
     } else {
-        &[&keryx_miner::models::TINYLLAMA, &keryx_miner::models::DEEPSEEK_R1_8B]
+        &[&keryx_miner::models::GEMMA_3_4B, &keryx_miner::models::DOLPHIN_LLAMA3_8B]
     };
     // Layer-A OPoI capability gate: only announce (and download) what this
     // hardware can actually serve.

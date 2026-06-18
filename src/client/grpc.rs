@@ -422,7 +422,7 @@ impl KeryxdHandler {
             return None;
         }
         let v: serde_json::Value = serde_json::from_slice(&raw[PREFIX.len()..]).ok()?;
-        let model = v["m"].as_str().unwrap_or("tinyllama").to_string();
+        let model = v["m"].as_str().unwrap_or("gemma-3-4b").to_string();
         let prompt = v["p"].as_str()?.to_string();
         let max_tokens = v["n"].as_u64().unwrap_or(128) as usize;
         Some((model, prompt, max_tokens))

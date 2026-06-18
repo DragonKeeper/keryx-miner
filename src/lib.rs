@@ -5,7 +5,6 @@ use std::error::Error as StdError;
 pub mod inference;
 pub mod models;
 pub mod quantized_llama_split;
-pub mod quantized_qwen2_split;
 pub mod quantized_qwen3_split;
 pub mod slm;
 pub mod xoshiro256starstar;
