@@ -118,6 +118,22 @@ pub const LLAMA_3_3_70B: ModelSpec = ModelSpec {
     min_vram_mb: 46_000,
 };
 
+/// Map a model_id to its Proof-of-Model tier index, matching the node's `POM_TIERS` order
+/// (Gemma=0, Dolphin=1, Qwen3-32B=2, Llama-70B-abl=3). None for non-PoM models.
+pub fn pom_tier_index(model_id: &[u8; 32]) -> Option<u8> {
+    if *model_id == GEMMA_3_4B.model_id {
+        Some(0)
+    } else if *model_id == DOLPHIN_LLAMA3_8B.model_id {
+        Some(1)
+    } else if *model_id == QWEN3_32B.model_id {
+        Some(2)
+    } else if *model_id == LLAMA_3_3_70B.model_id {
+        Some(3)
+    } else {
+        None
+    }
+}
+
 // ── Legacy lineup (pre-OPoI-v2) ───────────────────────────────────────────────
 // Served while `daa < OPOI_V2_ACTIVATION_DAA`. model_id values match the node's
 // pre-v2 INFERENCE_REWARD_MINIMUMS table (8B/TinyLlama = CID-derived; 32B/70B =

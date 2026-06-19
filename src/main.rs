@@ -486,6 +486,18 @@ async fn main() -> Result<(), Error> {
         opt.vram_pool,
         opt.cpu_inference,
     );
+    // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
+    // mine under possession). Captured before `specs_v2` is consumed; the index is built after
+    // prefetch (below). `&'static ModelSpec` is Copy so this survives the moves.
+    let pom_spec = if keryx_miner::pom::POM_ACTIVATION_DAA != u64::MAX {
+        specs_v2
+            .iter()
+            .copied()
+            .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id).is_some())
+            .max_by_key(|s| s.min_vram_mb)
+    } else {
+        None
+    };
     keryx_miner::slm::set_v2_lineup(specs_v2);
     keryx_miner::slm::init_supported(specs_v1);
     keryx_miner::slm::set_cpu_inference(opt.cpu_inference);
@@ -528,6 +540,28 @@ async fn main() -> Result<(), Error> {
             return Err(e.into());
         }
     }
+    // PoM: build the possession weight index for the mining tier, once, after the GGUF is
+    // present (prefetch above). Only when PoM is configured (gated above).
+    if let Some(spec) = pom_spec {
+        let tier = keryx_miner::models::pom_tier_index(&spec.model_id).expect("pom_spec has a tier");
+        let path = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+        info!("PoM: building possession index for tier {} ({}) — this can take a while…", tier, spec.dir_name);
+        match tokio::task::spawn_blocking(move || keryx_miner::pom::WeightIndex::build_from_gguf(&path)).await {
+            Ok(Ok(idx)) => {
+                info!("PoM: weight index ready — N={} chunks, R_T[..4]={:02x?}", idx.n_chunks, &idx.r_t[..4]);
+                keryx_miner::pom::set_index(idx, tier);
+            }
+            Ok(Err(e)) => {
+                error!("PoM: weight index build failed — cannot mine with possession: {}", e);
+                return Err(e.into());
+            }
+            Err(e) => {
+                error!("PoM: weight index build task panicked: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
+
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
     if opt.cpu_inference {

@@ -151,6 +151,12 @@ fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
     exe_dir.join("models").join(spec.dir_name)
 }
 
+/// Path to a model's GGUF file (`<exe_dir>/models/<dir_name>/model.gguf`). Used by PoM to
+/// build the possession weight index from the resident model.
+pub fn gguf_path_for(spec: &ModelSpec) -> std::path::PathBuf {
+    model_dir(spec).join("model.gguf")
+}
+
 /// Downloads `url` to `dest` with automatic resume. A partially downloaded file is
 /// continued via an HTTP `Range` request instead of restarting from zero, and both
 /// connect-time and mid-stream failures are retried with a fixed backoff. Designed
