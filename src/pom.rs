@@ -200,6 +200,45 @@ pub fn challenges(pre_pow_hash: &[u8; 32], nonce: u64, trace_root: &[u8; 32], po
     out
 }
 
+/// The hot search walk: K data-dependent reads, returns only `state[K]` (no trace recording).
+/// This is the per-nonce work; on GPU (slice 3b) this becomes the kernel over VRAM weights.
+pub fn walk_final<F: Fn(u64) -> [u64; CHUNK_WORDS]>(seed: u64, n_chunks: u64, k: u32, read_chunk: F) -> u64 {
+    let mut state = seed;
+    let mut off = state % n_chunks;
+    for _ in 0..k {
+        state = transition(state, &read_chunk(off));
+        off = state % n_chunks;
+    }
+    state
+}
+
+/// CPU Proof-of-Model mining (slice 3a — functional, slow). Searches nonces in
+/// `nonce_start..nonce_start+max_nonces`; on the first whose `pom_pow_value <= target`,
+/// re-walks to build the full `PomProof`. GPU fast-path is slice 3b. Returns the winning
+/// nonce + proof, or None if the range is exhausted.
+#[allow(clippy::too_many_arguments)]
+pub fn mine_pom(
+    index: &WeightIndex,
+    tier: u8,
+    pre_pow_hash: &[u8; 32],
+    timestamp: u64,
+    target: &[u8; 32],
+    k: u32,
+    t: usize,
+    nonce_start: u64,
+    max_nonces: u64,
+) -> Option<(u64, PomProof)> {
+    for nonce in nonce_start..nonce_start.saturating_add(max_nonces) {
+        let seed = pom_block_seed(pre_pow_hash, timestamp, nonce);
+        let final_state = walk_final(seed, index.n_chunks, k, |o| index.read_chunk(o));
+        if le_leq(&pom_pow_value(final_state, pre_pow_hash), target) {
+            let proof = build_proof(tier, pre_pow_hash, nonce, seed, index.n_chunks, k, t, |o| index.read_chunk(o), |o| index.merkle_path(o));
+            return Some((nonce, proof));
+        }
+    }
+    None
+}
+
 /// PROVER. Re-walk the (already-won) nonce recording the trace, commit it, and open the
 /// `t` FS-selected steps. `read_chunk(off)` reads the 32 B chunk at canonical chunk index
 /// `off` from the resident weight blob; `weight_leaves` is the precomputed per-chunk leaf
@@ -456,6 +495,22 @@ mod tests {
         let proof = build_proof(0, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
         assert!(!verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0u8; 32]), "zero target must fail");
         assert!(!verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &blake(b"wrong"), &[0xff; 32]), "wrong R_T must fail");
+    }
+
+    #[test]
+    fn cpu_mine_finds_nonce_and_proof_verifies() {
+        let (k, t) = (128u32, 32usize);
+        let idx = synth_index(4096);
+        let pph = blake(b"mine-pph");
+        let ts = 555;
+        // Target requiring pow_value MSB <= 0x10 (~6.6% of nonces) — found within a few tries.
+        let mut target = [0xffu8; 32];
+        target[31] = 0x10;
+        let (nonce, proof) = mine_pom(&idx, 1, &pph, ts, &target, k, t, 0, 100_000).expect("mine a nonce");
+        let seed = pom_block_seed(&pph, ts, nonce);
+        // The proof verifies against the same target the node would use.
+        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target));
+        assert_eq!(proof.tier, 1);
     }
 
     // Validates the canonical layout against the consensus-pinned R_T. Needs the Gemma GGUF.
