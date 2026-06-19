@@ -34,8 +34,9 @@ pub struct Opt {
 
     #[clap(
         long = "cpu-inference",
-        help = "Run OPoI inference on the CPU instead of the GPU — frees the GPU for hashing and avoids weak-fp16 GPUs (e.g. GTX 1060). Required on AMD / non-NVIDIA GPUs, where inference cannot use CUDA (--cuda-disable only affects PoW, not inference). Pairs well with --light.",
-        help_heading = "OPoI / Inference"
+        help = "Run OPoI inference on the CPU instead of the GPU — frees the GPU for hashing and avoids weak-fp16 GPUs (e.g. GTX 1060). Required on AMD / non-NVIDIA GPUs, where inference cannot use CUDA (--cuda-disable only affects PoW, not inference). ONLY allowed with --light: the CPU cannot serve the larger tiers at GPU-class latency, so a CPU-only miner must not advertise (ai:cap) a model it cannot serve usefully.",
+        help_heading = "OPoI / Inference",
+        requires = "light"
     )]
     pub cpu_inference: bool,
 
