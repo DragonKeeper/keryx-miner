@@ -365,19 +365,30 @@ pub fn verify_proof(pre_pow_hash: &[u8; 32], nonce: u64, seed: u64, proof: &PomP
     true
 }
 
+/// Source of the raw 32 B canonical chunks for `read_chunk`.
+enum ChunkSource {
+    /// In-RAM chunks (synthetic tests / small indexes built without a GGUF).
+    Ram(Vec<u8>),
+    /// Chunks read on demand from the GGUF via `pread` — NO host copy (saves ~1x model size of
+    /// RAM, ~42 GB for the 70B). `table[j] = (canonical chunk index of tensor j's first chunk,
+    /// absolute file byte offset of that chunk)`, ascending by chunk index; `read_chunk`
+    /// binary-searches it. The GGUF's on-disk quantized bytes are byte-identical to candle's
+    /// `qt.data()` used to build the leaves (`tensor` seeks to the same `tensor_data_offset + offset`).
+    Gguf { file: File, table: Vec<(u64, u64)> },
+}
+
 /// Canonical weight index built once at startup from the resident model: the per-chunk
 /// blake3 leaves (for Merkle paths), the recomputed tier root `R_T` (sanity-checked against
 /// the consensus-pinned value), and a chunk reader. Canonical layout = name-sorted GGUF
 /// tensors, `floor(len/32)` 32 B chunks — identical to `pom-rt-builder` and the node.
 ///
-/// NOTE: holds the canonical chunk bytes + leaves in host RAM (~2x model size). Fine for
-/// the small/mid tiers; the big tiers will switch to reading chunks straight from the
-/// resident VRAM buffers (slice 3) instead of a host copy.
+/// The Merkle tree lives on disk (pread); the raw chunks are read on demand from the GGUF
+/// (`ChunkSource::Gguf`), so the index holds no full host copy of the weights.
 pub struct WeightIndex {
     pub n_chunks: u64,
     pub r_t: [u8; 32],
-    /// Raw 32 B chunks (canonical order) kept in RAM for `read_chunk`.
-    data: Vec<u8>,
+    /// Raw 32 B chunk reader: GGUF-backed in production, RAM-backed in synthetic tests.
+    chunks: ChunkSource,
     /// Disk-backed Merkle tree: all levels (level 0 = leaves … single-node root) concatenated in
     /// one file, so the 70B tree (~84 GB) need not fit in RAM. `merkle_path` reads ~log N sibling
     /// nodes via `pread`. Built once per PoM activation; deleted on drop.
@@ -413,17 +424,22 @@ impl WeightIndex {
                 .open(&tree_path).map_err(candle_core::Error::wrap)?,
         );
 
-        // Level 0: hash chunks → leaves (to disk), keep raw chunks in RAM for read_chunk.
-        let mut data: Vec<u8> = Vec::new();
+        // Level 0: hash chunks → leaves (to disk). The raw chunks are NOT retained in RAM; instead
+        // we record, per tensor, the canonical chunk index of its first chunk and that chunk's
+        // absolute byte offset in the GGUF, so `read_chunk` can `pread` any chunk on demand.
+        let mut table: Vec<(u64, u64)> = Vec::with_capacity(names.len());
         let mut n_chunks: u64 = 0;
         for name in &names {
+            let file_off = content.tensor_data_offset + content.tensor_infos[name].offset;
             let qt = content.tensor(&mut file, name, &device)?;
             let bytes = qt.data()?;
             let full = bytes.len() / 32;
+            if full > 0 {
+                table.push((n_chunks, file_off));
+            }
             for c in 0..full {
                 let chunk = &bytes[c * 32..c * 32 + 32];
                 writer.write_all(&blake(chunk)).map_err(candle_core::Error::wrap)?;
-                data.extend_from_slice(chunk);
                 n_chunks += 1;
             }
         }
@@ -431,14 +447,26 @@ impl WeightIndex {
             return Err(candle_core::Error::Msg("PoM: model produced 0 chunks".into()));
         }
 
-        finalize_disk_tree(writer, tree_path, n_chunks, data)
+        // Independent read-only handle for on-demand chunk preads (the build handle is consumed).
+        let gguf = File::open(path).map_err(candle_core::Error::wrap)?;
+        finalize_disk_tree(writer, tree_path, n_chunks, ChunkSource::Gguf { file: gguf, table })
     }
 
     /// 32 B chunk at canonical index `off` (panics if out of range — `off < n_chunks`).
     pub fn read_chunk(&self, off: u64) -> [u64; CHUNK_WORDS] {
-        let base = (off as usize) * 32;
         let mut arr = [0u8; 32];
-        arr.copy_from_slice(&self.data[base..base + 32]);
+        match &self.chunks {
+            ChunkSource::Ram(data) => {
+                let base = (off as usize) * 32;
+                arr.copy_from_slice(&data[base..base + 32]);
+            }
+            ChunkSource::Gguf { file, table } => {
+                // Tensor whose canonical range contains `off`: last entry with start <= off.
+                let j = table.partition_point(|&(start, _)| start <= off) - 1;
+                let (start, file_off) = table[j];
+                file.read_exact_at(&mut arr, file_off + (off - start) * 32).expect("PoM gguf chunk read");
+            }
+        }
         chunk_to_words(&arr)
     }
 
@@ -468,7 +496,7 @@ fn finalize_disk_tree(
     mut writer: BufWriter<File>,
     tree_path: PathBuf,
     n_chunks: u64,
-    data: Vec<u8>,
+    chunks: ChunkSource,
 ) -> candle_core::Result<WeightIndex> {
     let mut level_offsets: Vec<(u64, u64)> = vec![(0, n_chunks)];
     loop {
@@ -503,7 +531,7 @@ fn finalize_disk_tree(
     let mut r_t = [0u8; 32];
     tree_file.read_exact_at(&mut r_t, root_off).map_err(candle_core::Error::wrap)?;
 
-    Ok(WeightIndex { n_chunks, r_t, data, tree_file, tree_path, level_offsets })
+    Ok(WeightIndex { n_chunks, r_t, chunks, tree_file, tree_path, level_offsets })
 }
 
 /// PoM possession activation DAA score — MUST match the node's `pom_activation`.
@@ -556,7 +584,87 @@ mod tests {
             writer.write_all(&blake(&b)).unwrap();
             data.extend_from_slice(&b);
         }
-        finalize_disk_tree(writer, tree_path, n, data).unwrap()
+        finalize_disk_tree(writer, tree_path, n, ChunkSource::Ram(data)).unwrap()
+    }
+
+    /// GGUF-backed `read_chunk`: lay the canonical chunks across 3 "tensors" with header + inter-
+    /// tensor padding (so file offset != off*32), build the per-tensor offset table, and assert
+    /// `read_chunk` (pread) returns the exact canonical chunks AND that a proof verifies — same as
+    /// the RAM path, with no host copy of the weights.
+    #[test]
+    fn gguf_chunk_source_reads_match_and_proof_verifies() {
+        let n = 1000u64;
+        let uid = std::process::id();
+        let gguf_path = std::env::temp_dir().join(format!("keryx-pom-fakegguf-{uid}.bin"));
+        let _ = std::fs::remove_file(&gguf_path);
+        let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&gguf_path).unwrap();
+
+        // 3 tensors at chunk-start boundaries, with padding so file_off is not simply off*32.
+        let splits = [0u64, 400, 750, n];
+        let mut table: Vec<(u64, u64)> = Vec::new();
+        let mut pos: u64 = 17; // header padding
+        f.seek(SeekFrom::Start(pos)).unwrap();
+        for w in splits.windows(2) {
+            table.push((w[0], pos));
+            for o in w[0]..w[1] {
+                f.write_all(&words_to_bytes(&synth_chunk(o))).unwrap();
+                pos += 32;
+            }
+            pos += 13; // inter-tensor padding gap
+            f.seek(SeekFrom::Start(pos)).unwrap();
+        }
+        f.flush().unwrap();
+        let file = File::open(&gguf_path).unwrap();
+
+        // Build the tree over the canonical synth chunks, with the GGUF chunk source.
+        let tree_path = std::env::temp_dir().join(format!("keryx-pom-fakegguf-tree-{uid}.bin"));
+        let _ = std::fs::remove_file(&tree_path);
+        let mut writer = BufWriter::new(
+            OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap(),
+        );
+        for o in 0..n {
+            writer.write_all(&blake(&words_to_bytes(&synth_chunk(o)))).unwrap();
+        }
+        let idx = finalize_disk_tree(writer, tree_path, n, ChunkSource::Gguf { file, table }).unwrap();
+
+        // Every chunk read by pread matches the canonical chunk, across all segments + padding.
+        for o in 0..n {
+            assert_eq!(idx.read_chunk(o), synth_chunk(o), "chunk {o}");
+        }
+        // A proof built from the GGUF source verifies against R_T (target 0xff..ff = first nonce wins).
+        let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
+        let pph = [7u8; 32];
+        let target = [0xffu8; 32];
+        let (nonce, proof) = mine_pom(&idx, 2, &pph, 123, &target, k, t, 0, 1).expect("max target → win");
+        let seed = pom_block_seed(&pph, 123, nonce);
+        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target));
+
+        let _ = std::fs::remove_file(&gguf_path);
+    }
+
+    /// Real-GGUF byte-identity: build the index from a downloaded model and prove that chunks
+    /// read by `pread` (GGUF) verify against the model's own `R_T` (whose leaves were hashed from
+    /// candle's `qt.data()`). Confirms `pread(tensor_data_offset + offset)` == `qt.data()` for real
+    /// quant types. Ignored (needs the GGUF); run: `cargo test -p keryx-miner -- --ignored gguf_real`.
+    #[test]
+    #[ignore]
+    fn gguf_real_model_read_chunk_byte_identical() {
+        let path = "/home/slash/KERYX-KRX/claude/Outils PoM/keryx-miner-test CPU-Llama3-70B/target/release/models/Gemma-3-4B/model.gguf";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skip: GGUF not found at {path}");
+            return;
+        }
+        let idx = WeightIndex::build_from_gguf(path).expect("build index from real GGUF");
+        eprintln!("real model index: N={} chunks", idx.n_chunks);
+        let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
+        let pph = [3u8; 32];
+        let target = [0xffu8; 32]; // max → the first nonce wins, so 1 nonce suffices
+        let (nonce, proof) = mine_pom(&idx, 0, &pph, 99, &target, k, t, 0, 1).expect("max target → win");
+        let seed = pom_block_seed(&pph, 99, nonce);
+        assert!(
+            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target),
+            "GGUF-pread chunks must verify against the model's R_T (byte-identity broken otherwise)"
+        );
     }
 
     #[test]
