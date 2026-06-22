@@ -201,15 +201,11 @@ fn query_vram_mb() -> Option<u64> {
 
 /// OPoI capability gate (layer A): drop the models this machine cannot actually
 /// serve on GPU 0, so the `ai:cap` announcement never promises a model the miner
-/// would fail to load. Skipped under --cpu-inference (no VRAM constraint) and when
-/// nvidia-smi is unavailable (CPU-fallback setups keep working).
+/// would fail to load. Skipped when nvidia-smi is unavailable (CPU-fallback setups
+/// keep working).
 fn filter_specs_by_vram(
     specs: &'static [&'static keryx_miner::models::ModelSpec],
-    cpu_inference: bool,
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
-    if cpu_inference {
-        return specs;
-    }
     let Some(gpu0_mb) = query_vram_mb() else {
         log::warn!("Cannot query GPU VRAM (nvidia-smi) — skipping the model capability gate.");
         return specs;
@@ -444,13 +440,9 @@ async fn main() -> Result<(), Error> {
     //   - uncensored (daa >= H) is prefetched in the background and swapped in at H.
     // `specs_v1` is the CURRENT (legacy, daa < H) lineup the miner announces and serves until the
     // chain crosses H — `specs_for(0, ..)` so a fresh chain declares the legacy models.
-    let specs_v1 = filter_specs_by_vram(
-        keryx_miner::models::specs_for(0, tier),
-        opt.cpu_inference,
-    );
+    let specs_v1 = filter_specs_by_vram(keryx_miner::models::specs_for(0, tier));
     let specs_v2 = filter_specs_by_vram(
         keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
-        opt.cpu_inference,
     );
     // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
     // mine under possession). Captured before `specs_v2` is consumed; the index is built after
@@ -466,10 +458,6 @@ async fn main() -> Result<(), Error> {
     };
     keryx_miner::slm::set_v2_lineup(specs_v2);
     keryx_miner::slm::init_supported(specs_v1);
-    keryx_miner::slm::set_cpu_inference(opt.cpu_inference);
-    if opt.cpu_inference {
-        info!("--cpu-inference mode: OPoI inference runs on CPU, GPU stays dedicated to hashing.");
-    }
     info!(
         "OPoI Phase-3 active — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
         specs_v1.len(),
@@ -519,14 +507,12 @@ async fn main() -> Result<(), Error> {
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
-    if opt.cpu_inference {
-        info!("--cpu-inference: skipping GPU inference probe (inference runs on CPU).");
-    } else {
     info!("Probing GPU inference (cuBLAS) before mining…");
     match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
         Ok(keryx_miner::slm::GpuProbe::Ok) => info!("GPU inference verified — cuBLAS loaded successfully."),
         Ok(keryx_miner::slm::GpuProbe::NoCuda) => {
-            warn!("No CUDA device detected — inference will run on CPU (small models only, slow).");
+            error!("No CUDA device detected — OPoI inference is GPU-only and is mandatory, cannot mine.");
+            return Err("No CUDA device — cannot start OPoI mining".into());
         }
         Ok(keryx_miner::slm::GpuProbe::CublasMissing) => {
             warn!("CUDA GPU detected but a CUDA runtime lib is missing — installing them automatically (one-time)…");
@@ -561,7 +547,6 @@ async fn main() -> Result<(), Error> {
             error!("GPU probe task panicked: {}", e);
             return Err(e.into());
         }
-    }
     }
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);

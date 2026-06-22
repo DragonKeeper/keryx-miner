@@ -76,21 +76,6 @@ static LINEUP_V2: RwLock<&'static [&'static ModelSpec]> = RwLock::new(&[]);
 static V2_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ENGINE: Mutex<Option<SlmEngine>> = Mutex::new(None);
 
-/// When true, OPoI inference is forced onto the CPU even if a CUDA device is present.
-/// Set once at startup from the `--cpu-inference` CLI flag so weak GPUs (e.g. GTX 1060)
-/// can dedicate the GPU to hashing while the CPU runs the SLM.
-static FORCE_CPU_INFERENCE: AtomicBool = AtomicBool::new(false);
-
-/// Force OPoI inference onto the CPU (see [`FORCE_CPU_INFERENCE`]). Call once at startup.
-pub fn set_cpu_inference(enabled: bool) {
-    FORCE_CPU_INFERENCE.store(enabled, AtomicOrdering::Relaxed);
-}
-
-/// Whether OPoI inference is forced onto the CPU.
-pub fn cpu_inference_enabled() -> bool {
-    FORCE_CPU_INFERENCE.load(AtomicOrdering::Relaxed)
-}
-
 /// When true, the mining-tier model is loaded via the layer-split loader even on a single GPU,
 /// so it lands as a `QuantizedQwen3Split` (etc.) that exposes `pom_quant_tensors()`. This lets
 /// the PoM walk share the inference weights in place (Option C2 zero-dup). Set at startup when
@@ -903,7 +888,7 @@ pub fn probe_gpu_inference() -> GpuProbe {
     // CUDA device, by contrast, returns Err cleanly. So the whole sequence — including
     // new_cuda — must live inside catch_unwind, and we distinguish the three outcomes:
     //   Ok(Ok)  -> CUDA + cuBLAS work
-    //   Ok(Err) -> no usable CUDA device (clean error) -> CPU fallback
+    //   Ok(Err) -> no usable CUDA device (clean error) -> inference is GPU-only, cannot mine
     //   Err     -> panic -> cuBLAS missing
     //
     // Silence the default panic hook for the probe so its scary backtrace doesn't pollute
@@ -1003,13 +988,11 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             // weights so this model fits. Mining rebuilds (reloads its model) when it next runs.
             crate::pom_gpu::uninstall();
             *guard = None;
-            let device = if cpu_inference_enabled() {
-                log::info!("SlmEngine: --cpu-inference set — running on CPU device");
-                Device::Cpu
-            } else {
-                match Device::new_cuda(0) {
-                    Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
-                    Err(e) => { log::warn!("SlmEngine: CUDA unavailable ({e}) — CPU fallback"); Device::Cpu }
+            let device = match Device::new_cuda(0) {
+                Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
+                Err(e) => {
+                    log::error!("SlmEngine: CUDA device unavailable ({e}) — inference is GPU-only, cannot load '{}'", spec.name);
+                    return None;
                 }
             };
             match load_engine(spec, device) {
@@ -1066,15 +1049,11 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
         return true; // already resident
     }
     *guard = None;
-    let device = if cpu_inference_enabled() {
-        Device::Cpu
-    } else {
-        match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("SlmEngine: ensure_loaded CUDA unavailable ({e}) — CPU fallback");
-                Device::Cpu
-            }
+    let device = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("SlmEngine: ensure_loaded CUDA unavailable ({e}) — inference is GPU-only, cannot load '{}'", spec.name);
+            return false;
         }
     };
     match load_engine(spec, device) {

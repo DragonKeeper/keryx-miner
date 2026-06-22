@@ -59,7 +59,7 @@ pub const GEMMA_3_4B: ModelSpec = ModelSpec {
     config_cid: "",
     weight_cids: &["Qma1CbFzWTNhy2ReVjDG1GvM5q2Uy4VhqTbnS9c641jUQ6"],
     dir_name: "Gemma-3-4B",
-    // Baseline model — never gated. ~4 GB Q4_K_M; GPUs too small must use --cpu-inference.
+    // Baseline model — never gated. ~4 GB Q4_K_M; runs on any GPU that can mine.
     min_vram_mb: 0,
 };
 
