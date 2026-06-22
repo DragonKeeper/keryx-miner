@@ -7,7 +7,7 @@
 ///   --light       Gemma-3-4B-it-abliterated     (Google)  — any GPU (6 GB+)
 ///   (default)     Dolphin-3.0-Llama-3.1-8B       (Llama)  — RTX 3060 12GB / 3070
 ///   --high        Qwen3-32B-abliterated (Q4_K_M) (Qwen)   — 24 GB (3090 / 4090 / 5090)
-///   --very-high   Llama-3.3-70B-abliterated      (Meta)   — 48 GB single-GPU or --vram-pool
+///   --very-high   Llama-3.3-70B-abliterated      (Meta)   — 48 GB single-GPU
 ///
 /// All GGUF weights + tokenizers are pinned on the Keryx IPFS gateway; each
 /// model_id = base58-decode(weight CID)[2..34].
@@ -113,7 +113,7 @@ pub const LLAMA_3_3_70B: ModelSpec = ModelSpec {
     config_cid: "",
     weight_cids: &["QmPdTayXcEsfUwMCoMKKcLSv7Dwpp2xVBWELwrG2M7Rhzu"],
     dir_name: "Llama-3.3-70B",
-    // ~42.5 GB Q4_K_M weights + ~3.5 GB KV/workspace → 48 GB card or --vram-pool (matches the
+    // ~42.5 GB Q4_K_M weights + ~3.5 GB KV/workspace → 48 GB card (matches the
     // --very-high 46 GB startup gate).
     min_vram_mb: 46_000,
 };

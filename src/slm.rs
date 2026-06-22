@@ -13,7 +13,6 @@ use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Weights;
 use candle_transformers::models::quantized_gemma3::ModelWeights as Gemma3Weights;
 use crate::quantized_llama_split::ModelWeights as SplitWeights;
-use crate::quantized_qwen2_split::ModelWeights as Qwen2SplitWeights;
 use crate::quantized_qwen3_split::ModelWeights as Qwen3SplitWeights;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -92,21 +91,6 @@ pub fn cpu_inference_enabled() -> bool {
     FORCE_CPU_INFERENCE.load(AtomicOrdering::Relaxed)
 }
 
-/// When true, GGUF models are loaded with their layers split evenly across all
-/// available CUDA devices (layer-split VRAM pooling). Set once at startup from
-/// the `--vram-pool` CLI flag. EXPERIMENTAL.
-static VRAM_POOL: AtomicBool = AtomicBool::new(false);
-
-/// Enable layer-split VRAM pooling across all CUDA GPUs (see [`VRAM_POOL`]). Call once at startup.
-pub fn set_vram_pool(enabled: bool) {
-    VRAM_POOL.store(enabled, AtomicOrdering::Relaxed);
-}
-
-/// Whether layer-split VRAM pooling is enabled.
-pub fn vram_pool_enabled() -> bool {
-    VRAM_POOL.load(AtomicOrdering::Relaxed)
-}
-
 /// When true, the mining-tier model is loaded via the layer-split loader even on a single GPU,
 /// so it lands as a `QuantizedQwen3Split` (etc.) that exposes `pom_quant_tensors()`. This lets
 /// the PoM walk share the inference weights in place (Option C2 zero-dup). Set at startup when
@@ -126,17 +110,15 @@ pub fn pom_force_split() -> bool {
 enum ModelInner {
     Full { model: Llama, config: Config, cache_dtype: DType },
     Quantized(ModelWeights),
-    /// GGUF llama-arch model with layers split across multiple CUDA devices (--vram-pool).
+    /// GGUF llama-arch model via the split loader (single-device, for PoM zero-dup tensor sharing).
     QuantizedSplit(SplitWeights),
     QuantizedQwen3(Qwen3Weights),
-    /// GGUF Qwen3-arch dense model (Qwen3-32B) with layers split across CUDA devices (--vram-pool).
+    /// GGUF Qwen3-arch dense model (Qwen3-32B) via the split loader (single-device, PoM zero-dup).
     QuantizedQwen3Split(Qwen3SplitWeights),
     /// GGUF Gemma-3-arch model (Gemma-3-4B, baseline tier). Single-device only.
     QuantizedGemma3(Gemma3Weights),
     /// GGUF Qwen2-arch model (legacy DeepSeek-R1-32B, pre-OPoI-v2 lineup). Single-device.
     QuantizedQwen2(Qwen2Weights),
-    /// GGUF Qwen2-arch model with layers split across CUDA devices (--vram-pool).
-    QuantizedQwen2Split(Qwen2SplitWeights),
 }
 
 struct SlmEngine {
@@ -425,55 +407,6 @@ fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str
     }
 }
 
-/// Enumerate every available CUDA device for --vram-pool, starting from the
-/// already-open primary device (ordinal 0). Stops at the first ordinal that
-/// fails to open.
-fn cuda_pool_devices(primary: &Device) -> Vec<Device> {
-    let mut devices = vec![primary.clone()];
-    for ordinal in 1.. {
-        match Device::new_cuda(ordinal) {
-            Ok(d) => devices.push(d),
-            Err(_) => break,
-        }
-    }
-    devices
-}
-
-/// Total VRAM (MB) of the smallest CUDA card in the rig, via `nvidia-smi`.
-/// Conservative (min across cards) so a model that fits the smallest card can be
-/// loaded on a single GPU. Returns `None` if nvidia-smi is unavailable.
-fn min_gpu_vram_mb() -> Option<u64> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse::<u64>().ok())
-        .min()
-}
-
-/// VRAM headroom (MB) reserved on top of the GGUF weight footprint for the KV
-/// cache, activations and CUDA workspace when deciding single-GPU vs layer-split.
-const SINGLE_GPU_HEADROOM_MB: u64 = 2_048;
-
-/// Under `--vram-pool`, decide whether a GGUF model must be layer-split across
-/// GPUs. A model that comfortably fits one card is loaded on a single GPU to avoid
-/// needless inter-GPU pipeline overhead (e.g. Gemma-3-4B on a 6-GPU rig). When the
-/// per-card VRAM cannot be determined, defaults to splitting (previous behaviour).
-fn model_needs_pooling(gguf_path: &std::path::Path) -> bool {
-    let Some(card_mb) = min_gpu_vram_mb() else {
-        return true;
-    };
-    let model_mb = std::fs::metadata(gguf_path)
-        .map(|m| m.len() / (1024 * 1024))
-        .unwrap_or(u64::MAX);
-    model_mb.saturating_add(SINGLE_GPU_HEADROOM_MB) > card_mb
-}
-
 fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
     log::info!("SlmEngine: loading '{}'…", spec.name);
 
@@ -507,29 +440,10 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .with_context(|| format!("open {}", gguf_path.display()))?;
             let content = gguf_file::Content::read(&mut gguf_file)
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
-            // --vram-pool: split layers evenly across every CUDA device so the
-            // pooled VRAM can hold models no single card fits. Falls back to a
-            // regular single-device load when only one GPU is present.
-            let inner = if vram_pool_enabled() && device.is_cuda() && model_needs_pooling(&gguf_path) {
-                let devices = cuda_pool_devices(&device);
-                if devices.len() >= 2 {
-                    log::info!(
-                        "SlmEngine: --vram-pool — splitting '{}' layers evenly across {} GPUs",
-                        spec.name,
-                        devices.len()
-                    );
-                    let model = SplitWeights::from_gguf(content, &mut gguf_file, &devices)
-                        .map_err(|e| anyhow!("load gguf weights (split): {}", e))?;
-                    ModelInner::QuantizedSplit(model)
-                } else {
-                    log::warn!(
-                        "SlmEngine: --vram-pool set but only one CUDA device found — single-GPU load"
-                    );
-                    let model = ModelWeights::from_gguf(content, &mut gguf_file, &device)
-                        .map_err(|e| anyhow!("load gguf weights: {}", e))?;
-                    ModelInner::Quantized(model)
-                }
-            } else if pom_force_split() && device.is_cuda() {
+            // PoM zero-dup: load via the single-device split loader so the mining-tier model
+            // exposes its quant tensors for in-place sharing with the possession walk. Otherwise
+            // a regular single-device load.
+            let inner = if pom_force_split() && device.is_cuda() {
                 log::info!(
                     "SlmEngine: PoM zero-dup — loading '{}' (LLaMA) via single-device split loader",
                     spec.name
@@ -538,12 +452,6 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                     .map_err(|e| anyhow!("load gguf weights (pom split): {}", e))?;
                 ModelInner::QuantizedSplit(model)
             } else {
-                if vram_pool_enabled() && device.is_cuda() {
-                    log::info!(
-                        "SlmEngine: '{}' fits a single GPU — loading on one device (no --vram-pool split)",
-                        spec.name
-                    );
-                }
                 let model = ModelWeights::from_gguf(content, &mut gguf_file, &device)
                     .map_err(|e| anyhow!("load gguf weights: {}", e))?;
                 ModelInner::Quantized(model)
@@ -564,8 +472,7 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .with_context(|| format!("open {}", gguf_path.display()))?;
             let content = gguf_file::Content::read(&mut gguf_file)
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
-            // Gemma-3-4B is the baseline tier — small enough to always fit a single
-            // GPU, so it never uses the --vram-pool layer split.
+            // Gemma-3-4B is the baseline tier — always loaded single-device (no split loader).
             let model = Gemma3Weights::from_gguf(content, &mut gguf_file, &device)
                 .map_err(|e| anyhow!("load gemma3 gguf weights: {}", e))?;
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
@@ -584,38 +491,9 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .with_context(|| format!("open {}", gguf_path.display()))?;
             let content = gguf_file::Content::read(&mut gguf_file)
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
-            // --vram-pool: split layers across every CUDA device (legacy DeepSeek-R1-32B
-            // served by a multi-GPU rig). Falls back to single-device otherwise.
-            let inner = if vram_pool_enabled() && device.is_cuda() && model_needs_pooling(&gguf_path) {
-                let devices = cuda_pool_devices(&device);
-                if devices.len() >= 2 {
-                    log::info!(
-                        "SlmEngine: --vram-pool — splitting '{}' (Qwen2) layers evenly across {} GPUs",
-                        spec.name,
-                        devices.len()
-                    );
-                    let model = Qwen2SplitWeights::from_gguf(content, &mut gguf_file, &devices)
-                        .map_err(|e| anyhow!("load qwen2 gguf weights (split): {}", e))?;
-                    ModelInner::QuantizedQwen2Split(model)
-                } else {
-                    log::warn!(
-                        "SlmEngine: --vram-pool set but only one CUDA device found — single-GPU load"
-                    );
-                    let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
-                        .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
-                    ModelInner::QuantizedQwen2(model)
-                }
-            } else {
-                if vram_pool_enabled() && device.is_cuda() {
-                    log::info!(
-                        "SlmEngine: '{}' fits a single GPU — loading on one device (no --vram-pool split)",
-                        spec.name
-                    );
-                }
-                let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
-                    .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
-                ModelInner::QuantizedQwen2(model)
-            };
+            let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
+                .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
+            let inner = ModelInner::QuantizedQwen2(model);
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
@@ -632,28 +510,9 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .with_context(|| format!("open {}", gguf_path.display()))?;
             let content = gguf_file::Content::read(&mut gguf_file)
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
-            // --vram-pool: split layers across every CUDA device (Qwen3-32B served by
-            // a multi-GPU rig). Falls back to single-device otherwise.
-            let inner = if vram_pool_enabled() && device.is_cuda() && model_needs_pooling(&gguf_path) {
-                let devices = cuda_pool_devices(&device);
-                if devices.len() >= 2 {
-                    log::info!(
-                        "SlmEngine: --vram-pool — splitting '{}' (Qwen3) layers evenly across {} GPUs",
-                        spec.name,
-                        devices.len()
-                    );
-                    let model = Qwen3SplitWeights::from_gguf(content, &mut gguf_file, &devices)
-                        .map_err(|e| anyhow!("load qwen3 gguf weights (split): {}", e))?;
-                    ModelInner::QuantizedQwen3Split(model)
-                } else {
-                    log::warn!(
-                        "SlmEngine: --vram-pool set but only one CUDA device found — single-GPU load"
-                    );
-                    let model = Qwen3Weights::from_gguf(content, &mut gguf_file, &device)
-                        .map_err(|e| anyhow!("load qwen3 gguf weights: {}", e))?;
-                    ModelInner::QuantizedQwen3(model)
-                }
-            } else if pom_force_split() && device.is_cuda() {
+            // PoM zero-dup: single-device split loader (exposes quant tensors for the walk),
+            // otherwise a regular single-device load.
+            let inner = if pom_force_split() && device.is_cuda() {
                 log::info!(
                     "SlmEngine: PoM zero-dup — loading '{}' (Qwen3) via single-device split loader",
                     spec.name
@@ -662,12 +521,6 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                     .map_err(|e| anyhow!("load qwen3 gguf weights (pom split): {}", e))?;
                 ModelInner::QuantizedQwen3Split(model)
             } else {
-                if vram_pool_enabled() && device.is_cuda() {
-                    log::info!(
-                        "SlmEngine: '{}' fits a single GPU — loading on one device (no --vram-pool split)",
-                        spec.name
-                    );
-                }
                 let model = Qwen3Weights::from_gguf(content, &mut gguf_file, &device)
                     .map_err(|e| anyhow!("load qwen3 gguf weights: {}", e))?;
                 ModelInner::QuantizedQwen3(model)
@@ -916,26 +769,6 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
             }
         }
         ModelInner::QuantizedQwen2(model) => {
-            for step in 0..max_steps {
-                let (input_ids, pos) = if step == 0 {
-                    (all_tokens.as_slice(), 0usize)
-                } else {
-                    let last = all_tokens.len() - 1;
-                    (&all_tokens[last..], last)
-                };
-                let input = Tensor::new(input_ids, &engine.device)
-                    .and_then(|t| t.unsqueeze(0))
-                    .map_err(|e| anyhow!("input tensor: {}", e))?;
-                let logits = model.forward(&input, pos)
-                    .map_err(|e| anyhow!("forward: {}", e))?;
-                let next = sample_next(&logits, &mut lp, &all_tokens)?;
-                if engine.stop_token_ids.contains(&next) { break; }
-                all_tokens.push(next);
-                generated.push(next);
-                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
-            }
-        }
-        ModelInner::QuantizedQwen2Split(model) => {
             for step in 0..max_steps {
                 let (input_ids, pos) = if step == 0 {
                     (all_tokens.as_slice(), 0usize)

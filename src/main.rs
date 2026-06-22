@@ -124,10 +124,10 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
 ///   Gemma-3-4B      →  ~2.7 GB
 ///   Dolphin-8B      →  ~4.9 GB
 ///   Qwen3-32B       → ~19.5 GB  (requires ≥24 GB card)
-///   Llama-3.3-70B   → ~42.5 GB  (requires ≥48 GB card or --vram-pool)
+///   Llama-3.3-70B   → ~42.5 GB  (requires ≥48 GB card)
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
-fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: bool) {
+fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=power.limit,power.max_limit,memory.total",
@@ -135,16 +135,14 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: boo
         ])
         .output();
 
-    // nvidia-smi prints one line per GPU. The power check applies to GPU 0;
-    // for VRAM, --vram-pool combines every CUDA device (layer-split inference),
-    // so the gate must consider their summed capacity.
+    // nvidia-smi prints one line per GPU; the power + VRAM check applies to GPU 0
+    // (the device the miner mines/serves on).
     let (current_w, vram_mb) = match output {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
             let mut cur = 0u32;
             let mut vram = 0u64;
-            let gpu_limit = if vram_pool { usize::MAX } else { 1 };
-            for (i, line) in s.trim().lines().take(gpu_limit).enumerate() {
+            for (i, line) in s.trim().lines().take(1).enumerate() {
                 let mut parts = line.split(',');
                 let line_cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
                 let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
@@ -161,8 +159,8 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: boo
 
     // VRAM sufficiency for the selected tier (Q4_K_M weights + KV cache + CUDA workspace).
     // Insufficient VRAM means GPU inference for this tier will OOM. This is non-fatal — a
-    // host/CPU or pooled path can still serve it — so warn rather than error, and do NOT then
-    // claim the model is "ready" on the same GPU (the contradictory ERROR-then-ready pair).
+    // host/CPU path can still serve it — so warn rather than error, and do NOT then claim the
+    // model is "ready" on the same GPU (the contradictory ERROR-then-ready pair).
     let (model_label, min_vram_mb): (&str, u64) = if needs_very_high {
         ("Llama-3.3-70B (--very-high)", 46_000)
     } else if needs_high {
@@ -173,22 +171,21 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: boo
 
     if vram_mb < min_vram_mb {
         log::warn!(
-            "⚠  {} needs ≥{} GB VRAM but only {} GB {} — GPU inference for this tier will OOM. \
-             Use a smaller tier (--high Qwen3-32B / --light Gemma-3-4B), pool with --vram-pool, \
-             or serve it via a host/CPU path.",
+            "⚠  {} needs ≥{} GB VRAM but only {} GB on this GPU — GPU inference for this tier \
+             will OOM. Use a smaller tier (--high Qwen3-32B / --light Gemma-3-4B) or serve it \
+             via a host/CPU path.",
             model_label,
             min_vram_mb / 1024,
             vram_mb / 1024,
-            if vram_pool { "pooled across all GPUs" } else { "on this GPU" }
         );
     } else {
         log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
     }
 }
 
-/// Query VRAM via nvidia-smi: returns (gpu0_mb, sum_of_all_gpus_mb), or None
-/// when nvidia-smi is unavailable or unparseable (e.g. AMD-only machines).
-fn query_vram_mb() -> Option<(u64, u64)> {
+/// GPU 0 total VRAM (MB) via nvidia-smi, or None when nvidia-smi is unavailable or
+/// unparseable (e.g. AMD-only machines). GPU 0 is the device the miner mines/serves on.
+fn query_vram_mb() -> Option<u64> {
     let output = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .output()
@@ -196,35 +193,24 @@ fn query_vram_mb() -> Option<(u64, u64)> {
     if !output.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&output.stdout);
-    let mut gpu0 = None;
-    let mut total = 0u64;
-    for line in s.trim().lines() {
-        let v: u64 = line.trim().parse().ok()?;
-        if gpu0.is_none() {
-            gpu0 = Some(v);
-        }
-        total += v;
-    }
-    gpu0.map(|g| (g, total))
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u64>().ok())
 }
 
 /// OPoI capability gate (layer A): drop the models this machine cannot actually
-/// serve, so the `ai:cap` announcement never promises a model the miner would
-/// fail to load — a 24 GB card running --very-high must announce 3 models, not 4.
-/// Pool-aware: with --vram-pool the summed VRAM only counts for llama-arch GGUF
-/// models (the only format the layer-split loader supports); every other format
-/// still has to fit on GPU 0. Skipped under --cpu-inference (no VRAM constraint)
-/// and when nvidia-smi is unavailable (CPU-fallback setups keep working).
+/// serve on GPU 0, so the `ai:cap` announcement never promises a model the miner
+/// would fail to load. Skipped under --cpu-inference (no VRAM constraint) and when
+/// nvidia-smi is unavailable (CPU-fallback setups keep working).
 fn filter_specs_by_vram(
     specs: &'static [&'static keryx_miner::models::ModelSpec],
-    vram_pool: bool,
     cpu_inference: bool,
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
     if cpu_inference {
         return specs;
     }
-    let Some((gpu0_mb, pooled_mb)) = query_vram_mb() else {
+    let Some(gpu0_mb) = query_vram_mb() else {
         log::warn!("Cannot query GPU VRAM (nvidia-smi) — skipping the model capability gate.");
         return specs;
     };
@@ -232,33 +218,14 @@ fn filter_specs_by_vram(
         .iter()
         .copied()
         .filter(|spec| {
-            let splittable = vram_pool
-                && matches!(
-                    spec.format,
-                    keryx_miner::models::ModelFormat::Gguf
-                        | keryx_miner::models::ModelFormat::GgufQwen3
-                );
-            let available = if splittable { pooled_mb } else { gpu0_mb };
-            if spec.min_vram_mb <= available {
+            if spec.min_vram_mb <= gpu0_mb {
                 true
             } else {
                 log::warn!(
-                    "✗  '{}' needs ≥{} MB VRAM but only {} MB available{} — model NOT announced (ai:cap) and not downloaded.{}",
+                    "✗  '{}' needs ≥{} MB VRAM but only {} MB on GPU 0 — model NOT announced (ai:cap) and not downloaded.",
                     spec.name,
                     spec.min_vram_mb,
-                    available,
-                    if splittable { " pooled" } else { " on GPU 0" },
-                    if !vram_pool && pooled_mb >= spec.min_vram_mb
-                        && matches!(
-                            spec.format,
-                            keryx_miner::models::ModelFormat::Gguf
-                                | keryx_miner::models::ModelFormat::GgufQwen3
-                        )
-                    {
-                        " Your combined GPUs could serve it with --vram-pool."
-                    } else {
-                        ""
-                    }
+                    gpu0_mb,
                 );
                 false
             }
@@ -454,7 +421,7 @@ async fn main() -> Result<(), Error> {
 
     // Warn if GPU power limit is below safe threshold for the selected model tier.
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
-    check_gpu_power_limit(opt.high || opt.very_high, opt.very_high, opt.vram_pool);
+    check_gpu_power_limit(opt.high || opt.very_high, opt.very_high);
 
     let tier = if opt.very_high {
         info!("--very-high mode: top tier — mines Llama-3.3-70B under PoM.");
@@ -479,12 +446,10 @@ async fn main() -> Result<(), Error> {
     // chain crosses H — `specs_for(0, ..)` so a fresh chain declares the legacy models.
     let specs_v1 = filter_specs_by_vram(
         keryx_miner::models::specs_for(0, tier),
-        opt.vram_pool,
         opt.cpu_inference,
     );
     let specs_v2 = filter_specs_by_vram(
         keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
-        opt.vram_pool,
         opt.cpu_inference,
     );
     // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
@@ -504,10 +469,6 @@ async fn main() -> Result<(), Error> {
     keryx_miner::slm::set_cpu_inference(opt.cpu_inference);
     if opt.cpu_inference {
         info!("--cpu-inference mode: OPoI inference runs on CPU, GPU stays dedicated to hashing.");
-    }
-    keryx_miner::slm::set_vram_pool(opt.vram_pool);
-    if opt.vram_pool {
-        info!("--vram-pool mode (EXPERIMENTAL): GGUF model layers split evenly across all CUDA devices.");
     }
     info!(
         "OPoI Phase-3 active — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",

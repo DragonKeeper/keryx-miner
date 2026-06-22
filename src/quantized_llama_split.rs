@@ -1,12 +1,13 @@
-//! Device-mapped fork of candle-transformers' `quantized_llama` (v0.8.4) for
-//! multi-GPU VRAM pooling via layer-split (pipeline) inference.
+//! Device-mapped fork of candle-transformers' `quantized_llama` (v0.8.4). Used
+//! single-device by PoM zero-dup: loading the llama-arch mining tier through this
+//! loader exposes its quantized tensors (`pom_quant_tensors`) so the possession
+//! walk can share them in place.
 //!
 //! Stock candle loads every transformer block onto a single device. This fork
-//! assigns each block to one device of a caller-provided list (blocks are split
-//! evenly, e.g. 50/50 on 2 GPUs) and moves the hidden state across devices at
-//! split boundaries during `forward`. Inter-layer activations are tiny — one
-//! `hidden_size` vector per token (~16-32 KB for a 70B) — so this works even
-//! over the PCIe x1 risers found on mining rigs. The KV cache of each block
+//! assigns each block to one device of a caller-provided list (a single device
+//! under PoM) and moves the hidden state across devices at split boundaries
+//! during `forward`. Inter-layer activations are tiny — one `hidden_size` vector
+//! per token (~16-32 KB for a 70B). The KV cache of each block
 //! lives on that block's device, so cache memory is pooled too.
 //!
 //! Differences from the upstream implementation:

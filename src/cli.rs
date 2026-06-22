@@ -4,7 +4,7 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored model tiers (default: Gemma-3-4B + Dolphin-8B — RTX 3060 12GB / 3070 / 3080):\n  --light      Gemma-3-4B only — RTX 3060 6GB or any GPU\n  (default)    Gemma-3-4B + Dolphin-3.0-Llama-3.1-8B — RTX 3060 12GB / 3070 / 3080\n  --high       + Qwen3-32B (Q4_K_M) — RTX 3090 / 4090 / 5090 (24GB+)\n  --very-high  + Llama-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S) or --vram-pool", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored model tiers (default: Gemma-3-4B + Dolphin-8B — RTX 3060 12GB / 3070 / 3080):\n  --light      Gemma-3-4B only — RTX 3060 6GB or any GPU\n  (default)    Gemma-3-4B + Dolphin-3.0-Llama-3.1-8B — RTX 3060 12GB / 3070 / 3080\n  --high       + Qwen3-32B (Q4_K_M) — RTX 3090 / 4090 / 5090 (24GB+)\n  --very-high  Llama-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)", term_width = 0)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-high",
-        help = "Model tier: Gemma-3-4B + Dolphin-8B + Qwen3-32B + Llama-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S) or --vram-pool",
+        help = "Model tier: Llama-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high"]
     )]
@@ -39,14 +39,6 @@ pub struct Opt {
         requires = "light"
     )]
     pub cpu_inference: bool,
-
-    #[clap(
-        long = "vram-pool",
-        help = "EXPERIMENTAL: pool the VRAM of all CUDA GPUs by splitting GGUF model layers evenly across them (layer-split inference). Lets a multi-GPU rig serve models no single card can hold (e.g. 2x 24GB for Llama-3.3-70B, 2x 16GB for Qwen3-32B). Falls back to single-GPU when only one device is present.",
-        help_heading = "OPoI / Inference",
-        conflicts_with = "cpu_inference"
-    )]
-    pub vram_pool: bool,
 
     #[clap(
         long = "ipfs-url",

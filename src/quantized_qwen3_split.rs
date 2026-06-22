@@ -1,10 +1,11 @@
-//! Device-mapped fork of candle-transformers' `quantized_qwen3` for multi-GPU
-//! VRAM pooling via layer-split (pipeline) inference.
+//! Device-mapped fork of candle-transformers' `quantized_qwen3`. Used single-device
+//! by PoM zero-dup: loading Qwen3-32B through this loader exposes its quantized
+//! tensors (`pom_quant_tensors`) so the possession walk can share them in place.
 //!
 //! Same idea as `quantized_llama_split`: each transformer block is assigned to
-//! one device of a caller-provided list, the hidden state is moved across
-//! devices at split boundaries during `forward`, and each block's KV cache lives
-//! on its device. Lets a rig pool its VRAM to serve Qwen3-32B (Q4_K_M, ~20 GB).
+//! one device of a caller-provided list (a single device under PoM), the hidden
+//! state is moved across devices at split boundaries during `forward`, and each
+//! block's KV cache lives on its device.
 //!
 //! Qwen3 architecture specifics (vs the LLaMA split fork):
 //! - NO q/k/v bias (Qwen2 has them; Qwen3 does not).
