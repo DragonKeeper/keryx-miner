@@ -74,6 +74,8 @@ podman run --rm --security-opt label=disable \
 
 Binary: `target-cuda/release/keryx-miner`
 
+> **Always pass `-e CUDA_COMPUTE_CAP`.** The container does **not** inherit your host shell env, so you must set the compute cap with `-e` (as above). If you omit it, `candle-kernels` auto-detects the installed GPU and a Blackwell card resolves to `100` — which nvcc 12.2 rejects (`nvcc cannot target gpu arch 100`). On a 5090, set `-e CUDA_COMPUTE_CAP=89` (not `100`). If a previous run already cached the wrong value, clear the build dir first: `rm -rf target-cuda`.
+
 > **Runtime dependencies.** PoW needs only `libcuda.so.1` (the driver). GPU **inference** additionally `dlopen`s `libcublas.so.12` and `libcurand.so.10` at runtime, so the host must have the matching CUDA 12.2 runtime libs (`libcublas-12-2`, `libcurand-12-2`). On HiveOS the miner installs and registers them automatically on first run; on other hosts install them via your package manager or the CUDA 12.2 toolkit.
 
 **CUDA_COMPUTE_CAP by GPU generation:**
