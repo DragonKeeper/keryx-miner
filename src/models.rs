@@ -211,8 +211,9 @@ pub const LLAMA_3_3_70B_OFFICIAL: ModelSpec = ModelSpec {
 
 /// OPoI v2 hardfork activation DAA score. MUST match the node's `opoi_v2_activation`.
 /// Below this score the miner runs/announces the legacy lineup; at or above it, the
-/// uncensored lineup. ⚠️ TESTNET value — revert to mainnet H (same as the node) before release.
-pub const OPOI_V2_ACTIVATION_DAA: u64 = 5_000;
+/// uncensored lineup. Mainnet: 37_780_000 (2026-06-26 18:00 UTC) — same H as the node's
+/// MAINNET_PARAMS.opoi_v2_activation = new(37_780_000).
+pub const OPOI_V2_ACTIVATION_DAA: u64 = 37_780_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tier {

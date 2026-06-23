@@ -543,7 +543,9 @@ fn finalize_disk_tree(
 /// Testnet: `5_000` = mid-chain activation, to observe the kHeavyHash→PoM transition (incl.
 /// the difficulty drift: PoM ~30x slower → blocks slow at the cutover, then the DAA window
 /// recovers). Mainnet will need a difficulty reset at H.
-pub const POM_ACTIVATION_DAA: u64 = 5_000;
+/// Mainnet: 37_780_000 (2026-06-26 18:00 UTC) — MUST equal the node's
+/// MAINNET_PARAMS.pom_activation = new(37_780_000).
+pub const POM_ACTIVATION_DAA: u64 = 37_780_000;
 
 /// The resident tier weight index + tier id, installed once at startup when PoM is enabled.
 static POM_INDEX: OnceLock<(WeightIndex, u8)> = OnceLock::new();
