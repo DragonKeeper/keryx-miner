@@ -6,7 +6,7 @@
 __MD="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
 . "$__MD/h-manifest.conf"
 
-stats_raw=`cat $CUSTOM_LOG_BASENAME.log | grep "Current hashrate is" | tail -n 1`
+stats_raw=`cat $CUSTOM_LOG_BASENAME.log | tr -d '\000' | grep "Current hashrate is" | tail -n 1`
 
 maxDelay=120
 time_now=`date +%s`
@@ -20,14 +20,19 @@ time_rep=`date -d "$ts_field" +%s 2>/dev/null || echo 0`
 diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
 
 if [ "$diffTime" -lt "$maxDelay" ]; then
-        # Value is second-to-last field (before unit), unit is last field
-        total_hashrate=`echo $stats_raw | awk '{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+        # Value is second-to-last field (before unit), unit is last field.
+        # The miner logs the rate with 2 decimals, so cut+sed yields rate*1000 (e.g. 3.83 -> 3830).
+        # HiveOS expects kilohashes (khs): Ghash/s = rate*1e6 khs = (rate*1000)*1e3, etc.
+        total_hashrate=`echo $stats_raw | awk 'NF>=2{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+        # Force base 10: a sub-1.0 rate yields a leading zero (e.g. 0.48 -> "0480") which bash would
+        # otherwise parse as octal and reject ("value too great for base").
+        total_hashrate=$((10#${total_hashrate:-0}))
         if [[ $stats_raw == *"Thash"* ]]; then
-                total_hashrate=$(($total_hashrate*1000000000))
-        elif [[ $stats_raw == *"Ghash"* ]]; then
                 total_hashrate=$(($total_hashrate*1000000))
-        elif [[ $stats_raw == *"Mhash"* ]]; then
+        elif [[ $stats_raw == *"Ghash"* ]]; then
                 total_hashrate=$(($total_hashrate*1000))
+        elif [[ $stats_raw == *"Mhash"* ]]; then
+                : # Mhash/s = rate*1e3 khs = rate*1000 already, no multiplier needed
         fi
 
         # GPU status
@@ -55,15 +60,19 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 busid_arr+=($((16#${BASH_REMATCH[1]})))
                 temp_arr+=(${temps[i]})
                 fan_arr+=(${fans[i]})
-                # Per-device line: "... [INFO ] Device #N: 5.23 Ghash/s"
-                gpu_raw=`cat $CUSTOM_LOG_BASENAME.log | grep "Device #$i:" | tail -n 1`
-                hashrate=`echo $gpu_raw | awk '{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+                # Per-device line: "... Device #N (GPU name): 5.23 Ghash/s" — the worker id is
+                # "#N (name)" so the colon is after the name, not after the number; match "#N" followed
+                # by a space or colon (never "#N:" directly, which would also break for N=1 vs N=10).
+                gpu_raw=`cat $CUSTOM_LOG_BASENAME.log | tr -d '\000' | grep -E "Device #$i[ :]" | tail -n 1`
+                hashrate=`echo $gpu_raw | awk 'NF>=2{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+                # Force base 10 (sub-1.0 rates yield a leading zero that bash would parse as octal).
+                hashrate=$((10#${hashrate:-0}))
                 if [[ $gpu_raw == *"Thash"* ]]; then
-                        hashrate=$(($hashrate*1000000000))
-                elif [[ $gpu_raw == *"Ghash"* ]]; then
                         hashrate=$(($hashrate*1000000))
-                elif [[ $gpu_raw == *"Mhash"* ]]; then
+                elif [[ $gpu_raw == *"Ghash"* ]]; then
                         hashrate=$(($hashrate*1000))
+                elif [[ $gpu_raw == *"Mhash"* ]]; then
+                        : # Mhash/s = rate*1e3 khs = rate*1000 already, no multiplier needed
                 fi
                 hash_arr+=($hashrate)
         done
@@ -83,7 +92,7 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 --argjson fan "$fan_json" \
                 --argjson temp "$temp_json" \
                 --arg uptime "$uptime" \
-                '{ hs: $hs, hs_units: "khs", algo: "heavyhash", ver: $ver, $uptime, $bus_numbers, $temp, $fan }')
+                '{ hs: $hs, hs_units: "khs", algo: "keryxhash", ver: $ver, $uptime, $bus_numbers, $temp, $fan }')
         khs=$total_hashrate
 else
         khs=0
