@@ -435,15 +435,9 @@ async fn main() -> Result<(), Error> {
         info!("default mode: mines Dolphin-8B under PoM.");
         keryx_miner::models::Tier::Default
     };
-    // OPoI v2 hardfork: the model lineup is DAA-gated (mirrors the node's
-    // opoi_v2_activation). Stage BOTH lineups for this tier — each filtered by what
-    // this hardware can serve (layer-A capability gate) — so the chain crossing
-    // hot-swaps without a restart:
-    //   - legacy (daa < H) is prefetched now and mined immediately;
-    //   - uncensored (daa >= H) is prefetched in the background and swapped in at H.
-    // `specs_v1` is the CURRENT (legacy, daa < H) lineup the miner announces and serves until the
-    // chain crosses H — `specs_for(0, ..)` so a fresh chain declares the legacy models.
-    let specs_v1 = filter_specs_by_vram(keryx_miner::models::specs_for(0, tier));
+    // Post-OPoI-v2 only: the legacy lineup (daa < H) is dead — the OPoI-v2 hardfork (DAA H) is in
+    // the past, so no fresh miner is ever pre-H again. We stage and download ONLY the uncensored
+    // lineup (`specs_for(>= H, ..)`), filtered by what this hardware can serve (layer-A gate).
     let specs_v2 = filter_specs_by_vram(
         keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
     );
@@ -459,28 +453,16 @@ async fn main() -> Result<(), Error> {
     } else {
         None
     };
+    // Serve the uncensored lineup from the start. set_v2_lineup keeps the readiness-gated
+    // crossing swap a consistent no-op (it would swap v2 -> v2).
     keryx_miner::slm::set_v2_lineup(specs_v2);
-    keryx_miner::slm::init_supported(specs_v1);
+    keryx_miner::slm::init_supported(specs_v2);
     log::debug!(
-        "OPoI Phase-3 active — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
-        specs_v1.len(),
+        "OPoI Phase-3 active — {} uncensored model(s) staged (legacy lineup dropped, post-fork).",
         specs_v2.len(),
-        keryx_miner::models::OPOI_V2_ACTIVATION_DAA
     );
-    // Block on BOTH lineups before mining: never start hashing while a model this miner
-    // will serve — the legacy set now AND the uncensored set after the hardfork swap — is
-    // still downloading. The readiness-gated swap then activates v2 instantly at H.
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await {
-        Ok(Ok(())) => log::debug!("Legacy model files ready."),
-        Ok(Err(e)) => {
-            error!("Model prefetch failed — refusing to mine without inference capability: {}", e);
-            return Err(e.into());
-        }
-        Err(e) => {
-            error!("Model prefetch task panicked: {}", e);
-            return Err(e.into());
-        }
-    }
+    // Block until the uncensored lineup is fully downloaded before mining: never start hashing
+    // while a model this miner will serve is still downloading.
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
         Ok(Ok(())) => info!("Model files ready — starting mining."),
         Ok(Err(e)) => {
