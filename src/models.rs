@@ -303,9 +303,8 @@ pub const OPOI_V2_ACTIVATION_DAA: u64 = 37_780_000;
 ///     their 4-tier indices.
 ///   - `--very-high` swaps Llama-3.3-70B Q4_K_M (48 GB-only) → Q2_K_L (fits a 32 GB 5090).
 /// (Named for very-light for history; it now gates the whole H2 refresh.)
-/// TODO(H2): set the real activation DAA when the hardfork is scheduled (both miner AND node).
-/// `u64::MAX` = effectively disabled (lineup unchanged) until then.
-pub const VERY_LIGHT_ACTIVATION_DAA: u64 = u64::MAX;
+/// Must stay in lockstep with the node's `very_light_activation` (same DAA on both sides).
+pub const VERY_LIGHT_ACTIVATION_DAA: u64 = 38_951_445;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
