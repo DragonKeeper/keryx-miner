@@ -10,17 +10,252 @@
 //! so a nonce found here builds a `PomProof` (host) the node accepts.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 
-use log::info;
+use log::{info, warn};
 
-use candle_core::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use candle_core::cuda_backend::cudarc::driver::{result, sys, DevicePtr, CudaSlice, CudaStream, LaunchConfig};
 use candle_core::quantized::{gguf_file, QTensor};
 use candle_core::{CudaDevice, Device};
 
-const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine.ptx"));
+const PTX_SM90: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm90.ptx"));
+const PTX_SM89: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm89.ptx"));
+const PTX_SM86: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm86.ptx"));
+const PTX_SM80: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm80.ptx"));
+const PTX_SM75: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm75.ptx"));
+const PTX_SM70: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm70.ptx"));
+const PTX_SM61: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm61.ptx"));
+const FATBIN_LEGACY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine_legacy.fatbin"));
+const FATBIN_NEXTGEN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine_nextgen.fatbin"));
 const CHUNK_BYTES: usize = 32;
+const POM_KERNEL_NAME: &str = "pom_mine";
+
+const POM_PTX_CANDIDATES: [(&str, &str, &str); 7] = [
+    ("pom_mine_mod_sm90", "sm_90", PTX_SM90),
+    ("pom_mine_mod_sm89", "sm_89", PTX_SM89),
+    ("pom_mine_mod_sm86", "sm_86", PTX_SM86),
+    ("pom_mine_mod_sm80", "sm_80", PTX_SM80),
+    ("pom_mine_mod_sm75", "sm_75", PTX_SM75),
+    ("pom_mine_mod_sm70", "sm_70", PTX_SM70),
+    ("pom_mine_mod_sm61", "sm_61", PTX_SM61),
+];
+
+#[derive(Debug)]
+struct LoadedPomKernel {
+    cuda: CudaDevice,
+    module: sys::CUmodule,
+    function: sys::CUfunction,
+}
+
+impl Drop for LoadedPomKernel {
+    fn drop(&mut self) {
+        let module = self.module;
+        if !module.is_null() {
+            // Best-effort cleanup; a drop failure here would only leak the module.
+            let _ = unsafe { result::module::unload(module) };
+        }
+    }
+}
+
+unsafe impl Send for LoadedPomKernel {}
+unsafe impl Sync for LoadedPomKernel {}
+
+impl LoadedPomKernel {
+    fn from_fatbin(cuda: CudaDevice, label: &'static str, fatbin: &'static [u8]) -> candle_core::Result<Self> {
+        if fatbin.is_empty() {
+            return Err(candle_core::Error::Msg(format!("PoM GPU: {} fatbin is empty", label)));
+        }
+        let module = unsafe { result::module::load_data(fatbin.as_ptr() as *const c_void) }
+            .map_err(candle_core::Error::wrap)?;
+        let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }
+            .map_err(candle_core::Error::wrap)?;
+        Ok(Self { cuda, module, function })
+    }
+
+    fn from_ptx(cuda: CudaDevice, _label: &'static str, ptx: &'static str) -> candle_core::Result<Self> {
+        let c_src = CString::new(ptx).map_err(candle_core::Error::wrap)?;
+        let module = unsafe { result::module::load_data(c_src.as_ptr() as *const c_void) }
+            .map_err(candle_core::Error::wrap)?;
+        let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }
+            .map_err(candle_core::Error::wrap)?;
+        Ok(Self { cuda, module, function })
+    }
+
+    fn launch(
+        &self,
+        stream: &CudaStream,
+        bases_dev: &CudaSlice<u64>,
+        prefix_dev: &CudaSlice<u64>,
+        t_count: u32,
+        n_total_chunks: u64,
+        pre_pow_hash: &[u8; 32],
+        timestamp: u64,
+        target_le: &[u8; 32],
+        start: u64,
+        batch: u64,
+    ) -> candle_core::Result<Option<u64>> {
+        let p = words4(pre_pow_hash);
+        let t = words4(target_le);
+        let k = crate::pom::POM_WALK_STEPS;
+        let winner = self.cuda.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
+        let grid = ((batch + 255) / 256) as u32;
+        let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+
+        let (bases_ptr, _bases_guard) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _prefix_guard) = prefix_dev.device_ptr(stream);
+        let (winner_ptr, _winner_guard) = winner.device_ptr(stream);
+
+        let mut params: [*mut c_void; 17] = [
+            (&bases_ptr as *const _ as *mut c_void),
+            (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void),
+            (&n_total_chunks as *const _ as *mut c_void),
+            (&k as *const _ as *mut c_void),
+            (&p[0] as *const _ as *mut c_void),
+            (&p[1] as *const _ as *mut c_void),
+            (&p[2] as *const _ as *mut c_void),
+            (&p[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&t[0] as *const _ as *mut c_void),
+            (&t[1] as *const _ as *mut c_void),
+            (&t[2] as *const _ as *mut c_void),
+            (&t[3] as *const _ as *mut c_void),
+            (&start as *const _ as *mut c_void),
+            (&batch as *const _ as *mut c_void),
+            (&winner_ptr as *const _ as *mut c_void),
+        ];
+
+        unsafe { result::launch_kernel(self.function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }
+            .map_err(candle_core::Error::wrap)?;
+        stream.synchronize().map_err(candle_core::Error::wrap)?;
+
+        let w = self.cuda.clone_dtoh(&winner).map_err(candle_core::Error::wrap)?[0];
+        Ok(if w == u64::MAX { None } else { Some(w) })
+    }
+}
+
+fn is_nextgen_device(device_id: usize) -> bool {
+    let Ok(dev) = result::device::get(device_id as i32) else {
+        return false;
+    };
+    let major = unsafe {
+        result::device::get_attribute(
+            dev,
+            sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )
+    }
+    .unwrap_or(0);
+    let minor = unsafe {
+        result::device::get_attribute(
+            dev,
+            sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        )
+    }
+    .unwrap_or(0);
+    major > 8 || (major == 8 && minor >= 9)
+}
+
+fn gpu_compute_capability(device_id: usize) -> Option<(i32, i32)> {
+    let dev = result::device::get(device_id as i32).ok()?;
+    let major = unsafe {
+        result::device::get_attribute(
+            dev,
+            sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )
+    }
+    .ok()?;
+    let minor = unsafe {
+        result::device::get_attribute(
+            dev,
+            sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        )
+    }
+    .ok()?;
+    Some((major, minor))
+}
+
+fn select_pom_kernel(cuda: CudaDevice, device_id: usize) -> candle_core::Result<LoadedPomKernel> {
+    static FATBIN_STATUS_LOGGED: Once = Once::new();
+    FATBIN_STATUS_LOGGED.call_once(|| {
+        let legacy = FATBIN_LEGACY.len();
+        let nextgen = FATBIN_NEXTGEN.len();
+        if legacy > 0 || nextgen > 0 {
+            info!(
+                "PoM: prebuilt fatbins detected (legacy={} bytes, nextgen={} bytes); PTX fallback ladder currently active",
+                legacy,
+                nextgen
+            );
+        } else {
+            info!("PoM: no prebuilt fatbins detected; using PTX fallback ladder");
+        }
+    });
+
+    let is_nextgen_cc = is_nextgen_device(device_id);
+
+    let fatbin_candidates: [(&str, &str, &[u8]); 2] = if is_nextgen_cc {
+        [
+            ("pom_mine_mod_nextgen", "nextgen fatbin", FATBIN_NEXTGEN),
+            ("pom_mine_mod_legacy", "legacy fatbin", FATBIN_LEGACY),
+        ]
+    } else {
+        [
+            ("pom_mine_mod_legacy", "legacy fatbin", FATBIN_LEGACY),
+            ("pom_mine_mod_nextgen", "nextgen fatbin", FATBIN_NEXTGEN),
+        ]
+    };
+
+    for (module_name, label, fatbin) in fatbin_candidates {
+        match LoadedPomKernel::from_fatbin(cuda.clone(), label, fatbin) {
+            Ok(kernel) => {
+                if let Some((major, minor)) = gpu_compute_capability(device_id) {
+                    info!(
+                        "PoM[gpu{} cc{}.{}]: startup loaded {} via {}",
+                        device_id,
+                        major,
+                        minor,
+                        label,
+                        module_name,
+                    );
+                } else {
+                    info!("PoM[gpu{}]: startup loaded {} via {}", device_id, label, module_name);
+                }
+                return Ok(kernel);
+            }
+            Err(e) => {
+                warn!("PoM[gpu{}]: {} load failed: {}", device_id, label, e);
+            }
+        }
+    }
+
+    for (module_name, label, ptx) in POM_PTX_CANDIDATES {
+        match LoadedPomKernel::from_ptx(cuda.clone(), label, ptx) {
+            Ok(kernel) => {
+                if let Some((major, minor)) = gpu_compute_capability(device_id) {
+                    info!(
+                        "PoM[gpu{} cc{}.{}]: startup loaded {} PTX fallback via {}",
+                        device_id,
+                        major,
+                        minor,
+                        label,
+                        module_name,
+                    );
+                } else {
+                    info!("PoM[gpu{}]: startup loaded {} PTX fallback via {}", device_id, label, module_name);
+                }
+                return Ok(kernel);
+            }
+            Err(e) => {
+                warn!("PoM[gpu{}]: {} PTX load failed: {}", device_id, label, e);
+            }
+        }
+    }
+
+    Err(candle_core::Error::Msg(
+        "PoM GPU: no compatible PTX image for this device/driver".into(),
+    ))
+}
 
 fn words4(b: &[u8; 32]) -> [u64; 4] {
     let mut w = [0u64; 4];
@@ -60,8 +295,8 @@ pub fn query_all_gpus_vram() -> Vec<(usize, u64)> {
 }
 
 pub struct PomGpuMiner {
-    cuda: CudaDevice,
     stream: Arc<CudaStream>,
+    kernel: LoadedPomKernel,
     bases_dev: CudaSlice<u64>,
     prefix_dev: CudaSlice<u64>,
     t_count: u32,
@@ -105,12 +340,21 @@ impl PomGpuMiner {
             return Err(candle_core::Error::Msg("PoM GPU: model produced 0 chunks".into()));
         }
 
-        let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
-        let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        // Warm the module cache so mine() never compiles on the hot path.
-        let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?;
+        let bases_dev = cuda.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
+        let prefix_dev = cuda.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
+        // Load the best prebuilt module for this card and keep the raw CUfunction cached.
+        let kernel = select_pom_kernel(cuda.clone(), device_id)?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: tensors, _shared: Vec::new() })
+        Ok(Self {
+            stream,
+            kernel,
+            bases_dev,
+            prefix_dev,
+            t_count: bases.len() as u32,
+            n_total_chunks,
+            _tensors: tensors,
+            _shared: Vec::new(),
+        })
     }
 
     /// Zero-dup load (Option C): build the gather over the SAME canonical name-sorted layout as
@@ -171,11 +415,23 @@ impl PomGpuMiner {
         }
         info!("PoM zero-dup gather: {} shared tensors, {} raw-loaded, N={} chunks", shared_hits, raw.len(), n_total_chunks);
 
-        let bases_dev = stream.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
-        let prefix_dev = stream.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
-        let _ = cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?;
+        let bases_dev = cuda.clone_htod(&bases).map_err(candle_core::Error::wrap)?;
+        let prefix_dev = cuda.clone_htod(&prefix).map_err(candle_core::Error::wrap)?;
+        let device_id = cuda_gpu_id(device).ok_or_else(|| {
+            candle_core::Error::Msg("PoM GPU: shared load requires CUDA device id".into())
+        })?;
+        let kernel = select_pom_kernel(cuda.clone(), device_id)?;
 
-        Ok(Self { cuda, stream, bases_dev, prefix_dev, t_count: bases.len() as u32, n_total_chunks, _tensors: raw, _shared: kept_shared })
+        Ok(Self {
+            stream,
+            kernel,
+            bases_dev,
+            prefix_dev,
+            t_count: bases.len() as u32,
+            n_total_chunks,
+            _tensors: raw,
+            _shared: kept_shared,
+        })
     }
 
     pub fn n_chunks(&self) -> u64 {
@@ -185,24 +441,18 @@ impl PomGpuMiner {
     /// Search nonces in `[start, start + batch)`. Returns the lowest nonce whose `pom_pow_value`
     /// is `<= target_le`, or None. `target_le` is the header's compact target as 32 LE bytes.
     pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> candle_core::Result<Option<u64>> {
-        let p = words4(pre_pow_hash);
-        let t = words4(target_le);
-        let k = crate::pom::POM_WALK_STEPS;
-        let winner = self.stream.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
-        let grid = ((batch + 255) / 256) as u32;
-        let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
-
-        let func = self.cuda.get_or_load_custom_func("pom_mine", "pom_mine_mod", PTX)?; // cached
-        let mut b = func.builder();
-        b.arg(&self.bases_dev).arg(&self.prefix_dev).arg(&self.t_count).arg(&self.n_total_chunks).arg(&k)
-            .arg(&p[0]).arg(&p[1]).arg(&p[2]).arg(&p[3]).arg(&timestamp)
-            .arg(&t[0]).arg(&t[1]).arg(&t[2]).arg(&t[3])
-            .arg(&start).arg(&batch).arg(&winner);
-        unsafe { b.launch(cfg).map_err(candle_core::Error::wrap)?; }
-        self.stream.synchronize().map_err(candle_core::Error::wrap)?;
-
-        let w = self.stream.clone_dtoh(&winner).map_err(candle_core::Error::wrap)?[0];
-        Ok(if w == u64::MAX { None } else { Some(w) })
+        self.kernel.launch(
+            &self.stream,
+            &self.bases_dev,
+            &self.prefix_dev,
+            self.t_count,
+            self.n_total_chunks,
+            pre_pow_hash,
+            timestamp,
+            target_le,
+            start,
+            batch,
+        )
     }
 }
 
@@ -382,6 +632,31 @@ fn cuda_gpu_id(d: &Device) -> Option<usize> {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum MinerLoadFailureKind {
+    PtxIncompatible,
+    OomLikely,
+    Other,
+}
+
+fn classify_miner_load_error(err: &str) -> MinerLoadFailureKind {
+    let s = err.to_ascii_lowercase();
+    if s.contains("invalid_ptx")
+        || s.contains("invalid ptx")
+        || s.contains("ptx") && (s.contains("compatible") || s.contains("no kernel image"))
+    {
+        return MinerLoadFailureKind::PtxIncompatible;
+    }
+    if s.contains("out of memory")
+        || s.contains("cuda_error_out_of_memory")
+        || s.contains("memory allocation")
+        || s.contains("alloc") && s.contains("failed")
+    {
+        return MinerLoadFailureKind::OomLikely;
+    }
+    MinerLoadFailureKind::Other
+}
+
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
         Some(x) => x,
@@ -441,9 +716,33 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     let gm = match loaded {
         Ok(Ok(gm)) => gm,
         Ok(Err(e)) => {
-            log::error!("PoM[gpu{}]: device miner build failed: {} — banlisting this model and downgrading.", device_id, e);
-            oom_banlist_add(device_id, model_id);
-            downgrade_after_oom(device_id, &model_id, daa);
+            let e_msg = e.to_string();
+            match classify_miner_load_error(&e_msg) {
+                MinerLoadFailureKind::PtxIncompatible => {
+                    log::error!(
+                        "PoM[gpu{}]: PTX incompatibility while loading miner (not OOM): {}. \
+                         Check driver/PTX compatibility; skipping OOM downgrade.",
+                        device_id,
+                        e_msg
+                    );
+                }
+                MinerLoadFailureKind::OomLikely => {
+                    log::error!(
+                        "PoM[gpu{}]: device miner build failed (OOM likely): {} — banlisting this model and downgrading.",
+                        device_id,
+                        e_msg
+                    );
+                    oom_banlist_add(device_id, model_id);
+                    downgrade_after_oom(device_id, &model_id, daa);
+                }
+                MinerLoadFailureKind::Other => {
+                    log::error!(
+                        "PoM[gpu{}]: device miner build failed (non-OOM): {} — not applying OOM downgrade.",
+                        device_id,
+                        e_msg
+                    );
+                }
+            }
             return false;
         }
         Err(_) => {

@@ -4,6 +4,7 @@ use cust::device::DeviceAttribute;
 use cust::function::Function;
 use cust::module::{ModuleJitOption, OptLevel};
 use cust::prelude::*;
+use cust::CudaApiVersion;
 use keryx_miner::xoshiro256starstar::Xoshiro256StarStar;
 use keryx_miner::Worker;
 use log::{error, info};
@@ -22,6 +23,8 @@ static PTX_80: &str = include_str!("../resources/keryx-cuda-sm80.ptx");
 static PTX_75: &str = include_str!("../resources/keryx-cuda-sm75.ptx");
 static PTX_70: &str = include_str!("../resources/keryx-cuda-sm70.ptx");
 static PTX_61: &str = include_str!("../resources/keryx-cuda-sm61.ptx");
+static FATBIN_LEGACY: &[u8] = include_bytes!("../resources/keryx-legacy.fatbin");
+static FATBIN_NEXTGEN: &[u8] = include_bytes!("../resources/keryx-nextgen.fatbin");
 // sm_30 (Kepler) and sm_20 (Fermi) dropped: CUDA 12+ no longer compiles for
 // these architectures, and they predate practical GPU mining anyway.
 
@@ -164,8 +167,21 @@ impl<'gpu> CudaGPUWorker<'gpu> {
 
         let major = device.get_attribute(DeviceAttribute::ComputeCapabilityMajor)?;
         let minor = device.get_attribute(DeviceAttribute::ComputeCapabilityMinor)?;
-        let _module: Arc<Module>;
+        let mut _module: Option<Arc<Module>> = None;
         info!("Device #{} compute version is {}.{}", device_id, major, minor);
+
+        let driver_api = CudaApiVersion::get().ok();
+        if let Some(ver) = driver_api {
+            info!(
+                "GPU #{} CUDA driver API version {}.{}",
+                device_id,
+                ver.major(),
+                ver.minor()
+            );
+        }
+
+        let mut selected_module = String::new();
+        let mut selection_path = String::new();
 
         let load_ptx = |ptx, label: &str| {
             Module::from_ptx(ptx, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
@@ -174,6 +190,53 @@ impl<'gpu> CudaGPUWorker<'gpu> {
             })
         };
 
+        let load_fatbin = |fatbin: &[u8], label: &str| {
+            Module::from_fatbin(fatbin, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
+                error!("Failed to load {} fatbin: {}", label, e);
+                e
+            })
+        };
+
+        let is_nextgen_cc = major > 8 || (major == 8 && minor >= 9);
+        let fatbin_loaded = if is_nextgen_cc {
+            match load_fatbin(FATBIN_NEXTGEN, "nextgen") {
+                Ok(m) => {
+                    info!("GPU #{} using nextgen fatbin", device_id);
+                    _module = Some(Arc::new(m));
+                    selected_module = "fatbin:nextgen".to_string();
+                    selection_path = "nextgen-fatbin".to_string();
+                    true
+                }
+                Err(_) => match load_fatbin(FATBIN_LEGACY, "legacy (fallback)") {
+                    Ok(m) => {
+                        info!("GPU #{} using legacy fatbin fallback", device_id);
+                        _module = Some(Arc::new(m));
+                        selected_module = "fatbin:legacy".to_string();
+                        selection_path = "nextgen-fatbin->legacy-fatbin".to_string();
+                        true
+                    }
+                    Err(_) => false,
+                },
+            }
+        } else {
+            match load_fatbin(FATBIN_LEGACY, "legacy") {
+                Ok(m) => {
+                    info!("GPU #{} using legacy fatbin", device_id);
+                    _module = Some(Arc::new(m));
+                    selected_module = "fatbin:legacy".to_string();
+                    selection_path = "legacy-fatbin".to_string();
+                    true
+                }
+                Err(_) => false,
+            }
+        };
+
+        if !fatbin_loaded {
+        selection_path = if is_nextgen_cc {
+            "fatbin-miss(nextgen+legacy)->ptx".to_string()
+        } else {
+            "fatbin-miss(legacy)->ptx".to_string()
+        };
         // For sm_89 (Ada/RTX 40) and sm_100 (Blackwell/RTX 50), the PTX was compiled with
         // CUDA 13.2 (PTX ISA 9.2) which requires driver >= 570. If the driver is older, we
         // fall back to sm_86 (CUDA 12.0 / PTX 8.0, driver >= 520) which runs on all these
@@ -185,103 +248,136 @@ impl<'gpu> CudaGPUWorker<'gpu> {
             // `unknown error` on a 5090 and the card used to land on JIT'd sm_86
             // at roughly half the native throughput. The sm_120 PTX is ISA 9.0
             // (driver >= 580); on older drivers we fall through to sm_86.
-            _module = Arc::new(match load_ptx(PTX_120, "sm_120") {
+            _module = Some(Arc::new(match load_ptx(PTX_120, "sm_120") {
                 Ok(m) => {
                     info!("GPU #{} using optimised sm_120 PTX", device_id);
+                    selected_module = "ptx:sm_120".to_string();
                     m
                 }
                 Err(e) => {
                     info!("GPU #{} sm_120 PTX failed; trying sm_100 then sm_86 fallback (update driver to 580+)", device_id);
                     match load_ptx(PTX_100, "sm_100") {
-                        Ok(m) => m,
-                        Err(_) => load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?,
+                        Ok(m) => {
+                            selected_module = "ptx:sm_100".to_string();
+                            selection_path.push_str("->sm_120-fail->sm_100");
+                            m
+                        }
+                        Err(_) => {
+                            selected_module = "ptx:sm_86".to_string();
+                            selection_path.push_str("->sm_120-fail->sm_100-fail->sm_86");
+                            load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?
+                        }
                     }
                 }
-            });
+            }));
         } else if major >= 10 {
             // sm_100+ (datacenter Blackwell — H100 / B100 / GH100)
-            _module = Arc::new(match load_ptx(PTX_100, "sm_100") {
+            _module = Some(Arc::new(match load_ptx(PTX_100, "sm_100") {
                 Ok(m) => {
                     info!("GPU #{} using optimised sm_100 PTX", device_id);
+                    selected_module = "ptx:sm_100".to_string();
                     m
                 }
                 Err(e) => {
                     info!("GPU #{} falling back to sm_86 PTX (update driver to 570+ for full Blackwell optimisation)", device_id);
+                    selected_module = "ptx:sm_86".to_string();
+                    selection_path.push_str("->sm_100-fail->sm_86");
                     load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?
                 }
-            });
+            }));
         } else if major == 9 {
             // sm_90 (Hopper — H100 / H200 / GH200). Routed here before the Ada branch so it
             // loads the native sm_90 PTX instead of JIT'ing the sm_89 build. Falls back to
             // sm_89 then sm_86 if the driver is too old for the sm_90 PTX ISA.
-            _module = Arc::new(match load_ptx(PTX_90, "sm_90") {
+            _module = Some(Arc::new(match load_ptx(PTX_90, "sm_90") {
                 Ok(m) => {
                     info!("GPU #{} using optimised sm_90 PTX", device_id);
+                    selected_module = "ptx:sm_90".to_string();
                     m
                 }
                 Err(e) => {
                     info!("GPU #{} sm_90 PTX failed; trying sm_89 then sm_86 fallback", device_id);
                     match load_ptx(PTX_89, "sm_89") {
-                        Ok(m) => m,
-                        Err(_) => load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?,
+                        Ok(m) => {
+                            selected_module = "ptx:sm_89".to_string();
+                            selection_path.push_str("->sm_90-fail->sm_89");
+                            m
+                        }
+                        Err(_) => {
+                            selected_module = "ptx:sm_86".to_string();
+                            selection_path.push_str("->sm_90-fail->sm_89-fail->sm_86");
+                            load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?
+                        }
                     }
                 }
-            });
+            }));
         } else if major == 8 && minor >= 9 {
             // sm_89 (RTX 40 / Ada Lovelace)
-            _module = Arc::new(match load_ptx(PTX_89, "sm_89") {
+            _module = Some(Arc::new(match load_ptx(PTX_89, "sm_89") {
                 Ok(m) => {
                     info!("GPU #{} using optimised sm_89 PTX", device_id);
+                    selected_module = "ptx:sm_89".to_string();
                     m
                 }
                 Err(e) => {
                     info!("GPU #{} falling back to sm_86 PTX (update driver to 570+ for full Ada Lovelace optimisation)", device_id);
+                    selected_module = "ptx:sm_86".to_string();
+                    selection_path.push_str("->sm_89-fail->sm_86");
                     load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?
                 }
-            });
+            }));
         } else if major == 8 && minor >= 6 {
             // sm_86 (RTX 30 / Ampere)
-            _module = Arc::new(load_ptx(PTX_86, "sm_86")?);
+            selected_module = "ptx:sm_86".to_string();
+            _module = Some(Arc::new(load_ptx(PTX_86, "sm_86")?));
         } else if major == 8 {
             // sm_80 (A100 / CMP 170HX, data-center Ampere). Reaching here means minor < 6
             // (sm_86+ and sm_89+ are caught above). The sm_86 PTX would NOT load on sm_80
             // because a PTX .target is a *minimum* compute capability, so we ship a native
             // sm_80 PTX. If the driver is too old for its PTX ISA, fall back to sm_75, which
             // runs on sm_80 and up via the backward-compatible PTX JIT.
-            _module = Arc::new(match load_ptx(PTX_80, "sm_80") {
+            _module = Some(Arc::new(match load_ptx(PTX_80, "sm_80") {
                 Ok(m) => {
                     info!("GPU #{} using optimised sm_80 PTX", device_id);
+                    selected_module = "ptx:sm_80".to_string();
                     m
                 }
                 Err(e) => {
                     info!("GPU #{} falling back to sm_75 PTX (update driver for native sm_80)", device_id);
+                    selected_module = "ptx:sm_75".to_string();
+                    selection_path.push_str("->sm_80-fail->sm_75");
                     load_ptx(PTX_75, "sm_75 (fallback)").map_err(|_| e)?
                 }
-            });
+            }));
         } else if major > 7 || (major == 7 && minor >= 5) {
             // sm_75 (RTX 20 / Turing)
-            _module = Arc::new(Module::from_ptx(PTX_75, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
+            selected_module = "ptx:sm_75".to_string();
+            _module = Some(Arc::new(Module::from_ptx(PTX_75, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
                 error!("Error loading PTX. Make sure you have the updated driver for you devices");
                 e
-            })?);
+            })?));
         } else if major == 7 {
             // sm_70/sm_72 (Volta)
-            _module = Arc::new(match load_ptx(PTX_70, "sm_70") {
+            _module = Some(Arc::new(match load_ptx(PTX_70, "sm_70") {
                 Ok(m) => {
                     info!("GPU #{} using optimised sm_70 PTX", device_id);
+                    selected_module = "ptx:sm_70".to_string();
                     m
                 }
                 Err(e) => {
                     info!("GPU #{} falling back to sm_61 PTX (update driver for native sm_70)", device_id);
+                    selected_module = "ptx:sm_61".to_string();
+                    selection_path.push_str("->sm_70-fail->sm_61");
                     load_ptx(PTX_61, "sm_61 (fallback)").map_err(|_| e)?
                 }
-            });
+            }));
         } else if major > 6 || (major == 6 && minor >= 1) {
             // sm_61 (GTX 10 / Pascal)
-            _module = Arc::new(Module::from_ptx(PTX_61, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
+            selected_module = "ptx:sm_61".to_string();
+            _module = Some(Arc::new(Module::from_ptx(PTX_61, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
                 error!("Error loading PTX. Make sure you have the updated driver for you devices");
                 e
-            })?);
+            })?));
         } else {
             return Err(format!(
                 "CUDA compute {}.{} not supported. Keryx requires sm_61 (GTX 10xx) or newer.",
@@ -289,6 +385,24 @@ impl<'gpu> CudaGPUWorker<'gpu> {
             )
             .into());
         }
+        }
+
+        let (driver_major, driver_minor) = match driver_api {
+            Some(v) => (v.major().to_string(), v.minor().to_string()),
+            None => ("unknown".to_string(), "unknown".to_string()),
+        };
+        info!(
+            "GPU #{} selection summary | cc={}.{} | driver_api={}.{} | module={} | path={}",
+            device_id,
+            major,
+            minor,
+            driver_major,
+            driver_minor,
+            selected_module,
+            selection_path
+        );
+
+        let _module = _module.expect("CUDA module must be selected before use");
 
         let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
 
