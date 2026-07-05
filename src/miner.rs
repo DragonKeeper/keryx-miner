@@ -306,7 +306,8 @@ impl MinerManager {
                         if !keryx_miner::pom_gpu::is_installed(worker_device_id) {
                             keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa);
                         }
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH);
+                        let h3 = daa >= keryx_miner::pom::POM_LEVEL_ACTIVATION_DAA;
+                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH, h3);
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);

@@ -90,13 +90,12 @@ impl LoadedPomKernel {
         prefix_dev: &CudaSlice<u64>,
         t_count: u32,
         n_total_chunks: u64,
-        pre_pow_hash: &[u8; 32],
+        p_words: &[u64; 4],
         timestamp: u64,
         target_le: &[u8; 32],
         start: u64,
         batch: u64,
     ) -> candle_core::Result<Option<u64>> {
-        let p = words4(pre_pow_hash);
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
         let winner = self.cuda.clone_htod(&[u64::MAX]).map_err(candle_core::Error::wrap)?;
@@ -113,10 +112,10 @@ impl LoadedPomKernel {
             (&t_count as *const _ as *mut c_void),
             (&n_total_chunks as *const _ as *mut c_void),
             (&k as *const _ as *mut c_void),
-            (&p[0] as *const _ as *mut c_void),
-            (&p[1] as *const _ as *mut c_void),
-            (&p[2] as *const _ as *mut c_void),
-            (&p[3] as *const _ as *mut c_void),
+            (&p_words[0] as *const _ as *mut c_void),
+            (&p_words[1] as *const _ as *mut c_void),
+            (&p_words[2] as *const _ as *mut c_void),
+            (&p_words[3] as *const _ as *mut c_void),
             (&timestamp as *const _ as *mut c_void),
             (&t[0] as *const _ as *mut c_void),
             (&t[1] as *const _ as *mut c_void),
@@ -440,14 +439,17 @@ impl PomGpuMiner {
 
     /// Search nonces in `[start, start + batch)`. Returns the lowest nonce whose `pom_pow_value`
     /// is `<= target_le`, or None. `target_le` is the header's compact target as 32 LE bytes.
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> candle_core::Result<Option<u64>> {
+    /// `h3` salts the pph words host-side (POM_H3_PPH_SALT) — the kernel itself is era-agnostic,
+    /// it folds whatever words it receives, so no PTX change at the H3 gate.
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool) -> candle_core::Result<Option<u64>> {
+        let p_words = crate::pom::pph_words_for_era(pre_pow_hash, h3);
         self.kernel.launch(
             &self.stream,
             &self.bases_dev,
             &self.prefix_dev,
             self.t_count,
             self.n_total_chunks,
-            pre_pow_hash,
+            &p_words,
             timestamp,
             target_le,
             start,
@@ -519,12 +521,12 @@ pub fn is_loading() -> bool {
 }
 
 /// Convenience: search a nonce batch via the installed miner for a specific device.
-pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool) -> Option<u64> {
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
+    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3).ok().flatten()
 }
 
 /// Per-GPU mining-tier identity for rebuilds: `device_id -> (model_id, gguf_path)`. A heterogeneous
