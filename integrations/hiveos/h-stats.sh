@@ -46,6 +46,8 @@ fi
 if [ -n "$api_json" ] && jq -e '.total_hashrate_hs != null and .devices != null and .last_update_epoch_s != null' >/dev/null 2>&1 <<< "$api_json"; then
         time_rep=`jq -r '.last_update_epoch_s // 0' <<< "$api_json"`
         diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
+        accepted_blocks=`jq -r '.accepted_blocks // 0' <<< "$api_json"`
+        rejected_blocks=`jq -r '.rejected_blocks // 0' <<< "$api_json"`
 
         if [ "$diffTime" -lt "$maxDelay" ]; then
                 total_hashrate_hs=`jq -r '.total_hashrate_hs // 0' <<< "$api_json"`
@@ -82,11 +84,13 @@ if [ -n "$api_json" ] && jq -e '.total_hashrate_hs != null and .devices != null 
                         --argjson hs "$hash_json" \
                         --arg ver "$CUSTOM_VERSION" \
                         --arg ths "$total_hashrate" \
+                        --arg accepted "$accepted_blocks" \
+                        --arg rejected "$rejected_blocks" \
                         --argjson bus_numbers "$bus_numbers" \
                         --argjson fan "$fan_json" \
                         --argjson temp "$temp_json" \
                         --arg uptime "$uptime" \
-                        '{ hs: $hs, hs_units: "khs", algo: "keryxhash", ver: $ver, $uptime, $bus_numbers, $temp, $fan }')
+                        '{ hs: $hs, hs_units: "khs", algo: "keryxhash", ver: $ver, accepted_blocks: ($accepted|tonumber), rejected_blocks: ($rejected|tonumber), ar: [($accepted|tonumber), ($rejected|tonumber)], $uptime, $bus_numbers, $temp, $fan }')
                 khs=$total_hashrate
                 stats_raw="api://v1/miner/stats total_hs=${total_hashrate_hs}"
         else
@@ -104,6 +108,8 @@ time_rep=`date -d "$ts_field" +%s 2>/dev/null || echo 0`
 diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
 
 if [ "$diffTime" -lt "$maxDelay" ]; then
+        accepted_blocks=`grep -c "Block submitted successfully" <<< "$log"`
+        rejected_blocks=`grep -E -c "Failed submitting block|Failed submitting PoM block|rejected" <<< "$log"`
         # Value is second-to-last field (before unit), unit is last field.
         # The miner logs the rate with 2 decimals; dropping the dot then appending one 0 yields
         # rate*1000 (e.g. 3.83 -> "383" -> "3830"). NB: do NOT use `cut --output-delimiter=''` to
@@ -164,11 +170,13 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 --argjson hs "$hash_json" \
                 --arg ver "$CUSTOM_VERSION" \
                 --arg ths "$total_hashrate" \
+                --arg accepted "$accepted_blocks" \
+                --arg rejected "$rejected_blocks" \
                 --argjson bus_numbers "$bus_numbers" \
                 --argjson fan "$fan_json" \
                 --argjson temp "$temp_json" \
                 --arg uptime "$uptime" \
-                '{ hs: $hs, hs_units: "khs", algo: "keryxhash", ver: $ver, $uptime, $bus_numbers, $temp, $fan }')
+                '{ hs: $hs, hs_units: "khs", algo: "keryxhash", ver: $ver, accepted_blocks: ($accepted|tonumber), rejected_blocks: ($rejected|tonumber), ar: [($accepted|tonumber), ($rejected|tonumber)], $uptime, $bus_numbers, $temp, $fan }')
         khs=$total_hashrate
 else
         khs=0

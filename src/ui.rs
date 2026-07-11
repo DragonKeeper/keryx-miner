@@ -150,8 +150,6 @@ fn supports_truecolor() -> bool {
 pub struct UiState {
     lines: Mutex<VecDeque<String>>,
     scrollback_lines: AtomicU64,
-    blocks_found: AtomicU64,
-    rejected: AtomicU64,
 }
 
 impl UiState {
@@ -159,8 +157,6 @@ impl UiState {
         Self {
             lines: Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES)),
             scrollback_lines: AtomicU64::new(0),
-            blocks_found: AtomicU64::new(0),
-            rejected: AtomicU64::new(0),
         }
     }
 
@@ -182,24 +178,6 @@ impl UiState {
             }
         }
 
-        if message.contains("Found a block") {
-            self.blocks_found.fetch_add(1, Ordering::AcqRel);
-        }
-
-        if message.contains("Failed submitting block")
-            || message.contains("Failed submitting PoM block")
-            || message.to_ascii_lowercase().contains("rejected")
-        {
-            self.rejected.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-
-    fn blocks_found(&self) -> u64 {
-        self.blocks_found.load(Ordering::Acquire)
-    }
-
-    fn rejected(&self) -> u64 {
-        self.rejected.load(Ordering::Acquire)
     }
 
     fn visible_lines(&self, n: usize) -> Vec<String> {
@@ -357,8 +335,8 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>) -> UiGuard {
                 snapshot.total_hashrate_hs,
                 snapshot.devices.len(),
                 snapshot.last_update_epoch_s,
-                ui_state.blocks_found(),
-                ui_state.rejected(),
+                snapshot.accepted_blocks,
+                snapshot.rejected_blocks,
             );
             let periodic_refresh_due = last_drawn_at.elapsed() >= Duration::from_secs(1);
             if should_clear || periodic_refresh_due || last_draw_key != Some(draw_key) {
@@ -435,8 +413,8 @@ fn draw_frame(
 
     let hashrate_value = format_hashrate(snapshot.total_hashrate_hs);
     let opoi_pause_value = if snapshot.opoi_challenge_active { "Active" } else { "Idle" };
-    let blocks_found_value = ui_state.blocks_found();
-    let rejected_value = ui_state.rejected();
+    let blocks_found_value = snapshot.accepted_blocks;
+    let rejected_value = snapshot.rejected_blocks;
     let uptime_value = format_duration(snapshot.uptime_s);
     let last_update_age = seconds_since(snapshot.last_update_epoch_s);
     let last_update_value = format!("{}s ago", last_update_age);

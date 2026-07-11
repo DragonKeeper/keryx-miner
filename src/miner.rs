@@ -236,6 +236,14 @@ impl MinerManager {
         Arc::clone(&self.opoi_challenge_active)
     }
 
+    pub fn record_block_accepted(&self) {
+        self.stats.inc_accepted_blocks();
+    }
+
+    pub fn record_block_rejected(&self) {
+        self.stats.inc_rejected_blocks();
+    }
+
     pub async fn process_block(&mut self, block: Option<BlockSeed>) -> Result<(), Error> {
         let state = match block {
             Some(b) => {

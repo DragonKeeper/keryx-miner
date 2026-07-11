@@ -15,6 +15,8 @@ pub struct MinerStats {
     synced: AtomicBool,
     opoi_challenge_active: AtomicBool,
     total_hashrate_hs: AtomicU64,
+    accepted_blocks: AtomicU64,
+    rejected_blocks: AtomicU64,
     last_update_epoch_s: AtomicU64,
     api_port: AtomicU64,
     mining_address: Mutex<Option<String>>,
@@ -48,6 +50,8 @@ pub struct MinerStatsSnapshot {
     pub mining_address: Option<String>,
     pub api_port: Option<u16>,
     pub total_hashrate_hs: u64,
+    pub accepted_blocks: u64,
+    pub rejected_blocks: u64,
     pub last_update_epoch_s: u64,
     pub devices: Vec<DeviceRate>,
 }
@@ -61,6 +65,8 @@ impl MinerStats {
             synced: AtomicBool::new(true),
             opoi_challenge_active: AtomicBool::new(false),
             total_hashrate_hs: AtomicU64::new(0),
+            accepted_blocks: AtomicU64::new(0),
+            rejected_blocks: AtomicU64::new(0),
             last_update_epoch_s: AtomicU64::new(now),
             api_port: AtomicU64::new(0),
             mining_address: Mutex::new(None),
@@ -93,6 +99,16 @@ impl MinerStats {
         let mut map = self.device_hashrate_hs.lock().expect("device stats mutex poisoned");
         map.clear();
         map.extend(per_device_hs.iter().map(|(k, v)| (k.clone(), *v)));
+    }
+
+    pub fn inc_accepted_blocks(&self) {
+        self.accepted_blocks.fetch_add(1, Ordering::AcqRel);
+        self.last_update_epoch_s.store(now_epoch_s(), Ordering::Release);
+    }
+
+    pub fn inc_rejected_blocks(&self) {
+        self.rejected_blocks.fetch_add(1, Ordering::AcqRel);
+        self.last_update_epoch_s.store(now_epoch_s(), Ordering::Release);
     }
 
     pub fn refresh_gpu_telemetry(&self) {
@@ -191,6 +207,8 @@ impl MinerStats {
                 p => Some(p as u16),
             },
             total_hashrate_hs: self.total_hashrate_hs.load(Ordering::Acquire),
+            accepted_blocks: self.accepted_blocks.load(Ordering::Acquire),
+            rejected_blocks: self.rejected_blocks.load(Ordering::Acquire),
             last_update_epoch_s: self.last_update_epoch_s.load(Ordering::Acquire),
             devices,
         }
