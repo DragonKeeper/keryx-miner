@@ -15,4 +15,9 @@ cd `dirname $0`
 # so this is only a belt-and-suspenders hint for the dynamic loader.
 export LD_LIBRARY_PATH="$(dirname $0):${LD_LIBRARY_PATH:-}:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu"
 
-./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) $@ 2>&1 | tee $CUSTOM_LOG_BASENAME.log
+# GNU screen on HiveOS commonly mis-renders 24-bit colors; prefer ANSI palette there.
+if [[ -n "${STY:-}" && -z "${KERYX_TRUECOLOR:-}" ]]; then
+  export KERYX_TRUECOLOR=0
+fi
+
+./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --stats-bind 0.0.0.0 --stats-port "$WEB_PORT" --plain-log-file "$CUSTOM_LOG_BASENAME.log" $@

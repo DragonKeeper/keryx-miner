@@ -111,6 +111,29 @@ pub struct Opt {
 
     #[clap(skip)]
     pub devfund_address: String,
+
+    #[clap(
+        long = "stats-bind",
+        help = "Stats API bind address (e.g. 0.0.0.0, 127.0.0.1)",
+        help_heading = "Monitoring",
+        default_value = "0.0.0.0"
+    )]
+    pub stats_bind: String,
+
+    #[clap(
+        long = "stats-port",
+        help = "Stats API TCP port",
+        help_heading = "Monitoring",
+        default_value_t = 3338u16
+    )]
+    pub stats_port: u16,
+
+    #[clap(
+        long = "plain-log-file",
+        help = "Write plain text logs to this file path",
+        help_heading = "Monitoring"
+    )]
+    pub plain_log_file: Option<String>,
 }
 
 fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {

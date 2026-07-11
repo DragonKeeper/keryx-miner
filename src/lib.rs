@@ -1,6 +1,7 @@
 use clap::ArgMatches;
 use std::any::Any;
 use std::error::Error as StdError;
+use std::io::IsTerminal;
 
 pub mod inference;
 pub mod models;
@@ -13,6 +14,13 @@ pub mod xoshiro256starstar;
 use libloading::{Library, Symbol};
 
 pub type Error = Box<dyn StdError + Send + Sync + 'static>;
+pub type PluginLogSink = extern "C" fn(level: u8, msg_ptr: *const u8, msg_len: usize);
+
+pub const PLUGIN_LOG_ERROR: u8 = 1;
+pub const PLUGIN_LOG_WARN: u8 = 2;
+pub const PLUGIN_LOG_INFO: u8 = 3;
+pub const PLUGIN_LOG_DEBUG: u8 = 4;
+pub const PLUGIN_LOG_TRACE: u8 = 5;
 
 #[derive(Default)]
 pub struct PluginManager {
@@ -81,11 +89,13 @@ impl PluginManager {
             count += match plugin.process_option(matchs) {
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!(
-                        "WARNING: Failed processing options for {} (ignore if you do not intend to use): {}",
-                        plugin.name(),
-                        e
-                    );
+                    if should_emit_startup_stderr() {
+                        eprintln!(
+                            "WARNING: Failed processing options for {} (ignore if you do not intend to use): {}",
+                            plugin.name(),
+                            e
+                        );
+                    }
                     0
                 }
             }
@@ -96,6 +106,17 @@ impl PluginManager {
     pub fn has_specs(&self) -> bool {
         !self.plugins.is_empty()
     }
+
+    pub fn set_log_sink(&mut self, sink: Option<PluginLogSink>) {
+        for plugin in self.plugins.iter_mut() {
+            plugin.set_log_sink(sink);
+        }
+    }
+}
+
+#[inline]
+fn should_emit_startup_stderr() -> bool {
+    !std::io::stdout().is_terminal()
 }
 
 pub trait Plugin: Any + Send + Sync {
@@ -103,6 +124,7 @@ pub trait Plugin: Any + Send + Sync {
     fn enabled(&self) -> bool;
     fn get_worker_specs(&self) -> Vec<Box<dyn WorkerSpec>>;
     fn process_option(&mut self, matchs: &ArgMatches) -> Result<usize, Error>;
+    fn set_log_sink(&mut self, _sink: Option<PluginLogSink>) {}
 }
 
 pub trait WorkerSpec: Any + Send + Sync {
@@ -136,7 +158,9 @@ pub fn load_plugins<'help>(
     for path in paths {
         app = unsafe {
             factory.load_single_plugin(app, path.as_str()).unwrap_or_else(|(app, e)| {
-                eprintln!("WARNING: Failed loading plugin {} (ignore if you do not intend to use): {}", path, e);
+                if should_emit_startup_stderr() {
+                    eprintln!("WARNING: Failed loading plugin {} (ignore if you do not intend to use): {}", path, e);
+                }
                 app
             })
         };

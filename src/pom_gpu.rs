@@ -42,6 +42,47 @@ const POM_PTX_CANDIDATES: [(&str, &str, &str); 7] = [
     ("pom_mine_mod_sm61", "sm_61", PTX_SM61),
 ];
 
+#[derive(Clone, Debug)]
+pub struct GpuKernelInfo {
+    pub device_id: u32,
+    pub cc_major: Option<i32>,
+    pub cc_minor: Option<i32>,
+    pub image: String,
+    pub load_path: String,
+}
+
+fn gpu_kernel_info() -> &'static Mutex<HashMap<u32, GpuKernelInfo>> {
+    static GPU_KERNEL_INFO: OnceLock<Mutex<HashMap<u32, GpuKernelInfo>>> = OnceLock::new();
+    GPU_KERNEL_INFO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_gpu_kernel_info(
+    device_id: usize,
+    cc: Option<(i32, i32)>,
+    image: &str,
+    load_path: &str,
+) {
+    let entry = GpuKernelInfo {
+        device_id: device_id as u32,
+        cc_major: cc.map(|x| x.0),
+        cc_minor: cc.map(|x| x.1),
+        image: image.to_string(),
+        load_path: load_path.to_string(),
+    };
+    if let Ok(mut g) = gpu_kernel_info().lock() {
+        g.insert(device_id as u32, entry);
+    }
+}
+
+pub fn list_gpu_kernel_info() -> Vec<GpuKernelInfo> {
+    let mut out = gpu_kernel_info()
+        .lock()
+        .map(|g| g.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    out.sort_by_key(|e| e.device_id);
+    out
+}
+
 #[derive(Debug)]
 struct LoadedPomKernel {
     cuda: CudaDevice,
@@ -208,7 +249,8 @@ fn select_pom_kernel(cuda: CudaDevice, device_id: usize) -> candle_core::Result<
     for (module_name, label, fatbin) in fatbin_candidates {
         match LoadedPomKernel::from_fatbin(cuda.clone(), label, fatbin) {
             Ok(kernel) => {
-                if let Some((major, minor)) = gpu_compute_capability(device_id) {
+                let cc = gpu_compute_capability(device_id);
+                if let Some((major, minor)) = cc {
                     info!(
                         "PoM[gpu{} cc{}.{}]: startup loaded {} via {}",
                         device_id,
@@ -220,6 +262,7 @@ fn select_pom_kernel(cuda: CudaDevice, device_id: usize) -> candle_core::Result<
                 } else {
                     info!("PoM[gpu{}]: startup loaded {} via {}", device_id, label, module_name);
                 }
+                set_gpu_kernel_info(device_id, cc, label, module_name);
                 return Ok(kernel);
             }
             Err(e) => {
@@ -231,7 +274,8 @@ fn select_pom_kernel(cuda: CudaDevice, device_id: usize) -> candle_core::Result<
     for (module_name, label, ptx) in POM_PTX_CANDIDATES {
         match LoadedPomKernel::from_ptx(cuda.clone(), label, ptx) {
             Ok(kernel) => {
-                if let Some((major, minor)) = gpu_compute_capability(device_id) {
+                let cc = gpu_compute_capability(device_id);
+                if let Some((major, minor)) = cc {
                     info!(
                         "PoM[gpu{} cc{}.{}]: startup loaded {} PTX fallback via {}",
                         device_id,
@@ -243,6 +287,12 @@ fn select_pom_kernel(cuda: CudaDevice, device_id: usize) -> candle_core::Result<
                 } else {
                     info!("PoM[gpu{}]: startup loaded {} PTX fallback via {}", device_id, label, module_name);
                 }
+                set_gpu_kernel_info(
+                    device_id,
+                    cc,
+                    &format!("{} PTX fallback", label),
+                    module_name,
+                );
                 return Ok(kernel);
             }
             Err(e) => {
@@ -681,7 +731,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             Err(p) => p.into_inner(),
         };
         if crate::pom::active_index_for_tier(tier).is_none() {
-            info!("PoM: building host weight index for tier {} (gpu{}) — this can take a while…", tier, device_id);
+            info!("PoM: building host weight index for tier {} (gpu{}) - this can take a while...", tier, device_id);
             match crate::pom::WeightIndex::build_from_gguf(&gguf) {
                 Ok(idx) => {
                     info!("PoM: tier {} host index ready — N={} chunks", tier, idx.n_chunks);

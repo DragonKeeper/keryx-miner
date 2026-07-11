@@ -4,6 +4,10 @@ use std::env::consts::DLL_EXTENSION;
 use std::env::current_exe;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io::IsTerminal;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use clap::{App, FromArgMatches, IntoApp};
 use keryx_miner::PluginManager;
@@ -18,17 +22,23 @@ use crate::cli::Opt;
 use crate::client::grpc::KeryxdHandler;
 use crate::client::stratum::StratumHandler;
 use crate::client::Client;
+use crate::logging::init_logging;
 use crate::miner::MinerManager;
+use crate::stats::{spawn_stats_server, MinerStats};
 use crate::target::Uint256;
+use crate::ui::{spawn_ui, UiState};
 
 mod cli;
 mod client;
 mod escrow;
 mod ipfs;
 mod keryxd_messages;
+mod logging;
 mod miner;
 mod pow;
+mod stats;
 mod target;
+mod ui;
 mod watch;
 
 // PoM mining is CUDA-only (the walk kernel is CUDA). The OpenCL/AMD plugin did legacy
@@ -119,6 +129,44 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
             .collect::<Vec<String>>(),
         _ => Vec::<String>::new(),
     }
+}
+
+#[cfg(unix)]
+fn redirect_stderr_for_tui(path: &str) -> Result<(), String> {
+    use nix::libc::STDERR_FILENO;
+    use nix::unistd::dup2;
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("open stderr log '{}': {}", path, e))?;
+
+    dup2(file.as_raw_fd(), STDERR_FILENO)
+        .map_err(|e| format!("dup2(stderr -> '{}') failed: {}", path, e))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn redirect_stderr_for_tui(_path: &str) -> Result<(), String> {
+    Ok(())
+}
+
+extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
+    if msg_ptr.is_null() || msg_len == 0 {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(msg_ptr, msg_len) };
+    let msg = String::from_utf8_lossy(bytes);
+    let lvl = match level {
+        keryx_miner::PLUGIN_LOG_ERROR => log::Level::Error,
+        keryx_miner::PLUGIN_LOG_WARN => log::Level::Warn,
+        keryx_miner::PLUGIN_LOG_INFO => log::Level::Info,
+        keryx_miner::PLUGIN_LOG_DEBUG => log::Level::Debug,
+        keryx_miner::PLUGIN_LOG_TRACE => log::Level::Trace,
+        _ => log::Level::Info,
+    };
+    log::log!(lvl, "{}", msg);
 }
 
 /// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
@@ -313,6 +361,7 @@ async fn client_main(
     block_template_ctr: Arc<AtomicU16>,
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
+    stats: Arc<MinerStats>,
 ) -> Result<(), Error> {
     let ipfs_url = opt.ipfs_url.clone();
     tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
@@ -332,7 +381,7 @@ async fn client_main(
         client.add_devfund(opt.devfund_address.clone(), opt.devfund_percent);
     }
     client.register().await?;
-    let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager);
+    let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager, stats);
     client.listen(&mut miner_manager).await?;
     drop(miner_manager);
     Ok(())
@@ -383,10 +432,63 @@ async fn run() -> Result<(), Error> {
 
     let matches = app.get_matches();
 
-    let worker_count = plugin_manager.process_options(&matches)?;
     let mut opt: Opt = Opt::from_arg_matches(&matches)?;
     opt.process()?;
-    env_logger::builder().filter_level(opt.log_level()).parse_default_env().init();
+
+    let is_tty = std::io::stdout().is_terminal();
+    let ui_state = if is_tty { Some(Arc::new(UiState::new())) } else { None };
+    let plain_log_path = opt
+        .plain_log_file
+        .clone()
+        .or_else(|| std::env::var("KERYX_PLAIN_LOG_FILE").ok());
+    let plain_log_file = plain_log_path
+        .and_then(|path| {
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    eprintln!("Failed to open plain log file '{}': {}", path, e);
+                    None
+                }
+            }
+        });
+    init_logging(opt.log_level(), ui_state.clone(), !is_tty, plain_log_file)?;
+    plugin_manager.set_log_sink(Some(plugin_log_sink));
+
+    if is_tty {
+        let stderr_path = std::env::var("KERYX_STDERR_LOG_FILE").ok().unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{}/.keryx/stderr.log", home)
+        });
+        if let Some(parent) = std::path::Path::new(&stderr_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match redirect_stderr_for_tui(&stderr_path) {
+            Ok(()) => info!("TUI: stderr redirected to {}", stderr_path),
+            Err(e) => warn!("TUI: failed to redirect stderr ({})", e),
+        }
+    }
+
+    let worker_count = plugin_manager.process_options(&matches)?;
+
+    let stats = Arc::new(MinerStats::new());
+    stats.set_mining_address(opt.mining_address.clone());
+    stats.set_api_port(opt.stats_port);
+    let _ui_guard = ui_state
+        .as_ref()
+        .map(|ui| spawn_ui(Arc::clone(&stats), Arc::clone(ui)));
+
+    match spawn_stats_server(Arc::clone(&stats), opt.stats_bind.clone(), opt.stats_port) {
+        Ok(_handle) => {
+            info!("Stats API listening on {}:{}", opt.stats_bind, opt.stats_port);
+        }
+        Err(e) => {
+            warn!(
+                "Failed to start stats API on {}:{} ({})",
+                opt.stats_bind, opt.stats_port, e
+            );
+        }
+    }
+
     info!("=================================================================================");
     info!("                 Keryx-Miner GPU {}", env!("CARGO_PKG_VERSION"));
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));
@@ -616,7 +718,15 @@ async fn run() -> Result<(), Error> {
         );
     }
     loop {
-        match client_main(&opt, block_template_ctr.clone(), &plugin_manager, escrow_privkey.clone()).await {
+        match client_main(
+            &opt,
+            block_template_ctr.clone(),
+            &plugin_manager,
+            escrow_privkey.clone(),
+            Arc::clone(&stats),
+        )
+        .await
+        {
             Ok(_) => info!("Client closed gracefully"),
             Err(e) => error!("Client closed with error {:?}", e),
         }

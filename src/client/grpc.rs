@@ -662,7 +662,7 @@ impl KeryxdHandler {
                 }
             }
             Payload::SubmitBlockResponse(res) => match res.error {
-                None => info!("block submitted successfully!"),
+                None => info!("Block submitted successfully!"),
                 Some(e) => warn!("Failed submitting block: {:?}", e),
             },
             Payload::SubmitTransactionResponse(res) => {

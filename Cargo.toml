@@ -33,6 +33,7 @@ blake2b_simd = "1.0.0"
 clap = { version = "3.0", features = ["color", "derive"]}
 log = "0.4"
 env_logger = "0.9"
+crossterm = "0.28"
 keccak = { version = "0.1", optional = true }
 parking = { package = "parking_lot", version = "0.12", optional = true }
 libloading = "0.7"

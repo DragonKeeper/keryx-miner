@@ -4,8 +4,9 @@ extern crate keryx_miner;
 use clap::{ArgMatches, FromArgMatches};
 use cust::prelude::*;
 use keryx_miner::{Plugin, Worker, WorkerSpec};
-use log::LevelFilter;
+use log::{LevelFilter, Metadata, Record};
 use std::error::Error as StdError;
+use std::sync::{Mutex, Once, OnceLock};
 #[cfg(feature = "overclock")]
 use {
     log::{error, info},
@@ -31,10 +32,61 @@ pub struct CudaPlugin {
     _enabled: bool,
 }
 
+struct CudaPluginLogger;
+
+static CUDA_PLUGIN_LOGGER: CudaPluginLogger = CudaPluginLogger;
+static CUDA_LOGGER_INIT: Once = Once::new();
+
+fn host_log_sink() -> &'static Mutex<Option<keryx_miner::PluginLogSink>> {
+    static SINK: OnceLock<Mutex<Option<keryx_miner::PluginLogSink>>> = OnceLock::new();
+    SINK.get_or_init(|| Mutex::new(None))
+}
+
+fn level_to_u8(level: log::Level) -> u8 {
+    match level {
+        log::Level::Error => keryx_miner::PLUGIN_LOG_ERROR,
+        log::Level::Warn => keryx_miner::PLUGIN_LOG_WARN,
+        log::Level::Info => keryx_miner::PLUGIN_LOG_INFO,
+        log::Level::Debug => keryx_miner::PLUGIN_LOG_DEBUG,
+        log::Level::Trace => keryx_miner::PLUGIN_LOG_TRACE,
+    }
+}
+
+impl log::Log for CudaPluginLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let sink = host_log_sink()
+            .lock()
+            .ok()
+            .and_then(|g| *g);
+        let Some(sink) = sink else {
+            return;
+        };
+
+        let line = format!("[{} {}] {}", record.level(), record.target(), record.args());
+        sink(level_to_u8(record.level()), line.as_ptr(), line.len());
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_plugin_logger() {
+    CUDA_LOGGER_INIT.call_once(|| {
+        let _ = log::set_logger(&CUDA_PLUGIN_LOGGER).map(|()| log::set_max_level(LevelFilter::Info));
+    });
+}
+
 impl CudaPlugin {
     fn new() -> Result<Self, Error> {
         cust::init(CudaFlags::empty())?;
-        env_logger::builder().filter_level(LevelFilter::Info).parse_default_env().init();
+        init_plugin_logger();
         Ok(Self {
             specs: Vec::new(),
             _enabled: false,
@@ -139,6 +191,12 @@ impl Plugin for CudaPlugin {
                 .collect();
         }
         Ok(self.specs.len())
+    }
+
+    fn set_log_sink(&mut self, sink: Option<keryx_miner::PluginLogSink>) {
+        if let Ok(mut slot) = host_log_sink().lock() {
+            *slot = sink;
+        }
     }
 }
 
