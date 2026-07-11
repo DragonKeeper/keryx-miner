@@ -8,6 +8,7 @@ __MD="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
 
 conf=""
 conf+=" -s $CUSTOM_URL --mining-address $CUSTOM_TEMPLATE"
+conf+=" --plain-log-file $CUSTOM_LOG_BASENAME.log"
 
 [[ ! -z $CUSTOM_USER_CONFIG ]] && conf+=" $CUSTOM_USER_CONFIG"
 
