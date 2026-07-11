@@ -369,7 +369,6 @@ impl MinerManager {
                                 s.generate_block_if_pom(nonce, idx.as_ref(), tier)
                             });
                             if let Some(block_seed) = built {
-                                match send_channel.blocking_send(block_seed.clone()) {
                                     Ok(()) => block_seed.report_block(),
                                     Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
                                 }
