@@ -20,4 +20,4 @@ if [[ -n "${STY:-}" && -z "${KERYX_TRUECOLOR:-}" ]]; then
   export KERYX_TRUECOLOR=0
 fi
 
-./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --stats-bind 0.0.0.0 --stats-port "$WEB_PORT" --plain-log-file "$CUSTOM_LOG_BASENAME.log" $@
+./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --stats-bind 0.0.0.0 --stats-port "$WEB_PORT" $@
