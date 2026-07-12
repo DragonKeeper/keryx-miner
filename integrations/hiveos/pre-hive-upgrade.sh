@@ -33,4 +33,4 @@ EOF
 chmod +x "$SCRIPT_DIR/h-stop.sh"
 
 echo "[keryx] HiveOS Pre-upgrade preparation complete."
-echo "[keryx] It is now safe to change the Install URL in the HiveOS custom miner config screen."
+echo "[keryx] It is now safe to change the Install URL in the HiveOS custom miner config screen and apply changes."
