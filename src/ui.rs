@@ -404,8 +404,13 @@ fn draw_frame(
             .into_iter()
             .map(|k| (k.device_id, k))
             .collect();
+    let loaded_model_by_device: HashMap<u32, String> =
+        keryx_miner::pom_gpu::list_mining_model_labels()
+            .into_iter()
+            .collect();
 
-    let left_w = total_width.saturating_sub(1) / 2;
+    // Bias layout toward the device pane, but keep left metrics moderately large: ~43% / ~57%.
+    let left_w = total_width.saturating_sub(1) * 43 / 100;
     let right_w = total_width.saturating_sub(left_w + 1);
     let divider_x = left_w as u16;
     let right_x = left_w as u16 + 1;
@@ -539,17 +544,6 @@ fn draw_frame(
             (format!(" {:<16}", "Address"), palette().dim),
             (address_metric, palette().ok),
         ]),
-        PanelRow::Segments(vec![
-            (format!(" {:<16}", "OPoI"), palette().dim),
-            (
-                opoi_pause_value.to_string(),
-                if snapshot.opoi_challenge_active {
-                    palette().bright
-                } else {
-                    palette().dim
-                },
-            ),
-        ]),
         metric_row("Blocks Accepted", blocks_found_value.to_string(), palette().bright),
         metric_row(
             "Blocks Rejected",
@@ -611,6 +605,7 @@ fn draw_frame(
     right_rows.push((" Devices".to_string(), palette().accent, true));
 
     let id_w = if compact { 3usize } else { 4usize };
+    let model_w = if compact { 10usize } else { 14usize };
     let rate_w = if compact { 9usize } else { 11usize };
     let cc_w = if compact { 3usize } else { 5usize };
     let cm_w = if compact { 7usize } else { 9usize };
@@ -620,24 +615,32 @@ fn draw_frame(
     } else {
         (right_w / 8).clamp(5, 11)
     };
-    let kernel_w = right_w.saturating_sub(id_w + rate_w + cc_w + cm_w + fan_w + bar_w + 10);
+    let free_w = right_w.saturating_sub(id_w + model_w + rate_w + cc_w + cm_w + fan_w + bar_w + 12);
+    // Keep Loaded Model closer to Kernel: trim Kernel by ~5 chars when possible.
+    let kernel_min = if compact { 7 } else { 10 };
+    let kernel_w = ((free_w * 2 / 5).max(kernel_min)).saturating_sub(3).max(kernel_min);
+    let loaded_w = free_w.saturating_sub(kernel_w).max(if compact { 9 } else { 12 });
     right_rows.push((
         format!(
-            " {:<id_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$} {:<kernel_w$}",
+            " {:<id_w$} {:<model_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$} {:<kernel_w$} {:<loaded_w$}",
             "ID",
+            "Model",
             "Hashrate",
             "CC",
             "Core/Mem",
             "Fan",
             "Load",
             "Kernel",
+            "Loaded Model",
             id_w = id_w,
+            model_w = model_w,
             rate_w = rate_w,
             cc_w = cc_w,
             cm_w = cm_w,
             fan_w = fan_w,
             bar_w = bar_w,
             kernel_w = kernel_w,
+            loaded_w = loaded_w,
         ),
         palette().muted,
         true,
@@ -665,6 +668,9 @@ fn draw_frame(
                 (compute, k.image.clone())
             })
             .unwrap_or_else(|| ("n/a".to_string(), "n/a".to_string()));
+        let loaded_model = dev_id
+            .and_then(|id| loaded_model_by_device.get(&id).cloned())
+            .unwrap_or_else(|| "n/a".to_string());
 
         let load_blocks = (((d.hashrate_hs as f64 / max_rate as f64) * bar_w as f64).round() as usize)
             .clamp(0, bar_w);
@@ -672,6 +678,7 @@ fn draw_frame(
         let id_short = parse_device_id(&d.id)
             .map(|id| format!("#{}", id))
             .unwrap_or_else(|| trim_to_width(&d.id, id_w));
+        let model_short = trim_to_width(&short_device_model(&d.id), model_w);
         let rate_short = trim_to_width(&format_hashrate(d.hashrate_hs), rate_w);
         let temp = d.temp_c.map(|v| format!("{}C", v)).unwrap_or_else(|| "--".to_string());
         let mem = d
@@ -684,25 +691,31 @@ fn draw_frame(
             .map(|v| format!("{}%", v))
             .unwrap_or_else(|| "--".to_string());
         let kernel_short = trim_to_width(&kernel, kernel_w);
+        let loaded_short = trim_to_width(&loaded_model, loaded_w);
+        let brand_color = device_brand_color(&d.id);
         right_rows.push((
             format!(
-                " {:<id_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$} {:<kernel_w$}",
+                " {:<id_w$} {:<model_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$} {:<kernel_w$} {:<loaded_w$}",
                 id_short,
+                model_short,
                 rate_short,
                 compute,
                 core_mem,
                 fan,
                 load_bar,
                 kernel_short,
+                loaded_short,
                 id_w = id_w,
+                model_w = model_w,
                 rate_w = rate_w,
                 cc_w = cc_w,
                 cm_w = cm_w,
                 fan_w = fan_w,
                 bar_w = bar_w,
                 kernel_w = kernel_w,
+                loaded_w = loaded_w,
             ),
-            thermal_level_color(d.temp_c, d.memory_temp_c, d.fan_percent),
+            brand_color,
             false,
         ));
     }
@@ -997,38 +1010,6 @@ fn load_average_summary() -> Option<(f64, f64, f64)> {
     Some((load_1m, load_5m, load_15m))
 }
 
-fn thermal_level_color(core_temp_c: Option<u32>, memory_temp_c: Option<u32>, fan_percent: Option<u32>) -> Color {
-    // NVIDIA-oriented thermal bands:
-    // Core: warm 76-85, hot 86-92, dangerous 93+
-    // Mem : warm 86-95, hot 96-104, dangerous 105+
-    let core_crit = core_temp_c.is_some_and(|t| t >= 93);
-    let mem_crit = memory_temp_c.is_some_and(|t| t >= 105);
-    if core_crit || mem_crit {
-        return palette().err;
-    }
-
-    let core_hot = core_temp_c.is_some_and(|t| t >= 86);
-    let mem_hot = memory_temp_c.is_some_and(|t| t >= 96);
-    let fan_warn = fan_percent.is_some_and(|f| f >= 90);
-    if core_hot || mem_hot || fan_warn {
-        return palette().warn;
-    }
-
-    let core_warm = core_temp_c.is_some_and(|t| t >= 76);
-    let mem_warm = memory_temp_c.is_some_and(|t| t >= 86);
-    if core_warm || mem_warm {
-        return palette().mid;
-    }
-
-    if core_temp_c.is_some() || memory_temp_c.is_some() {
-        palette().ok
-    } else if fan_percent.is_some() {
-        palette().dim
-    } else {
-        palette().muted
-    }
-}
-
 fn handle_input(ui_state: &UiState) {
     while event::poll(Duration::from_millis(0)).unwrap_or(false) {
         let Ok(Event::Key(key)) = event::read() else {
@@ -1091,6 +1072,42 @@ fn parse_device_id(worker_id: &str) -> Option<u32> {
         .strip_prefix('#')
         .and_then(|s| s.split_whitespace().next())
         .and_then(|s| s.parse::<u32>().ok())
+}
+
+fn short_device_model(worker_id: &str) -> String {
+    let raw = worker_id
+        .split_once('(')
+        .and_then(|(_, rhs)| rhs.strip_suffix(')'))
+        .unwrap_or(worker_id)
+        .trim();
+
+    let lower = raw.to_ascii_lowercase();
+    let cleaned = if lower.contains("nvidia") {
+        raw.replace("NVIDIA", "")
+            .replace("GeForce", "")
+            .replace("Corporation", "")
+            .replace("Graphics Device", "")
+    } else if lower.contains("amd") || lower.contains("radeon") {
+        raw.replace("Advanced Micro Devices, Inc.", "")
+            .replace("AMD", "")
+            .replace("Radeon", "")
+            .replace("Graphics", "")
+    } else {
+        raw.to_string()
+    };
+
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn device_brand_color(worker_id: &str) -> Color {
+    let lower = worker_id.to_ascii_lowercase();
+    if lower.contains("nvidia") {
+        palette().ok
+    } else if lower.contains("amd") || lower.contains("radeon") {
+        palette().err
+    } else {
+        palette().text
+    }
 }
 
 fn uppercase_first_char(s: &str) -> String {

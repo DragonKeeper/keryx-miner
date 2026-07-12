@@ -627,6 +627,30 @@ pub fn device_for_model(model_id: &[u8; 32]) -> Option<u32> {
     g.iter().filter(|(_, (id, _))| id == model_id).map(|(dev, _)| *dev).min()
 }
 
+/// UI helper: current mining-model label by CUDA device id.
+/// Returns entries sorted by device id.
+pub fn list_mining_model_labels() -> Vec<(u32, String)> {
+    let snapshot: Vec<(u32, [u8; 32])> = match mining_tiers().lock() {
+        Ok(g) => g.iter().map(|(dev, (id, _))| (*dev, *id)).collect(),
+        Err(_) => return Vec::new(),
+    };
+
+    let mut out: Vec<(u32, String)> = snapshot
+        .into_iter()
+        .map(|(dev, model_id)| {
+            let label = crate::models::REGISTRY
+                .iter()
+                .copied()
+                .find(|m| m.model_id == model_id)
+                .map(|m| m.dir_name.to_string())
+                .unwrap_or_else(|| hex::encode(model_id)[..8].to_string());
+            (dev, label)
+        })
+        .collect();
+    out.sort_by_key(|(dev, _)| *dev);
+    out
+}
+
 /// Models that OOM'd when loading on a given GPU: `(device_id, model_id)`. Once banlisted, that GPU
 /// never retries that model (avoids a hot-spin reloading a model that doesn't fit); the OOM handler
 /// downgrades the GPU to a smaller downloaded tier instead.
