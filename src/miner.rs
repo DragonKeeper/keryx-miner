@@ -156,12 +156,7 @@ const LOG_RATE: Duration = Duration::from_secs(10);
 const STALL_GRACE_TICKS: u32 = 3;
 
 impl MinerManager {
-    pub fn new(
-        send_channel: Sender<BlockSeed>,
-        n_cpus: Option<u16>,
-        manager: &PluginManager,
-        stats: Arc<MinerStats>,
-    ) -> Self {
+    pub fn new(send_channel: Sender<BlockSeed>, n_cpus: Option<u16>, manager: &PluginManager, stats: Arc<MinerStats>) -> Self {
         register_freeze_handler();
         let hashes_tried = Arc::new(AtomicU64::new(0));
         let hashes_by_worker = Arc::new(Mutex::new(HashMap::<String, Arc<AtomicU64>>::new()));
@@ -190,13 +185,7 @@ impl MinerManager {
         let logger_challenge = Arc::clone(&opoi_challenge_active);
         let logger_stats = Arc::clone(&stats);
         thread::spawn(move || {
-            Self::log_hashrate(
-                logger_hashes,
-                logger_by_worker,
-                logger_challenge,
-                logger_stop_spawn,
-                logger_stats,
-            )
+            Self::log_hashrate(logger_hashes, logger_by_worker, logger_challenge, logger_stop_spawn, logger_stats)
         });
         Self {
             handles,
@@ -369,9 +358,10 @@ impl MinerManager {
                                 s.generate_block_if_pom(nonce, idx.as_ref(), tier)
                             });
                             if let Some(block_seed) = built {
+                                match send_channel.blocking_send(block_seed.clone()) {
                                     Ok(()) => block_seed.report_block(),
                                     Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
-                                }
+                                };
                                 if let BlockSeed::FullBlock(_) = block_seed {
                                     state = None;
                                 }
