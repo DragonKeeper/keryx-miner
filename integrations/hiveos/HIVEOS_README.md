@@ -4,7 +4,7 @@ h-stop.sh and h-run.sh contain code to protect the miner's `models` directory wh
 
 ## What the stop script does
 
-When HiveOS stops the custom miner during an upgrade or reinstall, `h-stop.sh` checks for the miner's local `models` directory and moves it out of the install path before HiveOS removes the old miner folder.
+When HiveOS stops the custom miner during an upgrade or reinstall, `h-stop.sh` checks for the miner's local `models` directory and moves it out of the install path before HiveOS removes the old miner folder. This should still pull the models directory out even with the current folder naming.
 
 This prevents model downloads from being deleted every time the install URL changes.
 
