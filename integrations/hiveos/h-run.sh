@@ -20,4 +20,9 @@ if [[ -n "${STY:-}" && -z "${KERYX_TRUECOLOR:-}" ]]; then
   export KERYX_TRUECOLOR=0
 fi
 
+# One-time migration: move the global models dir into this miner's local dir.
+if [[ -d "/hive/miners/custom/models" && ! -e "$CUSTOM_MINER_DIR/models" ]]; then
+  mv "/hive/miners/custom/models" "$CUSTOM_MINER_DIR/models" || true
+fi
+
 ./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --stats-bind 0.0.0.0 --stats-port "$WEB_PORT" $@
