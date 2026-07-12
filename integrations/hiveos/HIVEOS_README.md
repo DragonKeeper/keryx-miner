@@ -16,6 +16,8 @@ This restores the model files after HiveOS has unpacked the new miner package.
 
 ## Tarball naming
 
+Naming it like this with only 2 hyphens keeps the folder name that hive creates, short.  It creates a single folde each time named keryx-miner.  Every space after the second
+hyphen should be an underscore.
 The HiveOS release tarball should be named in this format:
 
 ```text
