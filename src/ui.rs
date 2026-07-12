@@ -601,8 +601,12 @@ fn draw_frame(
         left_rows.truncate(content_budget);
     }
 
-    let mut right_rows: Vec<(String, Color, bool)> = Vec::new();
-    right_rows.push((" Devices".to_string(), palette().accent, true));
+    let mut right_rows: Vec<PanelRow> = Vec::new();
+    right_rows.push(PanelRow::Plain {
+        text: " Devices".to_string(),
+        fg: palette().accent,
+        bold: true,
+    });
 
     let id_w = if compact { 3usize } else { 4usize };
     let model_w = if compact { 10usize } else { 14usize };
@@ -620,8 +624,8 @@ fn draw_frame(
     let kernel_min = if compact { 7 } else { 10 };
     let kernel_w = ((free_w * 2 / 5).max(kernel_min)).saturating_sub(3).max(kernel_min);
     let loaded_w = free_w.saturating_sub(kernel_w).max(if compact { 9 } else { 12 });
-    right_rows.push((
-        format!(
+    right_rows.push(PanelRow::Plain {
+        text: format!(
             " {:<id_w$} {:<model_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$} {:<kernel_w$} {:<loaded_w$}",
             "ID",
             "Model",
@@ -642,9 +646,9 @@ fn draw_frame(
             kernel_w = kernel_w,
             loaded_w = loaded_w,
         ),
-        palette().muted,
-        true,
-    ));
+        fg: palette().muted,
+        bold: true,
+    });
 
     let max_rate = snapshot
         .devices
@@ -654,7 +658,7 @@ fn draw_frame(
         .unwrap_or(1)
         .max(1);
 
-    let max_device_rows = content_budget.saturating_sub(3).max(1);
+    let max_device_rows = ((content_budget.saturating_sub(2)) / 2).max(1);
     let shown = snapshot.devices.len().min(max_device_rows);
     for d in snapshot.devices.iter().take(shown) {
         let dev_id = parse_device_id(&d.id);
@@ -692,40 +696,62 @@ fn draw_frame(
             .unwrap_or_else(|| "--".to_string());
         let kernel_short = trim_to_width(&kernel, kernel_w);
         let loaded_short = trim_to_width(&loaded_model, loaded_w);
+        let power_short = d
+            .power_draw_w
+            .map(format_power_draw)
+            .unwrap_or_else(|| "--".to_string());
+        let efficiency_short = d
+            .power_draw_w
+            .map(|w| format_efficiency(d.hashrate_hs, w))
+            .unwrap_or_else(|| "--".to_string());
+        let detail_color = if power_short == "--" || efficiency_short == "--" {
+            palette().muted
+        } else {
+            palette().ok
+        };
         let brand_color = device_brand_color(&d.id);
-        right_rows.push((
-            format!(
-                " {:<id_w$} {:<model_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$} {:<kernel_w$} {:<loaded_w$}",
-                id_short,
-                model_short,
-                rate_short,
-                compute,
-                core_mem,
-                fan,
-                load_bar,
-                kernel_short,
-                loaded_short,
-                id_w = id_w,
-                model_w = model_w,
-                rate_w = rate_w,
-                cc_w = cc_w,
-                cm_w = cm_w,
-                fan_w = fan_w,
-                bar_w = bar_w,
-                kernel_w = kernel_w,
-                loaded_w = loaded_w,
+        right_rows.push(PanelRow::Segments(vec![
+            (
+                format!(
+                    " {:<id_w$} {:<model_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$} {:<kernel_w$} {:<loaded_w$}",
+                    id_short,
+                    model_short,
+                    rate_short,
+                    compute,
+                    core_mem,
+                    fan,
+                    load_bar,
+                    kernel_short,
+                    loaded_short,
+                    id_w = id_w,
+                    model_w = model_w,
+                    rate_w = rate_w,
+                    cc_w = cc_w,
+                    cm_w = cm_w,
+                    fan_w = fan_w,
+                    bar_w = bar_w,
+                    kernel_w = kernel_w,
+                    loaded_w = loaded_w,
+                ),
+                brand_color,
             ),
-            brand_color,
-            false,
-        ));
+        ]));
+        right_rows.push(PanelRow::Segments(vec![
+            ("   ".to_string(), palette().muted),
+            ("P: ".to_string(), palette().muted),
+            (format!("{:<8}", power_short), detail_color),
+            ("  ".to_string(), palette().muted),
+            ("Eff: ".to_string(), palette().muted),
+            (efficiency_short, detail_color),
+        ]));
     }
 
     if snapshot.devices.len() > shown {
-        right_rows.push((
-            format!(" +{} more devices", snapshot.devices.len().saturating_sub(shown)),
-            palette().muted,
-            false,
-        ));
+        right_rows.push(PanelRow::Plain {
+            text: format!(" +{} more devices", snapshot.devices.len().saturating_sub(shown)),
+            fg: palette().muted,
+            bold: false,
+        });
     }
 
     let content_rows = left_rows.len().max(right_rows.len());
@@ -759,11 +785,15 @@ fn draw_frame(
 
         draw_colored_cell(out, divider_x, y, 1, "|", palette().muted, palette().panel, false);
 
-        let (right_text, right_fg, right_bold) = right_rows
-            .get(row)
-            .cloned()
-            .unwrap_or_else(|| ("".to_string(), palette().text, false));
-        draw_colored_cell(out, right_x, y, right_w, &right_text, right_fg, right_bg, right_bold);
+        match right_rows.get(row) {
+            Some(PanelRow::Plain { text, fg, bold }) => {
+                draw_colored_cell(out, right_x, y, right_w, text, *fg, right_bg, *bold);
+            }
+            Some(PanelRow::Segments(segments)) => {
+                draw_colored_segments_cell(out, right_x, y, right_w, segments, right_bg);
+            }
+            None => draw_colored_cell(out, right_x, y, right_w, "", palette().text, right_bg, false),
+        }
     }
 
     let separator_y = content_rows as u16 + 1;
@@ -1065,6 +1095,41 @@ fn format_hashrate(hs: u64) -> String {
     } else {
         format!("{:.2} Ths", v / 1_000_000_000_000.0)
     }
+}
+
+fn format_power_draw(power_w: f32) -> String {
+    if power_w.is_finite() {
+        format!("{:.0}W", power_w.max(0.0).round())
+    } else {
+        "--".to_string()
+    }
+}
+
+fn format_efficiency(hashrate_hs: u64, power_w: f32) -> String {
+    if hashrate_hs == 0 || !power_w.is_finite() || power_w.is_sign_negative() {
+        return "--".to_string();
+    }
+
+    let hashrate = hashrate_hs as f64;
+    if hashrate <= 0.0 {
+        return "--".to_string();
+    }
+
+    let (scaled_rate, unit) = if hashrate < 1_000_000.0 {
+        (hashrate / 1_000.0, "kH")
+    } else if hashrate < 1_000_000_000.0 {
+        (hashrate / 1_000_000.0, "MH")
+    } else if hashrate < 1_000_000_000_000.0 {
+        (hashrate / 1_000_000_000.0, "GH")
+    } else {
+        (hashrate / 1_000_000_000_000.0, "TH")
+    };
+
+    if scaled_rate <= 0.0 {
+        return "--".to_string();
+    }
+
+    format!("{:.1} J/{}", (power_w as f64) / scaled_rate, unit)
 }
 
 fn parse_device_id(worker_id: &str) -> Option<u32> {

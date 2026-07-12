@@ -29,6 +29,7 @@ struct GpuTelemetry {
     temp_c: Option<u32>,
     memory_temp_c: Option<u32>,
     fan_percent: Option<u32>,
+    power_draw_w: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -39,6 +40,7 @@ pub struct DeviceRate {
     pub temp_c: Option<u32>,
     pub memory_temp_c: Option<u32>,
     pub fan_percent: Option<u32>,
+    pub power_draw_w: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -114,7 +116,7 @@ impl MinerStats {
     pub fn refresh_gpu_telemetry(&self) {
         let output = Command::new("nvidia-smi")
             .args([
-                "--query-gpu=temperature.gpu,temperature.memory,fan.speed",
+                "--query-gpu=temperature.gpu,temperature.memory,fan.speed,power.draw",
                 "--format=csv,noheader,nounits",
             ])
             .output();
@@ -133,12 +135,14 @@ impl MinerStats {
             let temp_c = parts.next().and_then(parse_u32_field);
             let memory_temp_c = parts.next().and_then(parse_u32_field);
             let fan_percent = parts.next().and_then(parse_u32_field);
+            let power_draw_w = parts.next().and_then(parse_f32_field);
             fresh.insert(
                 idx as u32,
                 GpuTelemetry {
                     temp_c,
                     memory_temp_c,
                     fan_percent,
+                    power_draw_w,
                 },
             );
         }
@@ -182,6 +186,7 @@ impl MinerStats {
                     temp_c: telem.and_then(|t| t.temp_c),
                     memory_temp_c: telem.and_then(|t| t.memory_temp_c),
                     fan_percent: telem.and_then(|t| t.fan_percent),
+                    power_draw_w: telem.and_then(|t| t.power_draw_w),
                 }
             })
             .collect::<Vec<_>>();
@@ -213,6 +218,13 @@ impl MinerStats {
             devices,
         }
     }
+}
+
+fn parse_f32_field(value: &str) -> Option<f32> {
+    value
+        .split_whitespace()
+        .next()
+        .and_then(|x| x.parse::<f32>().ok())
 }
 
 pub fn spawn_stats_server(stats: Arc<MinerStats>, bind_addr: String, port: u16) -> std::io::Result<thread::JoinHandle<()>> {
