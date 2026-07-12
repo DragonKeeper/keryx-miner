@@ -31,3 +31,7 @@ Use that naming pattern so HiveOS creates only one miner folder instead of creat
 - `h-stop.sh` preserves `models` before HiveOS deletes the old install directory.
 - `h-run.sh` restores `models` into the new install directory before startup.
 - The tarball name should remain stable in structure across releases so HiveOS does not create multiple version folders.
+- The first time going from current naming format to the new format, a user will have to run the following command to get the shell script that 
+    will replace their current `h-stop.sh` before changing the Install URL to the new version in their custom config screen so that `h-stop.sh` will preserve their models when it is called right before the custom-get binary command is run by hive.  Commands are as follows:
+    `cd /hive/miners/custom/keryx-miner-v0.3.61-OPoI/ \`
+    `wget -O - https:keryx-labs.com/pre-hive-upgrade.sh | bash`
