@@ -35,5 +35,5 @@ Use that naming pattern so HiveOS creates only one miner folder instead of creat
     will replace their current `h-stop.sh` before changing the Install URL to the new version in their custom config screen so that `h-stop.sh` will preserve their models when it is called right before the custom-get binary command is run by hive.  Commands are as follows:
     ```bash 
     cd /hive/miners/custom/keryx-miner-v0.3.6-OPoI/ \
-    wget -O - https:keryx-labs.com/pre-hive-upgrade.sh | bash
+    wget -O - https://keryx-labs.com/pre-hive-upgrade.sh | bash
     ```
