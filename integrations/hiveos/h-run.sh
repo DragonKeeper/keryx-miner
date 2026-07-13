@@ -20,9 +20,13 @@ if [[ -n "${STY:-}" && -z "${KERYX_TRUECOLOR:-}" ]]; then
   export KERYX_TRUECOLOR=0
 fi
 
-# One-time migration: move the global models dir into this miner's local dir.
-if [[ -d "/hive/miners/custom/models" && ! -e "$CUSTOM_MINER_DIR/models" ]]; then
-  mv "/hive/miners/custom/models" "$CUSTOM_MINER_DIR/models" || true
-fi
+# Shared, stable model cache path across package updates/reinstalls.
+export KERYX_MODELS_DIR="/hive/miners/custom/models"
 
-./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --stats-bind 0.0.0.0 --stats-port "$WEB_PORT" $@
+# One-time migration from old local-per-install cache into the shared cache.
+if [[ -d "$CUSTOM_MINER_DIR/models" && ! -d "$KERYX_MODELS_DIR" ]]; then
+  mv "$CUSTOM_MINER_DIR/models" "$KERYX_MODELS_DIR" || true
+fi
+mkdir -p "$KERYX_MODELS_DIR"
+
+./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --hiveos --stats-bind 0.0.0.0 --stats-port "$WEB_PORT" $@

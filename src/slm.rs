@@ -127,6 +127,9 @@ unsafe impl Sync for SlmEngine {}
 // ── File management ──────────────────────────────────────────────────────────
 
 fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
+    if let Some(root) = std::env::var_os("KERYX_MODELS_DIR") {
+        return std::path::PathBuf::from(root).join(spec.dir_name);
+    }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))

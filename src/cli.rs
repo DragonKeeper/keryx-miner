@@ -49,6 +49,20 @@ pub struct Opt {
     pub ipfs_url: String,
 
     #[clap(
+        long = "models-dir",
+        help = "Directory where model files are stored/downloaded (overrides default <exe_dir>/models)",
+        help_heading = "OPoI / Inference"
+    )]
+    pub models_dir: Option<String>,
+
+    #[clap(
+        long = "hiveos",
+        help = "Enable HiveOS defaults (uses /hive/miners/custom/models when --models-dir is not set)",
+        help_heading = "OPoI / Inference"
+    )]
+    pub hiveos: bool,
+
+    #[clap(
         long = "escrow-key-file",
         help = "Path to the OPoI escrow private key file (auto-generated if absent)",
         help_heading = "OPoI / Inference",

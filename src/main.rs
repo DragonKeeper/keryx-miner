@@ -435,6 +435,14 @@ async fn run() -> Result<(), Error> {
     let mut opt: Opt = Opt::from_arg_matches(&matches)?;
     opt.process()?;
 
+    // Model storage root is configurable: explicit --models-dir wins, otherwise
+    // --hiveos defaults to a stable shared HiveOS path.
+    if let Some(dir) = opt.models_dir.as_ref() {
+        std::env::set_var("KERYX_MODELS_DIR", dir);
+    } else if opt.hiveos && std::env::var_os("KERYX_MODELS_DIR").is_none() {
+        std::env::set_var("KERYX_MODELS_DIR", "/hive/miners/custom/models");
+    }
+
     let is_tty = std::io::stdout().is_terminal();
     let ui_state = if is_tty { Some(Arc::new(UiState::new())) } else { None };
     let plain_log_path = opt
@@ -453,6 +461,10 @@ async fn run() -> Result<(), Error> {
         });
     init_logging(opt.log_level(), ui_state.clone(), !is_tty, plain_log_file)?;
     plugin_manager.set_log_sink(Some(plugin_log_sink));
+
+    if let Ok(dir) = std::env::var("KERYX_MODELS_DIR") {
+        info!("Models directory: {}", dir);
+    }
 
     if is_tty {
         let stderr_path = std::env::var("KERYX_STDERR_LOG_FILE").ok().unwrap_or_else(|| {
