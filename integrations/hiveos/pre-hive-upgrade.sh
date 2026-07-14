@@ -12,6 +12,8 @@ fi
 if [[ -d "$CUSTOM_MINER_DIR/models" ]]; then
     if [[ ! -d /hive/miners/custom/models ]]; then
         mv "$CUSTOM_MINER_DIR/models" /hive/miners/custom/models || true
+    else
+        echo "[keryx] WARNING: legacy model cache still exists at $CUSTOM_MINER_DIR/models while /hive/miners/custom/models already exists (possible duplicate disk usage)." >&2
     fi
 fi
 

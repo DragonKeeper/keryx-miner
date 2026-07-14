@@ -27,6 +27,9 @@ export KERYX_MODELS_DIR="/hive/miners/custom/models"
 if [[ -d "$CUSTOM_MINER_DIR/models" && ! -d "$KERYX_MODELS_DIR" ]]; then
   mv "$CUSTOM_MINER_DIR/models" "$KERYX_MODELS_DIR" || true
 fi
+if [[ -d "$CUSTOM_MINER_DIR/models" && -d "$KERYX_MODELS_DIR" ]]; then
+  echo "[keryx] WARNING: legacy model cache still exists at $CUSTOM_MINER_DIR/models while shared cache exists at $KERYX_MODELS_DIR (possible duplicate disk usage)." >&2
+fi
 mkdir -p "$KERYX_MODELS_DIR"
 
-./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --hiveos --stats-bind 0.0.0.0 --stats-port "$WEB_PORT" $@
+./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --hiveos --stats-bind 127.0.0.1 --stats-port "$WEB_PORT" $@

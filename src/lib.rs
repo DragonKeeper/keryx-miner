@@ -26,6 +26,7 @@ pub const PLUGIN_LOG_TRACE: u8 = 5;
 pub struct PluginManager {
     plugins: Vec<Box<dyn Plugin>>,
     loaded_libraries: Vec<Library>,
+    startup_warnings: Vec<String>,
 }
 
 /**
@@ -34,7 +35,22 @@ pub struct PluginManager {
 */
 impl PluginManager {
     pub fn new() -> Self {
-        Self { plugins: Vec::new(), loaded_libraries: Vec::new() }
+        Self {
+            plugins: Vec::new(),
+            loaded_libraries: Vec::new(),
+            startup_warnings: Vec::new(),
+        }
+    }
+
+    fn record_startup_warning(&mut self, message: String) {
+        self.startup_warnings.push(message.clone());
+        if should_emit_startup_stderr() {
+            eprintln!("{}", message);
+        }
+    }
+
+    pub fn drain_startup_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.startup_warnings)
     }
 
     pub(crate) unsafe fn load_single_plugin<'help>(
@@ -89,13 +105,11 @@ impl PluginManager {
             count += match plugin.process_option(matchs) {
                 Ok(n) => n,
                 Err(e) => {
-                    if should_emit_startup_stderr() {
-                        eprintln!(
-                            "WARNING: Failed processing options for {} (ignore if you do not intend to use): {}",
-                            plugin.name(),
-                            e
-                        );
-                    }
+                    self.record_startup_warning(format!(
+                        "WARNING: Failed processing options for {} (ignore if you do not intend to use): {}",
+                        plugin.name(),
+                        e
+                    ));
                     0
                 }
             }
@@ -158,9 +172,10 @@ pub fn load_plugins<'help>(
     for path in paths {
         app = unsafe {
             factory.load_single_plugin(app, path.as_str()).unwrap_or_else(|(app, e)| {
-                if should_emit_startup_stderr() {
-                    eprintln!("WARNING: Failed loading plugin {} (ignore if you do not intend to use): {}", path, e);
-                }
+                factory.record_startup_warning(format!(
+                    "WARNING: Failed loading plugin {} (ignore if you do not intend to use): {}",
+                    path, e
+                ));
                 app
             })
         };

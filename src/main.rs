@@ -483,6 +483,9 @@ async fn run() -> Result<(), Error> {
         });
     init_logging(opt.log_level(), ui_state.clone(), !is_tty, plain_log_file)?;
     plugin_manager.set_log_sink(Some(plugin_log_sink));
+    for warning in plugin_manager.drain_startup_warnings() {
+        warn!("{}", warning);
+    }
 
     if let Ok(dir) = std::env::var("KERYX_MODELS_DIR") {
         info!("Models directory: {}", dir);

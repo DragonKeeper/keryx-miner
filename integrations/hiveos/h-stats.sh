@@ -109,7 +109,7 @@ diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
 
 if [ "$diffTime" -lt "$maxDelay" ]; then
         accepted_blocks=`grep -c "Block submitted successfully" <<< "$log"`
-        rejected_blocks=`grep -E -c "Failed submitting block|Failed submitting PoM block|rejected" <<< "$log"`
+        rejected_blocks=`grep -E -c "Failed submitting block|Failed submitting PoM block" <<< "$log"`
         # Value is second-to-last field (before unit), unit is last field.
         # The miner logs the rate with 2 decimals; dropping the dot then appending one 0 yields
         # rate*1000 (e.g. 3.83 -> "383" -> "3830"). NB: do NOT use `cut --output-delimiter=''` to
