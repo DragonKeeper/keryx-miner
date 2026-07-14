@@ -196,7 +196,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                 (f, resume_from, total)
             } else if resume_from > 0 && status == 416 {
                 // Range not satisfiable ⇒ the file is already fully downloaded.
-                if ui_progress_to_terminal() {
+                if ui_progress_to_stderr() {
                     eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
                 } else {
                     ui_download_info(&format!("[keryx-miner] already complete ({} MB).", resume_from / 1_000_000));
@@ -224,7 +224,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                     downloaded += n as u64;
                     if let Some(t) = total {
                         let pct = downloaded * 100 / t.max(1);
-                        if ui_progress_to_terminal() {
+                        if ui_progress_to_stderr() {
                             eprint!("\r  {:.1}/{:.1} MB ({}%)   ",
                                 downloaded as f64 / 1_000_000.0,
                                 t as f64 / 1_000_000.0,
@@ -254,7 +254,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         // usually returns a parsable Content-Range and self-heals.
         let complete = stream_err.is_none() && matches!(total, Some(t) if downloaded >= t);
         if complete {
-            if ui_progress_to_terminal() {
+            if ui_progress_to_stderr() {
                 eprintln!();
             }
             return Ok(());
@@ -275,13 +275,13 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
 }
 
 #[inline]
-fn ui_progress_to_terminal() -> bool {
+fn ui_progress_to_stderr() -> bool {
     !std::io::stdout().is_terminal()
 }
 
 #[inline]
 fn ui_download_info(message: &str) {
-    if ui_progress_to_terminal() {
+    if ui_progress_to_stderr() {
         eprintln!("{}", message);
     } else {
         log::info!("{}", message);
@@ -290,7 +290,7 @@ fn ui_download_info(message: &str) {
 
 #[inline]
 fn ui_download_warn(message: &str) {
-    if ui_progress_to_terminal() {
+    if ui_progress_to_stderr() {
         eprintln!("{}", message);
     } else {
         log::warn!("{}", message);
