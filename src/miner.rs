@@ -149,6 +149,7 @@ pub fn get_num_cpus(n_cpus: Option<u16>) -> u16 {
 }
 
 const LOG_RATE: Duration = Duration::from_secs(10);
+const GPU_TELEMETRY_RATE: Duration = Duration::from_secs(10);
 // Number of consecutive all-zero hashrate ticks (outside an OPoI inference pause)
 // tolerated before reporting a real stall. A brief run of zeros is normal — model
 // load/eviction or a gap between block templates — so we wait past this grace window
@@ -187,6 +188,9 @@ impl MinerManager {
         thread::spawn(move || {
             Self::log_hashrate(logger_hashes, logger_by_worker, logger_challenge, logger_stop_spawn, logger_stats)
         });
+        let telemetry_stop = Arc::clone(&logger_stop);
+        let telemetry_stats = Arc::clone(&stats);
+        thread::spawn(move || Self::refresh_gpu_telemetry_loop(telemetry_stop, telemetry_stats));
         Self {
             handles,
             block_channel: send,
@@ -571,7 +575,6 @@ impl MinerManager {
             let challenge_active = opoi_challenge_active.load(Ordering::Relaxed)
                 || keryx_miner::pom_gpu::is_loading();
             stats.set_opoi_challenge_active(challenge_active);
-            stats.refresh_gpu_telemetry();
             let total = hashes_tried.swap(0, Ordering::AcqRel);
 
             if total > 0 {
@@ -615,6 +618,13 @@ impl MinerManager {
                     info!("PoW paused (OPoI inference / model load) — stand by");
                 }
             }
+        }
+    }
+
+    fn refresh_gpu_telemetry_loop(stop: Arc<AtomicBool>, stats: Arc<MinerStats>) {
+        while !stop.load(Ordering::Acquire) {
+            stats.refresh_gpu_telemetry();
+            thread::sleep(GPU_TELEMETRY_RATE);
         }
     }
 
