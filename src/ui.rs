@@ -281,7 +281,7 @@ impl Drop for UiGuard {
     }
 }
 
-pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>) -> UiGuard {
+pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>, shutdown_requested: Arc<AtomicBool>) -> UiGuard {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop);
 
@@ -297,7 +297,9 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>) -> UiGuard {
         let mut last_drawn_at = std::time::Instant::now();
 
         while !stop_clone.load(Ordering::Acquire) {
-            handle_input(&ui_state);
+            if handle_input(&ui_state, &shutdown_requested) {
+                break;
+            }
             let current_size = terminal::size()
                 .ok()
                 .filter(|(w, h)| *w > 0 && *h > 0);
@@ -1040,7 +1042,7 @@ fn load_average_summary() -> Option<(f64, f64, f64)> {
     Some((load_1m, load_5m, load_15m))
 }
 
-fn handle_input(ui_state: &UiState) {
+fn handle_input(ui_state: &UiState, shutdown_requested: &AtomicBool) -> bool {
     while event::poll(Duration::from_millis(0)).unwrap_or(false) {
         let Ok(Event::Key(key)) = event::read() else {
             continue;
@@ -1054,7 +1056,8 @@ fn handle_input(ui_state: &UiState) {
             let mut out = stdout();
             let _ = execute!(out, Show, LeaveAlternateScreen);
             let _ = disable_raw_mode();
-            std::process::exit(130);
+            shutdown_requested.store(true, Ordering::Release);
+            return true;
         }
         match key.code {
             KeyCode::Up => ui_state.scroll_up(1),
@@ -1066,6 +1069,7 @@ fn handle_input(ui_state: &UiState) {
             _ => {}
         }
     }
+    false
 }
 
 fn trim_to_width(s: &str, width: usize) -> String {

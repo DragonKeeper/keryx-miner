@@ -14,7 +14,7 @@ use keryx_miner::PluginManager;
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use std::fs;
-use std::sync::atomic::AtomicU16;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -362,6 +362,7 @@ async fn client_main(
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
     stats: Arc<MinerStats>,
+    shutdown_requested: Arc<AtomicBool>,
 ) -> Result<(), Error> {
     let ipfs_url = opt.ipfs_url.clone();
     tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
@@ -382,9 +383,22 @@ async fn client_main(
     }
     client.register().await?;
     let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager, stats);
-    client.listen(&mut miner_manager).await?;
+    tokio::select! {
+        listen_res = client.listen(&mut miner_manager) => {
+            listen_res?;
+        }
+        _ = wait_for_shutdown(shutdown_requested) => {
+            info!("Shutdown requested, stopping client listen loop");
+        }
+    }
     drop(miner_manager);
     Ok(())
+}
+
+async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) {
+    while !shutdown_requested.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Tokio async worker count. The miner's async workload is tiny (one gRPC/stratum connection +
@@ -444,6 +458,14 @@ async fn run() -> Result<(), Error> {
     }
 
     let is_tty = std::io::stdout().is_terminal();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown_requested = Arc::clone(&shutdown_requested);
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown_requested.store(true, Ordering::Release);
+        });
+    }
     let ui_state = if is_tty { Some(Arc::new(UiState::new())) } else { None };
     let plain_log_path = opt
         .plain_log_file
@@ -481,13 +503,16 @@ async fn run() -> Result<(), Error> {
     }
 
     let worker_count = plugin_manager.process_options(&matches)?;
+    for warning in plugin_manager.drain_startup_warnings() {
+        warn!("{}", warning);
+    }
 
     let stats = Arc::new(MinerStats::new());
     stats.set_mining_address(opt.mining_address.clone());
     stats.set_api_port(opt.stats_port);
     let _ui_guard = ui_state
         .as_ref()
-        .map(|ui| spawn_ui(Arc::clone(&stats), Arc::clone(ui)));
+        .map(|ui| spawn_ui(Arc::clone(&stats), Arc::clone(ui), Arc::clone(&shutdown_requested)));
 
     match spawn_stats_server(Arc::clone(&stats), opt.stats_bind.clone(), opt.stats_port) {
         Ok(_handle) => {
@@ -730,19 +755,29 @@ async fn run() -> Result<(), Error> {
         );
     }
     loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            info!("Shutdown requested, exiting miner main loop");
+            break;
+        }
         match client_main(
             &opt,
             block_template_ctr.clone(),
             &plugin_manager,
             escrow_privkey.clone(),
             Arc::clone(&stats),
+            Arc::clone(&shutdown_requested),
         )
         .await
         {
             Ok(_) => info!("Client closed gracefully"),
             Err(e) => error!("Client closed with error {:?}", e),
         }
+        if shutdown_requested.load(Ordering::Acquire) {
+            info!("Shutdown requested, skipping reconnect");
+            break;
+        }
         info!("Client closed, reconnecting");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    Ok(())
 }
