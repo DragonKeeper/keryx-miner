@@ -130,7 +130,7 @@ pub struct Opt {
         long = "stats-bind",
         help = "Stats API bind address (e.g. 0.0.0.0, 127.0.0.1)",
         help_heading = "Monitoring",
-        default_value = "0.0.0.0"
+        default_value = "127.0.0.1"
     )]
     pub stats_bind: String,
 
