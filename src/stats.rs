@@ -6,7 +6,11 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const STATS_READ_TIMEOUT_SECS: u64 = 5;
+const STATS_WRITE_TIMEOUT_SECS: u64 = 5;
+const MAX_REQUEST_LINE_BYTES: usize = 4096;
 
 #[derive(Default)]
 pub struct MinerStats {
@@ -233,7 +237,10 @@ pub fn spawn_stats_server(stats: Arc<MinerStats>, bind_addr: String, port: u16) 
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let _ = handle_connection(stream, &stats);
+                    let stats = Arc::clone(&stats);
+                    thread::spawn(move || {
+                        let _ = handle_connection(stream, &stats);
+                    });
                 }
                 Err(_) => continue,
             }
@@ -242,11 +249,36 @@ pub fn spawn_stats_server(stats: Arc<MinerStats>, bind_addr: String, port: u16) 
 }
 
 fn handle_connection(mut stream: TcpStream, stats: &MinerStats) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(STATS_READ_TIMEOUT_SECS)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(STATS_WRITE_TIMEOUT_SECS)))?;
+
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
+    let mut request_line = Vec::with_capacity(256);
+    let read_res = reader
+        .by_ref()
+        .take((MAX_REQUEST_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut request_line);
+    let bytes_read = match read_res {
+        Ok(n) => n,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::WouldBlock || err.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    if bytes_read == 0 {
         return Ok(());
     }
+    if request_line.len() > MAX_REQUEST_LINE_BYTES {
+        return write_json_response(
+            &mut stream,
+            "414 URI Too Long",
+            b"{\"error\":\"request line too long\"}".to_vec(),
+        );
+    }
+
+    let request_line = String::from_utf8_lossy(&request_line);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
 
     let (status, body) = if path == "/stats" || path == "/v1/miner/stats" {
@@ -258,6 +290,10 @@ fn handle_connection(mut stream: TcpStream, stats: &MinerStats) -> std::io::Resu
         ("404 Not Found", b"{\"error\":\"not found\"}".to_vec())
     };
 
+    write_json_response(&mut stream, status, body)
+}
+
+fn write_json_response(stream: &mut TcpStream, status: &str, body: Vec<u8>) -> std::io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
