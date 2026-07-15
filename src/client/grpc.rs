@@ -662,8 +662,14 @@ impl KeryxdHandler {
                 }
             }
             Payload::SubmitBlockResponse(res) => match res.error {
-                None => info!("block submitted successfully!"),
-                Some(e) => warn!("Failed submitting block: {:?}", e),
+                None => {
+                    miner.record_block_accepted();
+                    info!("Block submitted successfully!");
+                }
+                Some(e) => {
+                    miner.record_block_rejected();
+                    warn!("Failed submitting block: {:?}", e);
+                }
             },
             Payload::SubmitTransactionResponse(res) => {
                 if self.escrow_watcher.as_ref().map_or(false, |w| w.pending_claim_txid.is_some()) {

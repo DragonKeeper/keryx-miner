@@ -14,7 +14,7 @@ use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Weights;
 use candle_transformers::models::quantized_gemma3::ModelWeights as Gemma3Weights;
 use crate::quantized_llama_split::ModelWeights as SplitWeights;
 use crate::quantized_qwen3_split::ModelWeights as Qwen3SplitWeights;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokenizers::Tokenizer;
@@ -127,6 +127,9 @@ unsafe impl Sync for SlmEngine {}
 // ── File management ──────────────────────────────────────────────────────────
 
 fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
+    if let Some(root) = std::env::var_os("KERYX_MODELS_DIR") {
+        return std::path::PathBuf::from(root).join(spec.dir_name);
+    }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -150,8 +153,9 @@ pub fn gguf_path_for(spec: &ModelSpec) -> std::path::PathBuf {
 fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 240; // survives long gateway outages (~40 min of retries)
     const BACKOFF_SECS: u64 = 10;
-    eprintln!("[keryx-miner] Downloading {} ...", url);
+    ui_download_info(&format!("[keryx-miner] Downloading {} ...", url));
     let mut attempt = 0u32;
+    let mut last_logged_percent: u64 = 0;
     loop {
         // Resume offset = how many bytes we already have on disk.
         let resume_from = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
@@ -167,8 +171,10 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                 if attempt >= MAX_ATTEMPTS {
                     return Err(anyhow!("HTTP GET {} failed after {} attempts: {}", url, attempt, e));
                 }
-                eprintln!("\n[keryx-miner] connect error ({e}); retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s (resume @ {} MB)…",
-                    resume_from / 1_000_000);
+                ui_download_warn(&format!(
+                    "[keryx-miner] connect error ({e}); retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s (resume @ {} MB)…",
+                    resume_from / 1_000_000
+                ));
                 std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
                 continue;
             }
@@ -190,7 +196,11 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                 (f, resume_from, total)
             } else if resume_from > 0 && status == 416 {
                 // Range not satisfiable ⇒ the file is already fully downloaded.
-                eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+                if ui_progress_to_stderr() {
+                    eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+                } else {
+                    ui_download_info(&format!("[keryx-miner] already complete ({} MB).", resume_from / 1_000_000));
+                }
                 return Ok(());
             } else {
                 // 200, or the server ignored Range ⇒ (re)start from scratch.
@@ -213,11 +223,22 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                     }
                     downloaded += n as u64;
                     if let Some(t) = total {
-                        eprint!("\r  {:.1}/{:.1} MB ({}%)   ",
-                            downloaded as f64 / 1_000_000.0,
-                            t as f64 / 1_000_000.0,
-                            downloaded * 100 / t.max(1));
-                        let _ = std::io::stderr().flush();
+                        let pct = downloaded * 100 / t.max(1);
+                        if ui_progress_to_stderr() {
+                            eprint!("\r  {:.1}/{:.1} MB ({}%)   ",
+                                downloaded as f64 / 1_000_000.0,
+                                t as f64 / 1_000_000.0,
+                                pct);
+                            let _ = std::io::stderr().flush();
+                        } else if pct >= last_logged_percent.saturating_add(10) || pct == 100 {
+                            last_logged_percent = pct;
+                            ui_download_info(&format!(
+                                "[keryx-miner] download progress: {:.1}/{:.1} MB ({}%)",
+                                downloaded as f64 / 1_000_000.0,
+                                t as f64 / 1_000_000.0,
+                                pct
+                            ));
+                        }
                     }
                 }
                 Err(e) => { stream_err = Some(e.to_string()); break; }
@@ -233,7 +254,9 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         // usually returns a parsable Content-Range and self-heals.
         let complete = stream_err.is_none() && matches!(total, Some(t) if downloaded >= t);
         if complete {
-            eprintln!();
+            if ui_progress_to_stderr() {
+                eprintln!();
+            }
             return Ok(());
         }
 
@@ -243,9 +266,34 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                 url, attempt, downloaded / 1_000_000));
         }
         let why = stream_err.unwrap_or_else(|| "short read".into());
-        eprintln!("\n[keryx-miner] interrupted ({why}); resuming {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s @ {} MB…",
-            downloaded / 1_000_000);
+        ui_download_warn(&format!(
+            "[keryx-miner] interrupted ({why}); resuming {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s @ {} MB…",
+            downloaded / 1_000_000
+        ));
         std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
+    }
+}
+
+#[inline]
+fn ui_progress_to_stderr() -> bool {
+    !std::io::stdout().is_terminal()
+}
+
+#[inline]
+fn ui_download_info(message: &str) {
+    if ui_progress_to_stderr() {
+        eprintln!("{}", message);
+    } else {
+        log::info!("{}", message);
+    }
+}
+
+#[inline]
+fn ui_download_warn(message: &str) {
+    if ui_progress_to_stderr() {
+        eprintln!("{}", message);
+    } else {
+        log::warn!("{}", message);
     }
 }
 
@@ -270,15 +318,17 @@ fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path
     }
     std::fs::create_dir_all(&dir)?;
     let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
-    eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
+    ui_download_info(&format!("[keryx-miner] Downloading model '{}' via IPFS. This happens once.", spec.name));
     if !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
     if !cfg.exists() { download_file(&ipfs_url(spec.config_cid), &cfg)?; }
     for (i, (cid, path)) in spec.weight_cids.iter().zip(wts.iter()).enumerate() {
-        if spec.weight_cids.len() > 1 { eprintln!("[keryx-miner] Shard {}/{}", i + 1, spec.weight_cids.len()); }
+        if spec.weight_cids.len() > 1 {
+            ui_download_info(&format!("[keryx-miner] Shard {}/{}", i + 1, spec.weight_cids.len()));
+        }
         download_file(&ipfs_url(cid), path)?;
     }
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
-    eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
+    ui_download_info(&format!("[keryx-miner] Model '{}' ready.", spec.name));
     Ok((tok, cfg, wts))
 }
 
@@ -295,11 +345,11 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     }
     std::fs::create_dir_all(&dir)?;
     let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
-    eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
+    ui_download_info(&format!("[keryx-miner] Downloading model '{}' via IPFS. This happens once.", spec.name));
     if !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
     download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
-    eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
+    ui_download_info(&format!("[keryx-miner] Model '{}' ready.", spec.name));
     Ok((tok, gguf))
 }
 

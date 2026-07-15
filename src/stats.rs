@@ -1,0 +1,331 @@
+use serde::Serialize;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const STATS_READ_TIMEOUT_SECS: u64 = 5;
+const STATS_WRITE_TIMEOUT_SECS: u64 = 5;
+const MAX_REQUEST_LINE_BYTES: usize = 4096;
+
+#[derive(Default)]
+pub struct MinerStats {
+    started_at: Mutex<Option<Instant>>,
+    started_epoch_s: AtomicU64,
+    synced: AtomicBool,
+    opoi_challenge_active: AtomicBool,
+    total_hashrate_hs: AtomicU64,
+    accepted_blocks: AtomicU64,
+    rejected_blocks: AtomicU64,
+    last_update_epoch_s: AtomicU64,
+    api_port: AtomicU64,
+    mining_address: Mutex<Option<String>>,
+    device_hashrate_hs: Mutex<HashMap<String, u64>>,
+    gpu_telemetry: Mutex<HashMap<u32, GpuTelemetry>>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct GpuTelemetry {
+    temp_c: Option<u32>,
+    memory_temp_c: Option<u32>,
+    fan_percent: Option<u32>,
+    power_draw_w: Option<f32>,
+}
+
+#[derive(Serialize)]
+pub struct DeviceRate {
+    pub id: String,
+    pub hashrate_hs: u64,
+    // Backward-compatible alias for core temp.
+    pub temp_c: Option<u32>,
+    pub memory_temp_c: Option<u32>,
+    pub fan_percent: Option<u32>,
+    pub power_draw_w: Option<f32>,
+}
+
+#[derive(Serialize)]
+pub struct MinerStatsSnapshot {
+    pub started_epoch_s: u64,
+    pub uptime_s: u64,
+    pub synced: bool,
+    pub opoi_challenge_active: bool,
+    pub mining_address: Option<String>,
+    pub api_port: Option<u16>,
+    pub total_hashrate_hs: u64,
+    pub accepted_blocks: u64,
+    pub rejected_blocks: u64,
+    pub last_update_epoch_s: u64,
+    pub devices: Vec<DeviceRate>,
+}
+
+impl MinerStats {
+    pub fn new() -> Self {
+        let now = now_epoch_s();
+        Self {
+            started_at: Mutex::new(Some(Instant::now())),
+            started_epoch_s: AtomicU64::new(now),
+            synced: AtomicBool::new(true),
+            opoi_challenge_active: AtomicBool::new(false),
+            total_hashrate_hs: AtomicU64::new(0),
+            accepted_blocks: AtomicU64::new(0),
+            rejected_blocks: AtomicU64::new(0),
+            last_update_epoch_s: AtomicU64::new(now),
+            api_port: AtomicU64::new(0),
+            mining_address: Mutex::new(None),
+            device_hashrate_hs: Mutex::new(HashMap::new()),
+            gpu_telemetry: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn set_api_port(&self, port: u16) {
+        self.api_port.store(port as u64, Ordering::Release);
+    }
+
+    pub fn set_mining_address(&self, address: Option<String>) {
+        if let Ok(mut slot) = self.mining_address.lock() {
+            *slot = address;
+        }
+    }
+
+    pub fn set_synced(&self, synced: bool) {
+        self.synced.store(synced, Ordering::Release);
+    }
+
+    pub fn set_opoi_challenge_active(&self, active: bool) {
+        self.opoi_challenge_active.store(active, Ordering::Release);
+    }
+
+    pub fn set_hashrates(&self, total_hs: u64, per_device_hs: &HashMap<String, u64>) {
+        self.total_hashrate_hs.store(total_hs, Ordering::Release);
+        self.last_update_epoch_s.store(now_epoch_s(), Ordering::Release);
+        let mut map = self.device_hashrate_hs.lock().expect("device stats mutex poisoned");
+        map.clear();
+        map.extend(per_device_hs.iter().map(|(k, v)| (k.clone(), *v)));
+    }
+
+    pub fn inc_accepted_blocks(&self) {
+        self.accepted_blocks.fetch_add(1, Ordering::AcqRel);
+        self.last_update_epoch_s.store(now_epoch_s(), Ordering::Release);
+    }
+
+    pub fn inc_rejected_blocks(&self) {
+        self.rejected_blocks.fetch_add(1, Ordering::AcqRel);
+        self.last_update_epoch_s.store(now_epoch_s(), Ordering::Release);
+    }
+
+    pub fn refresh_gpu_telemetry(&self) {
+        let output = Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=temperature.gpu,temperature.memory,fan.speed,power.draw",
+                "--format=csv,noheader,nounits",
+            ])
+            .output();
+
+        let Ok(output) = output else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut fresh = HashMap::new();
+        for (idx, line) in stdout.lines().enumerate() {
+            let mut parts = line.split(',').map(|s| s.trim());
+            let temp_c = parts.next().and_then(parse_u32_field);
+            let memory_temp_c = parts.next().and_then(parse_u32_field);
+            let fan_percent = parts.next().and_then(parse_u32_field);
+            let power_draw_w = parts.next().and_then(parse_f32_field);
+            fresh.insert(
+                idx as u32,
+                GpuTelemetry {
+                    temp_c,
+                    memory_temp_c,
+                    fan_percent,
+                    power_draw_w,
+                },
+            );
+        }
+
+        if let Ok(mut map) = self.gpu_telemetry.lock() {
+            *map = fresh;
+        }
+    }
+
+    pub fn snapshot(&self) -> MinerStatsSnapshot {
+        let started_epoch_s = self.started_epoch_s.load(Ordering::Acquire);
+        let uptime_s = self
+            .started_at
+            .lock()
+            .expect("start time mutex poisoned")
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+
+        let telemetry = self
+            .gpu_telemetry
+            .lock()
+            .expect("gpu telemetry mutex poisoned")
+            .clone();
+        let mining_address = self
+            .mining_address
+            .lock()
+            .expect("mining address mutex poisoned")
+            .clone();
+
+        let mut devices = self
+            .device_hashrate_hs
+            .lock()
+            .expect("device stats mutex poisoned")
+            .iter()
+            .map(|(id, rate)| {
+                let gpu_idx = parse_device_number(id);
+                let telem = gpu_idx.and_then(|idx| telemetry.get(&idx).copied());
+                DeviceRate {
+                    id: id.clone(),
+                    hashrate_hs: *rate,
+                    temp_c: telem.and_then(|t| t.temp_c),
+                    memory_temp_c: telem.and_then(|t| t.memory_temp_c),
+                    fan_percent: telem.and_then(|t| t.fan_percent),
+                    power_draw_w: telem.and_then(|t| t.power_draw_w),
+                }
+            })
+            .collect::<Vec<_>>();
+        devices.sort_by(|a, b| {
+            let a_num = parse_device_number(&a.id);
+            let b_num = parse_device_number(&b.id);
+            match (a_num, b_num) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.id.cmp(&b.id),
+            }
+        });
+
+        MinerStatsSnapshot {
+            started_epoch_s,
+            uptime_s,
+            synced: self.synced.load(Ordering::Acquire),
+            opoi_challenge_active: self.opoi_challenge_active.load(Ordering::Acquire),
+            mining_address,
+            api_port: match self.api_port.load(Ordering::Acquire) {
+                0 => None,
+                p => Some(p as u16),
+            },
+            total_hashrate_hs: self.total_hashrate_hs.load(Ordering::Acquire),
+            accepted_blocks: self.accepted_blocks.load(Ordering::Acquire),
+            rejected_blocks: self.rejected_blocks.load(Ordering::Acquire),
+            last_update_epoch_s: self.last_update_epoch_s.load(Ordering::Acquire),
+            devices,
+        }
+    }
+}
+
+fn parse_f32_field(value: &str) -> Option<f32> {
+    value
+        .split_whitespace()
+        .next()
+        .and_then(|x| x.parse::<f32>().ok())
+}
+
+pub fn spawn_stats_server(stats: Arc<MinerStats>, bind_addr: String, port: u16) -> std::io::Result<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind((bind_addr.as_str(), port))?;
+    Ok(thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let stats = Arc::clone(&stats);
+                    thread::spawn(move || {
+                        let _ = handle_connection(stream, &stats);
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+    }))
+}
+
+fn handle_connection(mut stream: TcpStream, stats: &MinerStats) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(STATS_READ_TIMEOUT_SECS)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(STATS_WRITE_TIMEOUT_SECS)))?;
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = Vec::with_capacity(256);
+    let read_res = reader
+        .by_ref()
+        .take((MAX_REQUEST_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', &mut request_line);
+    let bytes_read = match read_res {
+        Ok(n) => n,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::WouldBlock || err.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    if bytes_read == 0 {
+        return Ok(());
+    }
+    if request_line.len() > MAX_REQUEST_LINE_BYTES {
+        return write_json_response(
+            &mut stream,
+            "414 URI Too Long",
+            b"{\"error\":\"request line too long\"}".to_vec(),
+        );
+    }
+
+    let request_line = String::from_utf8_lossy(&request_line);
+    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+
+    let (status, body) = if path == "/stats" || path == "/v1/miner/stats" {
+        (
+            "200 OK",
+            serde_json::to_vec(&stats.snapshot()).unwrap_or_else(|_| b"{\"error\":\"failed to serialize stats\"}".to_vec()),
+        )
+    } else {
+        ("404 Not Found", b"{\"error\":\"not found\"}".to_vec())
+    };
+
+    write_json_response(&mut stream, status, body)
+}
+
+fn write_json_response(stream: &mut TcpStream, status: &str, body: Vec<u8>) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        body.len()
+    )?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn now_epoch_s() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn parse_device_number(id: &str) -> Option<u32> {
+    id.strip_prefix('#')
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u32>().ok())
+}
+
+fn parse_u32_field(value: &str) -> Option<u32> {
+    let filtered = value
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    if filtered.is_empty() {
+        None
+    } else {
+        filtered.parse::<u32>().ok()
+    }
+}

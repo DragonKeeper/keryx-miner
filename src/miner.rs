@@ -6,6 +6,7 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use crate::{pow, watch, Error};
+use crate::stats::MinerStats;
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use tokio::sync::mpsc::Sender;
@@ -112,6 +113,7 @@ pub struct MinerManager {
     hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
     current_state_id: AtomicUsize,
     opoi_challenge_active: Arc<AtomicBool>,
+    stats: Arc<MinerStats>,
 }
 
 impl Drop for MinerManager {
@@ -147,6 +149,7 @@ pub fn get_num_cpus(n_cpus: Option<u16>) -> u16 {
 }
 
 const LOG_RATE: Duration = Duration::from_secs(10);
+const GPU_TELEMETRY_RATE: Duration = Duration::from_secs(10);
 // Number of consecutive all-zero hashrate ticks (outside an OPoI inference pause)
 // tolerated before reporting a real stall. A brief run of zeros is normal — model
 // load/eviction or a gap between block templates — so we wait past this grace window
@@ -154,7 +157,7 @@ const LOG_RATE: Duration = Duration::from_secs(10);
 const STALL_GRACE_TICKS: u32 = 3;
 
 impl MinerManager {
-    pub fn new(send_channel: Sender<BlockSeed>, n_cpus: Option<u16>, manager: &PluginManager) -> Self {
+    pub fn new(send_channel: Sender<BlockSeed>, n_cpus: Option<u16>, manager: &PluginManager, stats: Arc<MinerStats>) -> Self {
         register_freeze_handler();
         let hashes_tried = Arc::new(AtomicU64::new(0));
         let hashes_by_worker = Arc::new(Mutex::new(HashMap::<String, Arc<AtomicU64>>::new()));
@@ -181,9 +184,13 @@ impl MinerManager {
         let logger_hashes = Arc::clone(&hashes_tried);
         let logger_by_worker = hashes_by_worker.clone();
         let logger_challenge = Arc::clone(&opoi_challenge_active);
+        let logger_stats = Arc::clone(&stats);
         thread::spawn(move || {
-            Self::log_hashrate(logger_hashes, logger_by_worker, logger_challenge, logger_stop_spawn)
+            Self::log_hashrate(logger_hashes, logger_by_worker, logger_challenge, logger_stop_spawn, logger_stats)
         });
+        let telemetry_stop = Arc::clone(&logger_stop);
+        let telemetry_stats = Arc::clone(&stats);
+        thread::spawn(move || Self::refresh_gpu_telemetry_loop(telemetry_stop, telemetry_stats));
         Self {
             handles,
             block_channel: send,
@@ -194,6 +201,7 @@ impl MinerManager {
             current_state_id: AtomicUsize::new(0),
             hashes_by_worker,
             opoi_challenge_active,
+            stats,
         }
     }
 
@@ -236,10 +244,19 @@ impl MinerManager {
         Arc::clone(&self.opoi_challenge_active)
     }
 
+    pub fn record_block_accepted(&self) {
+        self.stats.inc_accepted_blocks();
+    }
+
+    pub fn record_block_rejected(&self) {
+        self.stats.inc_rejected_blocks();
+    }
+
     pub async fn process_block(&mut self, block: Option<BlockSeed>) -> Result<(), Error> {
         let state = match block {
             Some(b) => {
                 self.is_synced = true;
+                self.stats.set_synced(true);
                 let id = self.current_state_id.fetch_add(1, Ordering::SeqCst);
                 Some(WorkerCommand::Job(Box::new(pow::State::new(id, b)?)))
             }
@@ -248,6 +265,7 @@ impl MinerManager {
                     return Ok(());
                 }
                 self.is_synced = false;
+                self.stats.set_synced(false);
                 if self.opoi_challenge_active.load(Ordering::Relaxed) {
                     info!("OPoI challenge in progress — PoW template suspended, stand by");
                 } else {
@@ -347,7 +365,7 @@ impl MinerManager {
                                 match send_channel.blocking_send(block_seed.clone()) {
                                     Ok(()) => block_seed.report_block(),
                                     Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
-                                }
+                                };
                                 if let BlockSeed::FullBlock(_) = block_seed {
                                     state = None;
                                 }
@@ -541,6 +559,7 @@ impl MinerManager {
         hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
         opoi_challenge_active: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
+        stats: Arc<MinerStats>,
     ) {
         let mut last_instant = Instant::now();
         // Consecutive all-zero ticks while NOT in an OPoI inference pause.
@@ -555,6 +574,7 @@ impl MinerManager {
             // PoM model (re)load also intentionally pauses PoW — treat it like an inference pause.
             let challenge_active = opoi_challenge_active.load(Ordering::Relaxed)
                 || keryx_miner::pom_gpu::is_loading();
+            stats.set_opoi_challenge_active(challenge_active);
             let total = hashes_tried.swap(0, Ordering::AcqRel);
 
             if total > 0 {
@@ -562,11 +582,16 @@ impl MinerManager {
                 zero_streak = 0;
                 let (rate, suffix) = Self::hash_suffix(total as f64 / duration);
                 info!("Current hashrate is {:.2} {}", rate, suffix);
+                let mut per_device_hs = HashMap::new();
                 for (device, counter) in &*hashes_by_worker.lock().unwrap() {
                     let h = counter.swap(0, Ordering::AcqRel);
                     let (r, s) = Self::hash_suffix(h as f64 / duration);
                     info!("Device {}: {:.2} {}", device, r, s);
+                    let device_hs = ((h as f64) / duration).max(0.0) as u64;
+                    per_device_hs.insert(device.clone(), device_hs);
                 }
+                let total_hs = ((total as f64) / duration).max(0.0) as u64;
+                stats.set_hashrates(total_hs, &per_device_hs);
                 continue;
             }
 
@@ -574,6 +599,7 @@ impl MinerManager {
             for (_device, counter) in &*hashes_by_worker.lock().unwrap() {
                 counter.store(0, Ordering::Release);
             }
+            stats.set_hashrates(0, &HashMap::new());
 
             if challenge_active {
                 // PoW is intentionally paused while the GPU runs inference / loads a model.
@@ -592,6 +618,13 @@ impl MinerManager {
                     info!("PoW paused (OPoI inference / model load) — stand by");
                 }
             }
+        }
+    }
+
+    fn refresh_gpu_telemetry_loop(stop: Arc<AtomicBool>, stats: Arc<MinerStats>) {
+        while !stop.load(Ordering::Acquire) {
+            stats.refresh_gpu_telemetry();
+            thread::sleep(GPU_TELEMETRY_RATE);
         }
     }
 

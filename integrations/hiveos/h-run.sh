@@ -15,4 +15,53 @@ cd `dirname $0`
 # so this is only a belt-and-suspenders hint for the dynamic loader.
 export LD_LIBRARY_PATH="$(dirname $0):${LD_LIBRARY_PATH:-}:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu"
 
-./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) $@ 2>&1 | tee $CUSTOM_LOG_BASENAME.log
+# GNU screen on HiveOS commonly mis-renders 24-bit colors; prefer ANSI palette there.
+if [[ -n "${STY:-}" && -z "${KERYX_TRUECOLOR:-}" ]]; then
+  export KERYX_TRUECOLOR=0
+fi
+
+# Shared, stable model cache path across package updates/reinstalls.
+export KERYX_MODELS_DIR="/hive/miners/custom/models"
+
+cleanup_legacy_models() {
+  local legacy_dir="$CUSTOM_MINER_DIR/models"
+  local shared_dir="$KERYX_MODELS_DIR"
+
+  [[ ! -d "$legacy_dir" ]] && return 0
+  [[ "$legacy_dir" == "$shared_dir" ]] && return 0
+
+  if [[ ! -d "$shared_dir" ]]; then
+    mv "$legacy_dir" "$shared_dir" || true
+    return 0
+  fi
+
+  # Merge only entries that do not yet exist in the shared cache.
+  for entry in "$legacy_dir"/*; do
+    [[ -e "$entry" ]] || break
+    local name
+    name="$(basename "$entry")"
+    [[ -e "$shared_dir/$name" ]] && continue
+    mv "$entry" "$shared_dir/$name" || true
+  done
+
+  # Remove empty directories left behind after merge.
+  find "$legacy_dir" -depth -type d -empty -delete 2>/dev/null || true
+
+  if rmdir "$legacy_dir" 2>/dev/null; then
+    echo "[keryx] Legacy model cache cleaned up: $legacy_dir" >&2
+    return 0
+  fi
+
+  if [[ "${KERYX_PURGE_LEGACY_MODELS:-0}" == "1" ]]; then
+    rm -rf "$legacy_dir" || true
+    echo "[keryx] WARNING: force-purged legacy model cache at $legacy_dir (KERYX_PURGE_LEGACY_MODELS=1)." >&2
+  else
+    echo "[keryx] WARNING: legacy model cache still exists at $legacy_dir while shared cache exists at $shared_dir (possible duplicate disk usage). Set KERYX_PURGE_LEGACY_MODELS=1 to remove it automatically." >&2
+  fi
+}
+
+# One-time migration from old local-per-install cache into the shared cache.
+mkdir -p "$KERYX_MODELS_DIR"
+cleanup_legacy_models
+
+./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --hiveos --stats-bind 127.0.0.1 --stats-port "$WEB_PORT" $@

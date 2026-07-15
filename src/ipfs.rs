@@ -106,7 +106,11 @@ pub fn ensure_daemon(api_url: &str) {
     let ipfs_repo = std::path::PathBuf::from(&home).join(".ipfs");
     if !ipfs_repo.exists() {
         log::info!("Initialising IPFS repo...");
-        let _ = std::process::Command::new(&ipfs_bin).arg("init").status();
+        let _ = std::process::Command::new(&ipfs_bin)
+            .arg("init")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 
     // Start daemon in background, redirecting output to a log file so

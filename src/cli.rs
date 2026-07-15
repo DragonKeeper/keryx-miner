@@ -49,6 +49,20 @@ pub struct Opt {
     pub ipfs_url: String,
 
     #[clap(
+        long = "models-dir",
+        help = "Directory where model files are stored/downloaded (overrides default <exe_dir>/models)",
+        help_heading = "OPoI / Inference"
+    )]
+    pub models_dir: Option<String>,
+
+    #[clap(
+        long = "hiveos",
+        help = "Enable HiveOS defaults (uses /hive/miners/custom/models when --models-dir is not set)",
+        help_heading = "OPoI / Inference"
+    )]
+    pub hiveos: bool,
+
+    #[clap(
         long = "escrow-key-file",
         help = "Path to the OPoI escrow private key file (auto-generated if absent)",
         help_heading = "OPoI / Inference",
@@ -111,6 +125,29 @@ pub struct Opt {
 
     #[clap(skip)]
     pub devfund_address: String,
+
+    #[clap(
+        long = "stats-bind",
+        help = "Stats API bind address (e.g. 0.0.0.0, 127.0.0.1)",
+        help_heading = "Monitoring",
+        default_value = "127.0.0.1"
+    )]
+    pub stats_bind: String,
+
+    #[clap(
+        long = "stats-port",
+        help = "Stats API TCP port",
+        help_heading = "Monitoring",
+        default_value_t = 3338u16
+    )]
+    pub stats_port: u16,
+
+    #[clap(
+        long = "plain-log-file",
+        help = "Write plain text logs to this file path",
+        help_heading = "Monitoring"
+    )]
+    pub plain_log_file: Option<String>,
 }
 
 fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {
