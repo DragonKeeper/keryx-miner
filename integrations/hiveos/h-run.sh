@@ -23,13 +23,45 @@ fi
 # Shared, stable model cache path across package updates/reinstalls.
 export KERYX_MODELS_DIR="/hive/miners/custom/models"
 
+cleanup_legacy_models() {
+  local legacy_dir="$CUSTOM_MINER_DIR/models"
+  local shared_dir="$KERYX_MODELS_DIR"
+
+  [[ ! -d "$legacy_dir" ]] && return 0
+  [[ "$legacy_dir" == "$shared_dir" ]] && return 0
+
+  if [[ ! -d "$shared_dir" ]]; then
+    mv "$legacy_dir" "$shared_dir" || true
+    return 0
+  fi
+
+  # Merge only entries that do not yet exist in the shared cache.
+  for entry in "$legacy_dir"/*; do
+    [[ -e "$entry" ]] || break
+    local name
+    name="$(basename "$entry")"
+    [[ -e "$shared_dir/$name" ]] && continue
+    mv "$entry" "$shared_dir/$name" || true
+  done
+
+  # Remove empty directories left behind after merge.
+  find "$legacy_dir" -depth -type d -empty -delete 2>/dev/null || true
+
+  if rmdir "$legacy_dir" 2>/dev/null; then
+    echo "[keryx] Legacy model cache cleaned up: $legacy_dir" >&2
+    return 0
+  fi
+
+  if [[ "${KERYX_PURGE_LEGACY_MODELS:-0}" == "1" ]]; then
+    rm -rf "$legacy_dir" || true
+    echo "[keryx] WARNING: force-purged legacy model cache at $legacy_dir (KERYX_PURGE_LEGACY_MODELS=1)." >&2
+  else
+    echo "[keryx] WARNING: legacy model cache still exists at $legacy_dir while shared cache exists at $shared_dir (possible duplicate disk usage). Set KERYX_PURGE_LEGACY_MODELS=1 to remove it automatically." >&2
+  fi
+}
+
 # One-time migration from old local-per-install cache into the shared cache.
-if [[ -d "$CUSTOM_MINER_DIR/models" && ! -d "$KERYX_MODELS_DIR" ]]; then
-  mv "$CUSTOM_MINER_DIR/models" "$KERYX_MODELS_DIR" || true
-fi
-if [[ -d "$CUSTOM_MINER_DIR/models" && -d "$KERYX_MODELS_DIR" ]]; then
-  echo "[keryx] WARNING: legacy model cache still exists at $CUSTOM_MINER_DIR/models while shared cache exists at $KERYX_MODELS_DIR (possible duplicate disk usage)." >&2
-fi
 mkdir -p "$KERYX_MODELS_DIR"
+cleanup_legacy_models
 
 ./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --hiveos --stats-bind 127.0.0.1 --stats-port "$WEB_PORT" $@
