@@ -101,19 +101,23 @@ impl PluginManager {
     */
     pub fn process_options(&mut self, matchs: &ArgMatches) -> Result<usize, Error> {
         let mut count = 0usize;
-        self.plugins.iter_mut().for_each(|plugin| {
+        let mut warnings = Vec::new();
+        for plugin in self.plugins.iter_mut() {
             count += match plugin.process_option(matchs) {
                 Ok(n) => n,
                 Err(e) => {
-                    self.record_startup_warning(format!(
+                    warnings.push(format!(
                         "WARNING: Failed processing options for {} (ignore if you do not intend to use): {}",
                         plugin.name(),
                         e
                     ));
                     0
                 }
-            }
-        });
+            };
+        }
+        for warning in warnings {
+            self.record_startup_warning(warning);
+        }
         Ok(count)
     }
 
