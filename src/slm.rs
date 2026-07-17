@@ -1051,6 +1051,19 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
 
+    // Highest priority: the IN-PROCESS llama.cpp engine (Phase 2 candle-independence). When the
+    // `libkeryx-llama.so` is present and active, llama.cpp owns the single resident model copy and
+    // serves the OPoI text. That text is user-facing only — consensus checks the fixed-point
+    // `model_fixed` commitment separately — so a non-candle engine is safe here. Absent/failed
+    // engine falls through to the candle path below, byte-identical to the pre-llama behaviour
+    // (candle-GPU → candle-CPU).
+    if crate::llama_engine::available() {
+        if let Some(text) = crate::llama_engine::generate(prompt, max_tokens) {
+            return Some(text);
+        }
+        log::warn!("SlmEngine: in-process llama generate failed — falling back to candle for this challenge.");
+    }
+
     // catch_unwind prevents any internal panic (cudarc, candle, OOM…) from permanently
     // poisoning ENGINE. Without this, one panic bricks inference for the entire session.
     let result = std::panic::catch_unwind(|| {
