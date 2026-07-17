@@ -68,7 +68,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fs::copy(&legacy_src, &legacy_dst).unwrap_or_else(|e| {
                 panic!("failed copying POM_FATBIN_LEGACY from {legacy_src} to {legacy_dst}: {e}")
             });
-            println!("cargo:warning=PoM legacy fatbin staged from {}", legacy_src);
         } else {
             fs::write(&legacy_dst, []).unwrap_or_else(|e| {
                 panic!("failed creating empty legacy fatbin placeholder {legacy_dst}: {e}")
@@ -79,7 +78,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fs::copy(&nextgen_src, &nextgen_dst).unwrap_or_else(|e| {
                 panic!("failed copying POM_FATBIN_NEXTGEN from {nextgen_src} to {nextgen_dst}: {e}")
             });
-            println!("cargo:warning=PoM nextgen fatbin staged from {}", nextgen_src);
         } else {
             fs::write(&nextgen_dst, []).unwrap_or_else(|e| {
                 panic!("failed creating empty nextgen fatbin placeholder {nextgen_dst}: {e}")
