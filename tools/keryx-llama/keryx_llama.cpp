@@ -22,6 +22,8 @@
 #include <cuda_runtime.h>
 #endif
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -35,12 +37,31 @@ struct KeryxLlama {
     std::mutex gen_lock;
 };
 
+// llama.cpp/ggml emit a large INFO-level dump on every model load (full tensor list, per-layer
+// device assignment, kv-cache map, sched-reserve…). The miner's own Rust logging already covers
+// what matters, so by default we install a log callback that forwards only WARN/ERROR. Set
+// KERYX_LLAMA_VERBOSE=1 to restore llama.cpp's full default stderr logging (debugging).
+static void keryx_llama_log_cb(enum ggml_log_level level, const char* text, void* /*ud*/) {
+    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+        fputs(text, stderr);
+    }
+}
+static void keryx_install_log_filter() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    if (getenv("KERYX_LLAMA_VERBOSE")) return; // leave llama's default stderr logging in place
+    llama_log_set(keryx_llama_log_cb, nullptr);
+    ggml_log_set(keryx_llama_log_cb, nullptr);
+}
+
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
 int keryx_llama_abi() { return 2; }
 
 KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+    keryx_install_log_filter();
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 999;
