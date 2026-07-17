@@ -338,15 +338,17 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     let gguf = dir.join("model.gguf");
     let ok_flag = dir.join(".ok");
 
+    // H4 models pin no separate tokenizer.json (llama uses the one embedded in the GGUF).
+    let tok_needed = !spec.tokenizer_cid.is_empty();
     // .ok sentinel written only after a complete download — guards against truncated files
-    if tok.exists() && gguf.exists() && ok_flag.exists() {
+    if (!tok_needed || tok.exists()) && gguf.exists() && ok_flag.exists() {
         log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, gguf));
     }
     std::fs::create_dir_all(&dir)?;
     let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
     ui_download_info(&format!("[keryx-miner] Downloading model '{}' via IPFS. This happens once.", spec.name));
-    if !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
+    if tok_needed && !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
     download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
     ui_download_info(&format!("[keryx-miner] Model '{}' ready.", spec.name));
@@ -452,6 +454,16 @@ fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str
 
 fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
     log::info!("SlmEngine: loading '{}'…", spec.name);
+
+    // H4 models are llama-served only: no pinned tokenizer.json and (for the new architectures)
+    // no candle loader. Generation is short-circuited by the in-process llama engine upstream;
+    // reaching this point means libkeryx-llama.so is missing or failed to load.
+    if spec.tokenizer_cid.is_empty() {
+        return Err(anyhow!(
+            "model '{}' requires the in-process llama engine (libkeryx-llama.so) — no candle path",
+            spec.name
+        ));
+    }
 
     match spec.format {
         ModelFormat::Safetensors => {
@@ -576,6 +588,15 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 tokenizer, device, stop_token_ids, stop_strings,
             })
         }
+        // H4 architectures — candle has no loader for these; unreachable in practice because the
+        // empty-tokenizer guard above bails first, kept for match exhaustiveness.
+        ModelFormat::GgufExaone4
+        | ModelFormat::GgufGlm4
+        | ModelFormat::GgufQwen35
+        | ModelFormat::GgufKimiLinear => Err(anyhow!(
+            "model '{}': architecture has no candle loader — requires the in-process llama engine",
+            spec.name
+        )),
     }
 }
 
@@ -1004,7 +1025,14 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
         log::debug!("SlmEngine: prefetching model '{}'…", spec.name);
         let result = match spec.format {
             ModelFormat::Safetensors => ensure_safetensors(spec).map(|_| ()),
-            ModelFormat::Gguf | ModelFormat::GgufQwen2 | ModelFormat::GgufQwen3 | ModelFormat::GgufGemma3 => ensure_gguf(spec).map(|_| ()),
+            ModelFormat::Gguf
+            | ModelFormat::GgufQwen2
+            | ModelFormat::GgufQwen3
+            | ModelFormat::GgufGemma3
+            | ModelFormat::GgufExaone4
+            | ModelFormat::GgufGlm4
+            | ModelFormat::GgufQwen35
+            | ModelFormat::GgufKimiLinear => ensure_gguf(spec).map(|_| ()),
         };
         match result {
             Ok(()) => log::debug!("SlmEngine: '{}' files ready.", spec.name),

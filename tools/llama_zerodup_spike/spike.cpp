@@ -27,7 +27,8 @@ int main(int argc, char** argv) {
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 999;
+    const char* ngl_env = getenv("SPIKE_NGL");
+    mp.n_gpu_layers = ngl_env ? atoi(ngl_env) : 999; // partial offload for models > VRAM
     mp.split_mode = LLAMA_SPLIT_MODE_NONE;
     mp.main_gpu = gpu;
     mp.use_mmap = true;

@@ -246,6 +246,21 @@ const POM_TIER_LADDER: &[(keryx_miner::models::Tier, u64)] = &[
     (keryx_miner::models::Tier::VeryLight, 2_000),
 ];
 
+/// H4 floors — the lineup's model sizes shift up (Mistral Q6_K ~7.5 GB served vs Gemma ~5 GB,
+/// GLM Q6_K ~10 GB served vs Dolphin ~6.5 GB), so Light/Default move to the 8/12 GB classes.
+const POM_TIER_LADDER_H4: &[(keryx_miner::models::Tier, u64)] = &[
+    (keryx_miner::models::Tier::VeryHigh, 30_000),
+    (keryx_miner::models::Tier::High, 24_000),
+    (keryx_miner::models::Tier::Default, 12_000),
+    (keryx_miner::models::Tier::Light, 8_000),
+    (keryx_miner::models::Tier::VeryLight, 2_000),
+];
+
+/// The ladder matching the lineup that startup staging pins (see `models::staging_daa`).
+fn pom_tier_ladder() -> &'static [(keryx_miner::models::Tier, u64)] {
+    if keryx_miner::models::h4_staged() { POM_TIER_LADDER_H4 } else { POM_TIER_LADDER }
+}
+
 /// Ordinal rank of a tier (VeryLight=0 … VeryHigh=4), for the "≤ ceiling" comparison.
 fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
     use keryx_miner::models::Tier::*;
@@ -270,11 +285,11 @@ fn assign_pom_tiers(ceiling: keryx_miner::models::Tier) -> Vec<(u32, &'static ke
     }
     let ceiling_rank = tier_rank(ceiling);
     // PoM model + assignment floor for each tier ≤ ceiling, largest first.
-    let candidates: Vec<(u64, &'static keryx_miner::models::ModelSpec)> = POM_TIER_LADDER
+    let candidates: Vec<(u64, &'static keryx_miner::models::ModelSpec)> = pom_tier_ladder()
         .iter()
         .filter(|(t, _)| tier_rank(*t) <= ceiling_rank)
         .filter_map(|(t, floor)| {
-            keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, *t)
+            keryx_miner::models::specs_for(keryx_miner::models::staging_daa(), *t)
                 .iter()
                 .copied()
                 .find(|s| keryx_miner::models::is_pom_model(&s.model_id))
@@ -315,7 +330,7 @@ fn lineup_from_assignments(
         }
     }
     if union.is_empty() {
-        return keryx_miner::models::specs_for(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, ceiling);
+        return keryx_miner::models::specs_for(keryx_miner::models::staging_daa(), ceiling);
     }
     // Leaked once at startup to keep the &'static API of init_supported / prefetch.
     Box::leak(union.into_boxed_slice())
@@ -647,7 +662,7 @@ async fn run() -> Result<(), Error> {
         info!("default mode: mines Dolphin-8B under PoM.");
         keryx_miner::models::Tier::Default
     };
-    // Stage the FINAL lineup (post-H2) directly — `specs_for(VERY_LIGHT_ACTIVATION_DAA, ..)` always
+    // Stage the FINAL lineup directly — `specs_for(models::staging_daa(), ..)` always
     // returns the latest models for the tier. The legacy lineup is dead (OPoI-v2 is in the past),
     // and we deliberately do NOT also download the pre-H2 model for a tier whose model changes at
     // H2: the old `--very-high` 70B Q4_K_M is served by nobody (48 GB-only), so a 5090 miner just
