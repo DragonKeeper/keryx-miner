@@ -4,6 +4,7 @@ use std::error::Error as StdError;
 use std::io::IsTerminal;
 
 pub mod inference;
+pub mod llama_engine;
 pub mod models;
 pub mod pom;
 pub mod pom_gpu;
