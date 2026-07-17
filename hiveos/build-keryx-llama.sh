@@ -31,7 +31,7 @@ fi
 
 docker run --rm --network host \
   -v "$SRC":/llama -v "$REPO":/repo:ro -v "$OUT":/out "${CUDAMOUNT[@]}" \
-  -e KCUDA="$KCUDA" -e ARCHS="$ARCHS" -e JOBS="$JOBS" \
+  -e KCUDA="$KCUDA" -e ARCHS="$ARCHS" -e JOBS="$JOBS" -e KERYX_SPIKE="${KERYX_SPIKE:-0}" \
   keryx-build:offline bash -euo pipefail -c '
     if [ ! -x /tmp/cmk/bin/cmake ]; then
       curl -sL https://github.com/Kitware/CMake/releases/download/v3.28.6/cmake-3.28.6-linux-x86_64.tar.gz \
@@ -55,5 +55,21 @@ docker run --rm --network host \
       -L$KCUDA/lib64/stubs -L$KCUDA/targets/x86_64-linux/lib/stubs -lcuda \
       -lpthread -ldl -o /out/libkeryx-llama.so
     chmod a+rx /out/libkeryx-llama.so
+
+    # Byte-identity spike (KERYX_SPIKE=1): proves the llama-resident tensor bytes are byte-identical
+    # to the on-disk GGUF (canonical name-sorted order — what the PoM walk gathers and R_T pins).
+    # Reuses the static libs already built in $B. Run: ./spike <model.gguf> <gpu_ordinal>; exit 0 = OK.
+    if [ "${KERYX_SPIKE:-0}" = "1" ]; then
+      g++ -O2 -std=c++17 /repo/tools/llama_zerodup_spike/spike.cpp \
+        -I /llama/include -I /llama/ggml/include -I /llama/src \
+        -I $KCUDA/include \
+        -Wl,--start-group $B/src/libllama.a $B/ggml/src/ggml-cuda/libggml-cuda.a \
+          $B/ggml/src/libggml-cpu.a $B/ggml/src/libggml.a $B/ggml/src/libggml-base.a \
+        -Wl,--end-group \
+        -L$KCUDA/lib64 -L$KCUDA/targets/x86_64-linux/lib -lcudart -lcublas -lcublasLt \
+        -L$KCUDA/lib64/stubs -L$KCUDA/targets/x86_64-linux/lib/stubs -lcuda \
+        -lpthread -ldl -o /out/spike
+      chmod a+rx /out/spike
+    fi
   '
 echo ">> $LINE libkeryx-llama.so: $(ls -la "$OUT/libkeryx-llama.so" | awk '{print $5}') bytes, glibc=$(objdump -T "$OUT/libkeryx-llama.so" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1), syms=$(nm -D "$OUT/libkeryx-llama.so" | grep -c keryx_llama)"
