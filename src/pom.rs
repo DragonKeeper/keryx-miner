@@ -803,8 +803,8 @@ impl WeightIndex {
         chunk_to_words(&self.read_chunk_bytes(off))
     }
 
-    /// Raw 32 B chunk bytes — used for leaf hashing in merkle_path.
-    fn read_chunk_bytes(&self, off: u64) -> [u8; 32] {
+    /// Raw 32 B chunk bytes — used for leaf hashing in merkle_path and the llama walk byte-gate.
+    pub(crate) fn read_chunk_bytes(&self, off: u64) -> [u8; 32] {
         let mut arr = [0u8; 32];
         match &self.chunks {
             #[cfg(test)]
