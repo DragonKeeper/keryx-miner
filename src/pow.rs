@@ -189,19 +189,28 @@ impl State {
             return None;
         }
 
-        let proof = pom::build_proof(
-            tier,
-            &pph,
-            nonce,
-            seed,
-            index.n_chunks,
-            pom::POM_WALK_STEPS,
-            pom::POM_OPENINGS,
-            |o| index.read_chunk(o),
-            |o| index.merkle_path(o),
-            h3,
-        );
-        let bytes = borsh::to_vec(&proof).ok()?;
+        // H4: recompute-from-chunks proof (all K chunks + paths, verifier re-walks). Pre-H4: the
+        // 32/256-opening proof. Node switches its verifier at the SAME score — lockstep.
+        let h4 = self.daa_score >= pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA;
+        let proof = if h4 {
+            pom::build_proof_v2(tier, &pph, seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), |o| index.merkle_path(o), h3)
+        } else {
+            pom::build_proof(
+                tier,
+                &pph,
+                nonce,
+                seed,
+                index.n_chunks,
+                pom::POM_WALK_STEPS,
+                pom::POM_OPENINGS,
+                |o| index.read_chunk(o),
+                |o| index.merkle_path(o),
+                h3,
+            )
+        };
+        // `to_wire_bytes` keeps a pre-H4 proof byte-identical to the 7-field layout the running
+        // node still decodes; a v2 proof encodes the full struct (only H4 nodes decode it).
+        let bytes = proof.to_wire_bytes();
 
         let mut block_seed = (*self.block).clone();
         match block_seed {
