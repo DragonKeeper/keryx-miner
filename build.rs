@@ -125,7 +125,9 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| target_root.join(format!("llama-src-{LLAMA_TAG}")));
     if !src.join("CMakeLists.txt").exists() {
-        println!("cargo:warning=cloning llama.cpp {LLAMA_TAG} (first build only; use KERYX_LLAMA_SRC for an offline checkout)");
+        // Informational only — goes to the build-script log, not the user's terminal
+        // (a cargo:warning here made every first build look broken).
+        eprintln!("cloning llama.cpp {LLAMA_TAG} (first build only; use KERYX_LLAMA_SRC for an offline checkout)");
         run(
             "git clone of llama.cpp",
             std::process::Command::new("git").args([
