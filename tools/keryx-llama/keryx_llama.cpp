@@ -29,6 +29,14 @@
 #include <string>
 #include <vector>
 
+// Windows DLLs export nothing by default — mark the ABI surface explicitly so the miner's
+// GetProcAddress finds it. No-op on ELF/Mach-O (default visibility already exports).
+#if defined(_WIN32)
+#define KERYX_EXPORT __declspec(dllexport)
+#else
+#define KERYX_EXPORT
+#endif
+
 struct KeryxLlama {
     llama_model*   model = nullptr;
     llama_context* ctx   = nullptr;
@@ -58,9 +66,9 @@ static void keryx_install_log_filter() {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-int keryx_llama_abi() { return 2; }
+KERYX_EXPORT int keryx_llama_abi() { return 2; }
 
-KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     keryx_install_log_filter();
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
@@ -90,12 +98,12 @@ KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     return h;
 }
 
-size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
+KERYX_EXPORT size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
 
 // Tensor i in CANONICAL order. *is_device = the data pointer is CUDA device memory (walkable
 // in-place); 0 = host memory (the caller uploads its own device copy for the walk).
-bool keryx_llama_tensor_info(KeryxLlama* h, size_t i, const char** name, void** data,
-                             size_t* nbytes, int* is_device) {
+KERYX_EXPORT bool keryx_llama_tensor_info(KeryxLlama* h, size_t i, const char** name, void** data,
+                                          size_t* nbytes, int* is_device) {
     if (!h || i >= h->names.size()) return false;
     const ggml_tensor* t = h->model->get_tensor(h->names[i].c_str());
     if (!t || !t->data) return false;
@@ -118,7 +126,7 @@ bool keryx_llama_tensor_info(KeryxLlama* h, size_t i, const char** name, void** 
 
 // Generate up to max_tokens; writes UTF-8 into out (cap bytes, NUL-terminated). Returns written
 // length, or -1 on error. Serialized — one generation at a time (OPoI challenges are rare).
-int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
+KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
     if (!h || !prompt || !out || cap < 2) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
@@ -147,7 +155,7 @@ int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char
     return written;
 }
 
-void keryx_llama_free(KeryxLlama* h) {
+KERYX_EXPORT void keryx_llama_free(KeryxLlama* h) {
     if (!h) return;
     if (h->smpl) llama_sampler_free(h->smpl);
     if (h->ctx) llama_free(h->ctx);

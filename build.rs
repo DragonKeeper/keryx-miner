@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_ARCHS");
     if env::var("KERYX_LLAMA_SKIP").as_deref() == Ok("1") {
         println!("cargo:warning=KERYX_LLAMA_SKIP=1 — libkeryx-llama.so not built; a prebuilt one must sit next to the miner binary or in-process llama tiers cannot be mined");
-    } else if target_arch == "x86_64" && target_os == "linux" {
+    } else if target_arch == "x86_64" && (target_os == "linux" || target_os == "windows") {
         build_keryx_llama(&nvcc)?;
     }
     Ok(())
@@ -163,8 +163,36 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         "cmake build of llama.cpp static libs",
         std::process::Command::new("cmake")
             .arg("--build").arg(&build_dir)
-            .args(["--target", "llama", "-j", &jobs]),
+            // --config is required by MSVC's multi-config generator; single-config
+            // generators (Makefiles/Ninja on Linux) silently ignore it.
+            .args(["--target", "llama", "--config", "Release", "-j", &jobs]),
     )?;
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // MSVC multi-config layout: static libs land under <dir>/Release/*.lib. Link the
+        // wrapper via nvcc (drives cl.exe and knows the CUDA include/lib paths; links
+        // cudart statically by default). /openmp pulls vcomp for ggml-cpu's OpenMP use.
+        let dll = profile_dir.join("keryx-llama.dll");
+        let lib = |p: &str| build_dir.join(p).into_os_string();
+        run(
+            "link of keryx-llama.dll",
+            std::process::Command::new(nvcc)
+                .args(["-O2", "-std=c++17", "-shared", "tools/keryx-llama/keryx_llama.cpp"])
+                .args(["-Xcompiler", "/EHsc", "-Xcompiler", "/openmp", "-Xcompiler", "/utf-8"])
+                .arg("-I").arg(src.join("include"))
+                .arg("-I").arg(src.join("ggml/include"))
+                .arg("-I").arg(src.join("src"))
+                .arg("-I").arg(src.join("common"))
+                .arg(lib("src/Release/llama.lib"))
+                .arg(lib("ggml/src/ggml-cuda/Release/ggml-cuda.lib"))
+                .arg(lib("ggml/src/Release/ggml-cpu.lib"))
+                .arg(lib("ggml/src/Release/ggml.lib"))
+                .arg(lib("ggml/src/Release/ggml-base.lib"))
+                .args(["-lcublas", "-lcublasLt", "-lcuda"])
+                .arg("-o").arg(&dll),
+        )?;
+        return Ok(());
+    }
 
     let cuda_home = cuda_home_from_nvcc(nvcc)?;
     let so = profile_dir.join("libkeryx-llama.so");

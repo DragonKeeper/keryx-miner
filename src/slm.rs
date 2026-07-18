@@ -296,16 +296,17 @@ pub fn probe_gpu_inference() -> GpuProbe {
         return GpuProbe::NoCuda;
     }
     // The binary links CUDA 12; probe the versioned soname first, then the generic one.
-    // libkeryx-llama.so needs the CUDA runtime on top of cuBLAS, and a missing libcudart
-    // would otherwise only surface at the first dlopen of the engine, mid-session.
-    let loads = |candidates: &[&str]| {
-        candidates.iter().any(|so| {
-            let c = std::ffi::CString::new(*so).unwrap();
-            let h = unsafe { nix::libc::dlopen(c.as_ptr(), nix::libc::RTLD_NOW | nix::libc::RTLD_LOCAL) };
-            !h.is_null()
-        })
-    };
-    if loads(&["libcublas.so.12", "libcublas.so"]) && loads(&["libcudart.so.12", "libcudart.so"]) {
+    // The in-process llama engine needs the CUDA runtime on top of cuBLAS, and a missing
+    // libcudart would otherwise only surface at the first engine load, mid-session. On
+    // Windows nvcc links cudart statically into keryx-llama.dll, so only cuBLAS is probed.
+    // Each probe Library is dropped immediately — we only care that it CAN load; the
+    // engine (re-)loads it for real later, and the OS loader refcounts it.
+    let loads = |candidates: &[&str]| candidates.iter().any(|so| libloading::Library::new(so).is_ok());
+    #[cfg(windows)]
+    let ok = loads(&["cublas64_12.dll"]);
+    #[cfg(not(windows))]
+    let ok = loads(&["libcublas.so.12", "libcublas.so"]) && loads(&["libcudart.so.12", "libcudart.so"]);
+    if ok {
         return GpuProbe::Ok;
     }
     GpuProbe::CublasMissing

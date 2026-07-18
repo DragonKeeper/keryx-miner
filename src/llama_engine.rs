@@ -14,8 +14,6 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::{Mutex, OnceLock};
 
-use nix::libc;
-
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
 type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
@@ -59,7 +57,9 @@ fn so_path() -> Option<std::path::PathBuf> {
     // repackage the Linux .so alongside the macOS binary during cross-arch testing.
     #[cfg(target_os = "macos")]
     let candidates: [&str; 2] = ["libkeryx-llama.dylib", "libkeryx-llama.so"];
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    let candidates: [&str; 1] = ["keryx-llama.dll"];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let candidates: [&str; 1] = ["libkeryx-llama.so"];
     for name in candidates {
         let p = dir.join(name);
@@ -70,14 +70,10 @@ fn so_path() -> Option<std::path::PathBuf> {
     None
 }
 
-unsafe fn sym<T: Copy>(lib: *mut c_void, name: &str) -> Option<T> {
-    let c = CString::new(name).ok()?;
-    let p = libc::dlsym(lib, c.as_ptr());
-    if p.is_null() {
-        return None;
-    }
-    // fn-pointer types are pointer-sized; read the address as T.
-    Some(std::mem::transmute_copy::<*mut c_void, T>(&p))
+unsafe fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Option<T> {
+    // Symbol<T> derefs to &T; copy the fn pointer out. Sound because the Library is
+    // intentionally leaked below (the engine keeps raw fn pointers for its lifetime).
+    lib.get::<T>(name.as_bytes()).ok().map(|s| *s)
 }
 
 /// Load the .so + the model once (idempotent, blocking — a model load takes seconds). Returns
@@ -91,18 +87,16 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
         return e.gguf == gguf && e.gpu == gpu;
     }
     let Some(so) = so_path() else { return false };
-    let cso = match CString::new(so.to_string_lossy().as_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    unsafe {
-        let lib = libc::dlopen(cso.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-        if lib.is_null() {
-            let err = libc::dlerror();
-            let msg = if err.is_null() { "?".into() } else { CStr::from_ptr(err).to_string_lossy().into_owned() };
-            log::warn!("llama engine: dlopen({}) failed: {} — inference unavailable.", so.display(), msg);
+    // Never unloaded (the old dlopen path never dlclosed either): the Engine keeps raw fn
+    // pointers into the library for the life of the process, so leak it deliberately.
+    let lib: &'static libloading::Library = match libloading::Library::new(&so) {
+        Ok(l) => Box::leak(Box::new(l)),
+        Err(e) => {
+            log::warn!("llama engine: load({}) failed: {} — inference unavailable.", so.display(), e);
             return false;
         }
+    };
+    unsafe {
         let (Some(abi), Some(load), Some(count), Some(info), Some(gen), Some(free)) = (
             sym::<AbiFn>(lib, "keryx_llama_abi"),
             sym::<LoadFn>(lib, "keryx_llama_load"),
