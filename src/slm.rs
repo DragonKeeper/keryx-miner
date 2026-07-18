@@ -64,6 +64,14 @@ const SYSTEM_PROMPT_QWEN3: &str =
      Never reveal your underlying model name. \
      Always identify yourself as a Keryx Network AI. Be thorough but concise.";
 
+/// Shared system prompt for the llama-served lineup (vendor-agnostic wording).
+const SYSTEM_PROMPT_NEXT: &str =
+    "You are a Keryx Network AI — a high-capability decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
+     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
+     You have no internet access — answer from training knowledge only. \
+     CRITICAL: Never mention your underlying model name or the company that trained it. \
+     Always identify yourself as a Keryx Network AI. Be thorough but concise.";
+
 // ── Static engine state ──────────────────────────────────────────────────────
 
 /// Models the miner currently serves (drives `ai:cap`). Mutable so the lineup can be
@@ -603,7 +611,14 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
 // ── Inference ────────────────────────────────────────────────────────────────
 
 fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
-    match engine.name {
+    format_prompt_by_name(engine.name, prompt)
+}
+
+/// Chat-template a raw user prompt for a model by name. Shared by the candle path and the
+/// in-process llama engine path — llama.cpp's `generate` consumes an already-templated string
+/// (a raw prompt makes template-strict models emit EOG immediately, e.g. EXAONE).
+fn format_prompt_by_name(name: &str, prompt: &str) -> String {
+    match name {
         // Gemma-3-4B — Gemma chat template. Gemma has no system role, so the system
         // prompt is folded into the first user turn.
         "gemma-3-4b" => format!(
@@ -647,6 +662,35 @@ fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
              <|im_start|>user\n{} /no_think<|im_end|>\n\
              <|im_start|>assistant\n",
             SYSTEM_PROMPT_QWEN3, prompt
+        ),
+        // ── Next lineup (llama-served) — each template validated against the GGUF's embedded
+        // chat template; generation goes through the in-process llama engine.
+        // EXAONE-4.0 — reasoning model: pre-fill an empty think block or the reasoning trace
+        // leaks into the visible answer (same trick as Qwen3.6 below).
+        "exaone-4.0-1.2b" => format!(
+            "[|system|]\n{}[|endofturn|]\n[|user|]\n{}\n[|assistant|]\n<think>\n\n</think>\n\n",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
+        "mistral-7b-v0.3" => format!("[INST] {}\n\n{}[/INST]", SYSTEM_PROMPT_NEXT, prompt),
+        // GLM-4-0414 ignores the <|system|> role identity (keeps claiming a foreign vendor) —
+        // fold the system prompt into the user turn instead.
+        "glm-4-9b-0414" => format!(
+            "[gMASK]<sop><|user|>\n{}\n\n{}\n<|assistant|>\n",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
+        // Qwen3.6 — ChatML + a pre-filled empty think block so the visible answer starts
+        // immediately (an open think block would eat the whole max_tokens budget).
+        "qwen3.6-27b" => format!(
+            "<|im_start|>system\n{}<|im_end|>\n\
+             <|im_start|>user\n{}<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
+        "kimi-linear-48b" => format!(
+            "<|im_system|>system<|im_middle|>{}<|im_end|>\
+             <|im_user|>user<|im_middle|>{}<|im_end|>\
+             <|im_assistant|>assistant<|im_middle|>",
+            SYSTEM_PROMPT_NEXT, prompt
         ),
         // Generic ChatML fallback.
         _ => format!(
@@ -1086,7 +1130,10 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     // engine falls through to the candle path below, byte-identical to the pre-llama behaviour
     // (candle-GPU → candle-CPU).
     if crate::llama_engine::available() {
-        if let Some(text) = crate::llama_engine::generate(prompt, max_tokens) {
+        // llama.cpp gets the raw tokens of whatever string we pass — apply the model's chat
+        // template here (template-strict models emit EOG immediately on a bare prompt).
+        let templated = format_prompt_by_name(spec.name, prompt);
+        if let Some(text) = crate::llama_engine::generate(&templated, max_tokens) {
             return Some(text);
         }
         log::warn!("SlmEngine: in-process llama generate failed — falling back to candle for this challenge.");
