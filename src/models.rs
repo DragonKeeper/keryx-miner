@@ -3,36 +3,22 @@
 /// model_id = sha2-256(primary_weight_file) = CIDv0_bytes[2..34].
 /// Verifiable: decode the weight CID from base58btc, skip the 2-byte multihash prefix.
 ///
-/// Uncensored lineup (5 tiers):
-///   --very-light  Qwen3-1.7B-abliterated         (Qwen)   — 4 GB+ GPU (PoM tier 0, post-H2)
-///   --light       Gemma-3-4B-it-abliterated      (Google) — any GPU (6 GB+)
-///   (default)     Dolphin-3.0-Llama-3.1-8B       (Llama)  — RTX 3060 12GB / 3070
-///   --high        Qwen3-32B-abliterated (Q4_K_M) (Qwen)   — 24 GB (3090 / 4090 / 5090)
-///   --very-high   Llama-3.3-70B-abliterated      (Meta)   — Q4 48 GB (pre-H2) → Q2_K_L 32 GB / 5090 (post-H2)
-///
-/// H4 lineup — all five tiers swap at `COIN_AGE_VERIFICATION_ACTIVATION_DAA`,
-/// every model untied so llama hosts walk + inference in one resident copy:
-///   --very-light  EXAONE-4.0-1.2B  Q4_K_M (LG)       — 4 GB+
+/// Uncensored five-tier lineup, active at `COIN_AGE_VERIFICATION_ACTIVATION_DAA` (the H4
+/// hardfork) — below that DAA this binary refuses to mine (`pom_tier_index` = None). Every
+/// model is untied so the in-process llama engine hosts walk + inference in one resident copy:
+///   --very-light  EXAONE-4.0-1.2B  Q4_K_M (LG)       — 2 GB+
 ///   --light       Mistral-7B-v0.3  Q6_K   (Mistral)  — 8 GB
 ///   (default)     GLM-4-9B-0414    Q6_K   (Zhipu)    — 12 GB
 ///   --high        Qwen3.6-27B      Q4_K_M (Alibaba)  — 24 GB
 ///   --very-high   Kimi-Linear-48B  Q4_K_M (Moonshot) — 32 GB
 ///
-/// All GGUF weights + tokenizers are pinned on the Keryx IPFS gateway; each
+/// All GGUF weights are pinned on the Keryx IPFS gateway; each
 /// model_id = base58-decode(weight CID)[2..34].
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ModelFormat {
-    /// Full-precision safetensors (one or more shards).
-    Safetensors,
-    /// GGUF quantized — LLaMA/LLaMA3 architecture.
+    /// GGUF quantized — LLaMA architecture (Mistral-7B). llama-served.
     Gguf,
-    /// GGUF quantized — Qwen2 architecture (legacy DeepSeek-R1-32B, pre-OPoI-v2 lineup).
-    GgufQwen2,
-    /// GGUF quantized — Qwen3 architecture (Qwen3-32B).
-    GgufQwen3,
-    /// GGUF quantized — Gemma 3 architecture (Gemma-3-4B, baseline tier).
-    GgufGemma3,
     /// GGUF quantized — EXAONE 4 architecture (H4 tier 0). llama-served.
     GgufExaone4,
     /// GGUF quantized — GLM 4 architecture (H4 tier 2). llama-served.
@@ -49,10 +35,9 @@ pub struct ModelSpec {
     /// 32-byte on-chain identifier embedded in AiRequest payloads.
     pub model_id: [u8; 32],
     pub format: ModelFormat,
+    /// Empty for the whole lineup: llama uses the tokenizer embedded in the GGUF.
     pub tokenizer_cid: &'static str,
-    /// Unused for GGUF (architecture embedded in file).
-    pub config_cid: &'static str,
-    /// Safetensors: one entry per shard. GGUF: single entry.
+    /// Single entry: the model.gguf CID.
     pub weight_cids: &'static [&'static str],
     /// Local directory name under `<exe_dir>/models/`.
     pub dir_name: &'static str,
@@ -61,122 +46,6 @@ pub struct ModelSpec {
     /// never announces a model the miner cannot load. 0 = never gated.
     pub min_vram_mb: u64,
 }
-
-pub const GEMMA_3_4B: ModelSpec = ModelSpec {
-    name: "gemma-3-4b",
-    // CIDv0[2..34] of model.gguf — mlabonne/gemma-3-4b-it-abliterated Q4_K_M
-    model_id: [
-        0xad, 0x50, 0xad, 0x0b, 0xd4, 0x61, 0xd8, 0xab,
-        0x44, 0xef, 0xc0, 0x21, 0x49, 0x89, 0xeb, 0x33,
-        0x29, 0x16, 0x85, 0xef, 0x4a, 0xde, 0x22, 0xa0,
-        0xf4, 0xf2, 0x17, 0xd0, 0x32, 0x66, 0xd8, 0x37,
-    ],
-    format: ModelFormat::GgufGemma3,
-    tokenizer_cid: "QmTh2MsVfAvWp7grN9rvkF9NkMkCW2PhWez2WbNh81KRXD",
-    config_cid: "",
-    weight_cids: &["Qma1CbFzWTNhy2ReVjDG1GvM5q2Uy4VhqTbnS9c641jUQ6"],
-    dir_name: "Gemma-3-4B",
-    // Baseline model — never gated. ~4 GB Q4_K_M; runs on any GPU that can mine.
-    min_vram_mb: 0,
-};
-
-pub const DOLPHIN_LLAMA3_8B: ModelSpec = ModelSpec {
-    name: "dolphin-llama3-8b",
-    // CIDv0[2..34] of model.gguf — Dolphin3.0-Llama3.1-8B Q4_K_M
-    model_id: [
-        0x94, 0x21, 0x06, 0x6a, 0x64, 0x00, 0xc9, 0x8b,
-        0xa1, 0x37, 0x11, 0x4f, 0x7f, 0x4b, 0x7d, 0x4a,
-        0x2d, 0xdf, 0x13, 0xab, 0x16, 0x3a, 0x5d, 0xe3,
-        0x8c, 0x01, 0x84, 0x79, 0x3a, 0xf6, 0x31, 0x3a,
-    ],
-    format: ModelFormat::Gguf,
-    tokenizer_cid: "QmQSe8rZQcTQ6q1xDGquv6s9wpzFT9u27U4wfGVZqwMJgJ",
-    config_cid: "",
-    weight_cids: &["QmYJtFpaDnVwAVSbzRo42fsb19nLpt8LHe8WVKoyxd4AkZ"],
-    dir_name: "Dolphin-Llama3-8B",
-    // ~4.9 GB Q4_K_M weights + ~1.6 GB KV/workspace.
-    min_vram_mb: 8_000,
-};
-
-pub const QWEN3_32B: ModelSpec = ModelSpec {
-    name: "qwen3-32b",
-    // CIDv0[2..34] of model.gguf — Qwen3-32B-abliterated Q4_K_M (mradermacher)
-    model_id: [
-        0x65, 0xc6, 0xeb, 0x6f, 0xe1, 0x8b, 0x9e, 0xfd,
-        0x80, 0x60, 0xab, 0x9d, 0x2d, 0x03, 0xbb, 0x9b,
-        0x01, 0x05, 0x0a, 0x3b, 0x13, 0x78, 0xcb, 0xac,
-        0x00, 0x0c, 0x5c, 0xc0, 0xac, 0xdc, 0x0d, 0x2a,
-    ],
-    format: ModelFormat::GgufQwen3,
-    tokenizer_cid: "QmcuGkJvR343ry3b4jy7u5L9ior3ujas3yGAFMSyZdACb5",
-    config_cid: "",
-    weight_cids: &["QmVBwp5n3muQJwYNLTHSu3EnzBWviQqfh58FvHvKRfLtam"],
-    dir_name: "Qwen3-32B",
-    // ~19.5 GB Q4_K_M weights + ~2.5 GB KV/workspace → fits a 24 GB card (3090/4090/5090).
-    min_vram_mb: 24_000,
-};
-
-pub const LLAMA_3_3_70B: ModelSpec = ModelSpec {
-    name: "llama-3.3-70b",
-    // CIDv0[2..34] of model.gguf — Llama-3.3-70B-Instruct-abliterated Q4_K_M (bartowski)
-    model_id: [
-        0x13, 0x29, 0xfb, 0xe2, 0x1b, 0x3f, 0x36, 0xf6,
-        0xd0, 0x06, 0x89, 0xfc, 0xaa, 0x74, 0xf7, 0xa2,
-        0x22, 0xb8, 0xcc, 0x4c, 0x08, 0xc0, 0x19, 0x1f,
-        0xeb, 0x23, 0x97, 0x55, 0xa7, 0x23, 0x42, 0x1e,
-    ],
-    format: ModelFormat::Gguf,
-    tokenizer_cid: "QmPd7WQvoQupfzpPVnVVc1Zra5SH4jKnGqNrdTHFtdQuvd",
-    config_cid: "",
-    weight_cids: &["QmPdTayXcEsfUwMCoMKKcLSv7Dwpp2xVBWELwrG2M7Rhzu"],
-    dir_name: "Llama-3.3-70B",
-    // ~42.5 GB Q4_K_M weights + ~3.5 GB KV/workspace → 48 GB card (matches the
-    // --very-high 46 GB startup gate).
-    min_vram_mb: 46_000,
-};
-
-pub const QWEN3_1_7B: ModelSpec = ModelSpec {
-    name: "qwen3-1.7b",
-    // CIDv0[2..34] of model.gguf — mlabonne/Qwen3-1.7B-abliterated Q4_K_M (locally quantized
-    // from the mlabonne safetensors; reproducible: re-quantize Q4_K_M and re-add to verify).
-    model_id: [
-        0x4f, 0x21, 0xdd, 0xeb, 0x7d, 0x62, 0xbd, 0x22,
-        0x65, 0xbc, 0x54, 0x23, 0x0d, 0x53, 0x6c, 0xa3,
-        0xf1, 0x74, 0x99, 0x27, 0x78, 0x0f, 0x52, 0x8c,
-        0x3c, 0x41, 0xfa, 0x29, 0x11, 0xdf, 0x4d, 0x72,
-    ],
-    format: ModelFormat::GgufQwen3,
-    // Qwen3 dense models share the same tokenizer byte-for-byte — identical CID to Qwen3-32B's.
-    tokenizer_cid: "QmcuGkJvR343ry3b4jy7u5L9ior3ujas3yGAFMSyZdACb5",
-    config_cid: "",
-    weight_cids: &["QmTfYsPusQUPG7t82N7tpwFqXuJZ5yCBGsqP19pDJVanh7"],
-    dir_name: "Qwen3-1.7B",
-    // ~1.05 GB Q4_K_M — very-light tier, runs comfortably on 4-6 GB GPUs. Never gated.
-    min_vram_mb: 0,
-};
-
-pub const LLAMA_3_3_70B_Q2: ModelSpec = ModelSpec {
-    name: "llama-3.3-70b-q2",
-    // CIDv0[2..34] of model.gguf — Llama-3.3-70B-Instruct-abliterated Q2_K_L (bartowski, same
-    // base as the Q4_K_M above). Post-H2 very-high tier: fits a 32 GB card (RTX 5090) where the
-    // 42.5 GB Q4 never did, so the top tier is finally servable on real consumer hardware.
-    model_id: [
-        0x6d, 0xf4, 0x6a, 0x78, 0xcb, 0xe4, 0xdc, 0x57,
-        0x9f, 0x04, 0xdb, 0xd8, 0x01, 0xf1, 0xa5, 0x20,
-        0xb9, 0xea, 0xe2, 0x8c, 0xe7, 0xb5, 0x0c, 0x8d,
-        0xa7, 0x87, 0x4b, 0xfa, 0x3f, 0xb5, 0x10, 0x8d,
-    ],
-    format: ModelFormat::Gguf,
-    // Same Llama-3.3 tokenizer as the Q4 (only the quant differs) — already pinned.
-    tokenizer_cid: "QmPd7WQvoQupfzpPVnVVc1Zra5SH4jKnGqNrdTHFtdQuvd",
-    config_cid: "",
-    weight_cids: &["QmVjsK1LBMjk24tawUrGyWUEXHQwkcPgeetC5JpNZL7p1J"],
-    // Distinct dir from the Q4 70B so both coexist on disk across the H2 transition.
-    dir_name: "Llama-3.3-70B-Q2",
-    // ~25.5 GiB Q2_K_L weights + ~2.5 GB KV/workspace ≈ 28 GB → needs a 32 GB card (5090).
-    // Gate at 30 GB so 24 GB cards are excluded (the Q2 is 5090-exclusive).
-    min_vram_mb: 30_000,
-};
 
 // ── H4 lineup ───────────────────────────────────────────────────
 // Active at `crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA` (the H4 hardfork). Every model is
@@ -196,7 +65,6 @@ pub const EXAONE_4_0_1_2B: ModelSpec = ModelSpec {
     ],
     format: ModelFormat::GgufExaone4,
     tokenizer_cid: "",
-    config_cid: "",
     weight_cids: &["QmRaBetZg8SaeWeGrQDBhRMd362mf4Nm3w2YacCSQ8tocb"],
     dir_name: "EXAONE-4.0-1.2B",
     // ~0.9 GB Q4_K_M — smallest tier, runs on 4-6 GB GPUs. Never gated.
@@ -215,7 +83,6 @@ pub const MISTRAL_7B_V03: ModelSpec = ModelSpec {
     // llama architecture, but llama-served like the rest of the H4 lineup (no pinned tokenizer.json).
     format: ModelFormat::Gguf,
     tokenizer_cid: "",
-    config_cid: "",
     weight_cids: &["QmXmtATpJerCCcWWF515vAe5FanSvqJrD4L1ogZxDurQ3s"],
     dir_name: "Mistral-7B-v0.3",
     // ~5.9 GB Q6_K weights + ~1.5 GB KV/workspace. The Q6_K quant is deliberate VRAM gating:
@@ -234,7 +101,6 @@ pub const GLM_4_9B_0414: ModelSpec = ModelSpec {
     ],
     format: ModelFormat::GgufGlm4,
     tokenizer_cid: "",
-    config_cid: "",
     weight_cids: &["QmfBGGZumBR4XGFLLPjYozvhRSt3kXjrgsV3jXciCdAeM7"],
     dir_name: "GLM-4-9B-0414",
     // ~8.3 GB Q6_K weights + ~1.5 GB KV/workspace → 12 GB card (3060 12GB / 3080 12GB).
@@ -252,7 +118,6 @@ pub const QWEN3_6_27B: ModelSpec = ModelSpec {
     ],
     format: ModelFormat::GgufQwen35,
     tokenizer_cid: "",
-    config_cid: "",
     weight_cids: &["QmamoYQGGAkBaqiWuNmwxeC9AQnt9F7sLyX57VoqbJWeUV"],
     dir_name: "Qwen3.6-27B",
     // ~16.5 GB Q4_K_M weights + ~2.5 GB KV/workspace → 24 GB card (3090/4090/5090).
@@ -270,33 +135,18 @@ pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
     ],
     format: ModelFormat::GgufKimiLinear,
     tokenizer_cid: "",
-    config_cid: "",
     weight_cids: &["QmSVhtoNrL8bWJXZuEXMMWqty8qHScQMRuacuoa9ujsYqp"],
     dir_name: "Kimi-Linear-48B",
-    // ~29.7 GB Q4_K_M weights (MoE, 3B active) + KV/workspace → needs a 32 GB card (5090).
-    // Same gate as the outgoing 70B-Q2 so the top tier stays 5090-class.
+    // ~29.7 GB Q4_K_M weights (MoE, 3B active) + KV/workspace → needs a 32 GB card (5090),
+    // so the top tier stays 5090-class.
     min_vram_mb: 30_000,
 };
 
-/// Map a model_id to its Proof-of-Model tier index, matching the node's `POM_TIERS` order.
-/// DAA-gated at the very-light hardfork (H2) so the index ordering stays logical (smallest = 0):
-///   - daa <  H2 (4-tier): Gemma=0, Dolphin=1, Qwen3-32B=2, Llama-70B-Q4=3.
-///   - daa >= H2 (5-tier): Qwen3-1.7B=0, Gemma=1, Dolphin=2, Qwen3-32B=3, Llama-70B-Q2=4.
-/// At H2 the top tier's model also changes (70B Q4_K_M → Q2_K_L) so it fits a 32 GB 5090.
-/// The gate is mandatory: an archival/IBD node recomputing pre-H2 blocks under the new scheme
-/// would assign different tiers → different reward brackets → UTXO divergence. MUST match the
-/// node, and the tier must be recomputed per block from that block's DAA (not frozen).
 /// Whether `model_id` is one of the Proof-of-Model tier models (any era). DAA-independent —
 /// used at startup to pick a mineable PoM model before any block DAA is known (the tier *index*
 /// is then computed per block via `pom_tier_index`).
 pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
-    *model_id == QWEN3_1_7B.model_id
-        || *model_id == GEMMA_3_4B.model_id
-        || *model_id == DOLPHIN_LLAMA3_8B.model_id
-        || *model_id == QWEN3_32B.model_id
-        || *model_id == LLAMA_3_3_70B.model_id
-        || *model_id == LLAMA_3_3_70B_Q2.model_id
-        || *model_id == EXAONE_4_0_1_2B.model_id
+    *model_id == EXAONE_4_0_1_2B.model_id
         || *model_id == MISTRAL_7B_V03.model_id
         || *model_id == GLM_4_9B_0414.model_id
         || *model_id == QWEN3_6_27B.model_id
@@ -304,145 +154,26 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
 }
 
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
-    if daa >= crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA {
-        // H4 5-tier scheme: the WHOLE lineup swaps at once (all five models are
-        // untied so llama hosts walk + inference in one copy). MUST mirror the node's
-        // `POM_TIERS_H4` order; recomputed per block from that block's DAA (see gate rationale below).
-        if *model_id == EXAONE_4_0_1_2B.model_id {
-            Some(0)
-        } else if *model_id == MISTRAL_7B_V03.model_id {
-            Some(1)
-        } else if *model_id == GLM_4_9B_0414.model_id {
-            Some(2)
-        } else if *model_id == QWEN3_6_27B.model_id {
-            Some(3)
-        } else if *model_id == KIMI_LINEAR_48B.model_id {
-            Some(4)
-        } else {
-            None
-        }
-    } else if daa >= VERY_LIGHT_ACTIVATION_DAA {
-        // 5-tier scheme: very-light inserted at 0, the existing tiers shift up by one.
-        if *model_id == QWEN3_1_7B.model_id {
-            Some(0)
-        } else if *model_id == GEMMA_3_4B.model_id {
-            Some(1)
-        } else if *model_id == DOLPHIN_LLAMA3_8B.model_id {
-            Some(2)
-        } else if *model_id == QWEN3_32B.model_id {
-            Some(3)
-        } else if *model_id == LLAMA_3_3_70B_Q2.model_id {
-            // Top tier post-H2 = the Q2_K_L (5090-servable), replacing the Q4 (48 GB-only).
-            Some(4)
-        } else {
-            None
-        }
+    // H4 gate: below the flip this binary refuses to mine (None) — it never produces a
+    // pre-H4-era block. MUST mirror the node's `POM_TIERS_H4` order, recomputed per block
+    // from that block's DAA.
+    if daa < crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA {
+        return None;
+    }
+    if *model_id == EXAONE_4_0_1_2B.model_id {
+        Some(0)
+    } else if *model_id == MISTRAL_7B_V03.model_id {
+        Some(1)
+    } else if *model_id == GLM_4_9B_0414.model_id {
+        Some(2)
+    } else if *model_id == QWEN3_6_27B.model_id {
+        Some(3)
+    } else if *model_id == KIMI_LINEAR_48B.model_id {
+        Some(4)
     } else {
-        // 4-tier scheme (pre-H2): unchanged from OPoI v2.
-        if *model_id == GEMMA_3_4B.model_id {
-            Some(0)
-        } else if *model_id == DOLPHIN_LLAMA3_8B.model_id {
-            Some(1)
-        } else if *model_id == QWEN3_32B.model_id {
-            Some(2)
-        } else if *model_id == LLAMA_3_3_70B.model_id {
-            Some(3)
-        } else {
-            None
-        }
+        None
     }
 }
-
-// ── Legacy lineup (pre-OPoI-v2) ───────────────────────────────────────────────
-// Served while `daa < OPOI_V2_ACTIVATION_DAA`. model_id values match the node's
-// pre-v2 INFERENCE_REWARD_MINIMUMS table (8B/TinyLlama = CID-derived; 32B/70B =
-// sha2-256(model.gguf) computed locally). Ported verbatim from the pre-rewrite
-// registry so the transition is a true gate, not a re-derivation.
-
-pub const TINYLLAMA: ModelSpec = ModelSpec {
-    name: "tinyllama",
-    // sha2-256(QmdqcmS8aMngiZWYYdeZEaW22N6XRTd9zK5ZCJG1MPmrQ3)
-    model_id: [
-        0xe6, 0x4a, 0xf3, 0x68, 0xec, 0x93, 0x51, 0xa5,
-        0xa4, 0xc0, 0xec, 0x7a, 0xe4, 0x7d, 0x42, 0xad,
-        0xa7, 0xf6, 0xb3, 0xf1, 0xa6, 0xe6, 0x0f, 0xc7,
-        0x3d, 0x0e, 0xb6, 0xca, 0x29, 0x53, 0x64, 0x5c,
-    ],
-    format: ModelFormat::Safetensors,
-    tokenizer_cid: "QmSKrRu8HRt9v2dUeVdABKDkuREa5xFhPLZdevvvBfDYmp",
-    config_cid: "QmbLTR3GLjBUKw8Lj14isiwG3XZJaL61ES852vkNqNPhyd",
-    weight_cids: &["QmdqcmS8aMngiZWYYdeZEaW22N6XRTd9zK5ZCJG1MPmrQ3"],
-    dir_name: "TinyLlama-1.1B",
-    min_vram_mb: 0,
-};
-
-pub const DEEPSEEK_R1_8B: ModelSpec = ModelSpec {
-    name: "deepseek-r1-8b",
-    // sha2-256(QmYK1faUGNMYZ2UKeSpUoUoFpRarZQEwfPCHbYNG2ib2mR)
-    model_id: [
-        0x94, 0x29, 0x67, 0x33, 0x16, 0xbc, 0x40, 0xec,
-        0x06, 0x67, 0x89, 0x45, 0x34, 0x57, 0x8b, 0x41,
-        0x23, 0x6f, 0xc7, 0xee, 0xa4, 0xd9, 0x31, 0xf1,
-        0x48, 0x9c, 0x34, 0xc5, 0x83, 0x7f, 0x42, 0xf4,
-    ],
-    format: ModelFormat::Gguf,
-    tokenizer_cid: "QmXVdcr2FJuHtXcBbYbBuCMic2pJTkM1LJ6WpyfvhDytHg",
-    config_cid: "",
-    weight_cids: &["QmYK1faUGNMYZ2UKeSpUoUoFpRarZQEwfPCHbYNG2ib2mR"],
-    dir_name: "DeepSeek-R1-8B",
-    min_vram_mb: 5_500,
-};
-
-pub const DEEPSEEK_R1_32B: ModelSpec = ModelSpec {
-    name: "deepseek-r1-32b",
-    // sha2-256(model.gguf)
-    model_id: [
-        0xbe, 0xd9, 0xb0, 0xf5, 0x51, 0xf5, 0xb9, 0x5b,
-        0xf9, 0xda, 0x58, 0x88, 0xa4, 0x8f, 0x0f, 0x87,
-        0xc3, 0x7a, 0xd6, 0xb7, 0x25, 0x19, 0xc4, 0xcb,
-        0xd7, 0x75, 0xf5, 0x4a, 0xc0, 0xb9, 0xfc, 0x62,
-    ],
-    format: ModelFormat::GgufQwen2,
-    tokenizer_cid: "Qmf3uZwnuxZUhDbhup8Q51soVMRmNxohYctG9wZemNEPHm",
-    config_cid: "",
-    weight_cids: &["QmSrmkEoJUPf7r9t4o79F5APycnGrRu2icaU3KKPdFVUk7"],
-    dir_name: "DeepSeek-R1-32B",
-    min_vram_mb: 20_000,
-};
-
-pub const LLAMA_3_3_70B_OFFICIAL: ModelSpec = ModelSpec {
-    name: "llama-3.3-70b-official",
-    // sha2-256(model.gguf)
-    model_id: [
-        0xaa, 0xd2, 0xcf, 0x33, 0x48, 0xd8, 0xc7, 0xfd,
-        0xbd, 0x2c, 0x0d, 0xd5, 0x8e, 0x0d, 0x99, 0x36,
-        0x84, 0x50, 0xd4, 0x3c, 0x95, 0x84, 0xae, 0xf8,
-        0x1a, 0x46, 0x7d, 0xd3, 0x47, 0x56, 0x13, 0x44,
-    ],
-    format: ModelFormat::Gguf,
-    tokenizer_cid: "QmPd7WQvoQupfzpPVnVVc1Zra5SH4jKnGqNrdTHFtdQuvd",
-    config_cid: "",
-    weight_cids: &["QmbRQJFZ9NuZQW9uXezANTwunnwJCKybHiCFnVQ7D4SZKb"],
-    // Distinct dir from the abliterated Llama-3.3-70B so both lineups coexist on disk.
-    dir_name: "Llama-3.3-70B-official",
-    min_vram_mb: 30_000,
-};
-
-/// OPoI v2 hardfork activation DAA score. MUST match the node's `opoi_v2_activation`.
-/// Below this score the miner runs/announces the legacy lineup; at or above it, the
-/// uncensored lineup. Mainnet: 37_780_000 (2026-06-26 18:00 UTC) — same H as the node's
-/// MAINNET_PARAMS.opoi_v2_activation = new(37_780_000).
-pub const OPOI_V2_ACTIVATION_DAA: u64 = 37_780_000;
-
-/// H2 lineup-refresh hardfork activation DAA. MUST match the node. At this score the uncensored
-/// lineup changes in two ways:
-///   - `--very-light` enters as PoM tier 0 (Qwen3-1.7B); before H2 it falls back to the light
-///     tier (Gemma) so an early upgrader still mines a valid tier, and the existing tiers keep
-///     their 4-tier indices.
-///   - `--very-high` swaps Llama-3.3-70B Q4_K_M (48 GB-only) → Q2_K_L (fits a 32 GB 5090).
-/// (Named for very-light for history; it now gates the whole H2 refresh.)
-/// Must stay in lockstep with the node's `very_light_activation` (same DAA on both sides).
-pub const VERY_LIGHT_ACTIVATION_DAA: u64 = 38_951_445;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -453,110 +184,27 @@ pub enum Tier {
     VeryHigh,
 }
 
-/// Cumulative model set for a hardware tier within the lineup active at `daa`.
-/// DAA-gated to mirror the node's `opoi_v2_activation`: one binary runs the legacy
-/// lineup before H and the uncensored lineup at/after H (hot-swapped at the crossing),
-/// so miners can upgrade before the hardfork without a flag-day restart.
-/// DAA marking the latest scheduled era for staging (VRAM ladder + the H4-era model in the prefetch
-/// union). While H4 is unscheduled (`COIN_AGE_VERIFICATION_ACTIVATION_DAA == u64::MAX`) this is the
-/// H2 constant, so behaviour is unchanged. Once the H4 DAA is set it is the H4 gate. The miner does
-/// NOT idle until the crossing: it stages the pre-crossing (H2) model as the initial mining model,
-/// prefetches both eras (`pom_models_all_eras`), and hot-swaps the resident model at the crossing
-/// (`pom_gpu::advance_mining_tier_if_due`).
-pub fn staging_daa() -> u64 {
-    if h4_staged() {
-        crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA
-    } else {
-        VERY_LIGHT_ACTIVATION_DAA
+/// The single model a hardware tier mines AND serves — one flag = one model. A PoM GPU is
+/// bound to its tier (serving a lower tier would mean unloading the mined model and pausing
+/// mining); multi-tier coverage is a network property (different miners per tier), not a
+/// per-GPU one.
+pub fn spec_for_tier(tier: Tier) -> &'static ModelSpec {
+    match tier {
+        Tier::VeryLight => &EXAONE_4_0_1_2B,
+        Tier::Light => &MISTRAL_7B_V03,
+        Tier::Default => &GLM_4_9B_0414,
+        Tier::High => &QWEN3_6_27B,
+        Tier::VeryHigh => &KIMI_LINEAR_48B,
     }
 }
 
-/// True once the H4 hardfork has a scheduled DAA — startup staging (lineup + VRAM ladder)
-/// then targets the H4 lineup instead of H2.
-pub fn h4_staged() -> bool {
-    crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA != u64::MAX
-}
-
-/// The PoM model a GPU on `tier` must mine at block `daa` — the era-correct single model, matching
-/// the node's per-block tier table. Drives the resident-model crossing swap: the mining loop keeps
-/// this model loaded, and the H2→H4 crossing swaps it in place at `daa >= H4`.
-pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
-    specs_for(daa, tier).iter().copied().find(|s| is_pom_model(&s.model_id))
-}
-
-/// Every PoM model a GPU on `tier` may mine across the currently-scheduled eras — the pre-crossing
-/// (H2) model and, once H4 is scheduled, the H4 model. Prefetched together at startup so the era
-/// crossing hot-swaps the resident mining model without stalling on a mid-run download.
-pub fn pom_models_all_eras(tier: Tier) -> Vec<&'static ModelSpec> {
-    let mut out: Vec<&'static ModelSpec> = Vec::new();
-    // Pre-crossing (H2) era = a DAA below any H4 gate; H4 era = staging_daa() (the H4 gate when set).
-    for daa in [VERY_LIGHT_ACTIVATION_DAA, staging_daa()] {
-        if let Some(s) = pom_model_for_tier(daa, tier) {
-            if !out.iter().any(|x| x.model_id == s.model_id) {
-                out.push(s);
-            }
-        }
-    }
-    out
-}
-
-pub fn specs_for(daa: u64, tier: Tier) -> &'static [&'static ModelSpec] {
-    if daa >= crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA {
-        // H4 lineup: one flag = one model, all five tiers swap together.
-        return match tier {
-            Tier::VeryLight => &[&EXAONE_4_0_1_2B],
-            Tier::Light => &[&MISTRAL_7B_V03],
-            Tier::Default => &[&GLM_4_9B_0414],
-            Tier::High => &[&QWEN3_6_27B],
-            Tier::VeryHigh => &[&KIMI_LINEAR_48B],
-        };
-    }
-    if daa >= OPOI_V2_ACTIVATION_DAA {
-        // PoM era: one flag = one model. Each hardware tier mines AND serves exactly the
-        // single model it proves possession of — the cumulative "serve everything below my
-        // tier" behaviour is dropped, because a PoM GPU is bound to its tier (serving a
-        // lower tier means unloading the mined model and pausing mining). Multi-tier
-        // coverage is a network property (different miners per tier), not a per-GPU one.
-        match tier {
-            // Very-light only enters consensus at its own H2; before that it falls back to the
-            // light tier (Gemma) so an early `--very-light` miner still mines a valid tier.
-            Tier::VeryLight if daa >= VERY_LIGHT_ACTIVATION_DAA => &[&QWEN3_1_7B],
-            Tier::VeryLight => &[&GEMMA_3_4B],
-            Tier::Light => &[&GEMMA_3_4B],
-            Tier::Default => &[&DOLPHIN_LLAMA3_8B],
-            Tier::High => &[&QWEN3_32B],
-            // At H2 the top tier swaps Q4_K_M (48 GB-only, effectively unserved) → Q2_K_L so it
-            // fits a 32 GB 5090. Before H2 it stays the Q4 (live today).
-            Tier::VeryHigh if daa >= VERY_LIGHT_ACTIVATION_DAA => &[&LLAMA_3_3_70B_Q2],
-            Tier::VeryHigh => &[&LLAMA_3_3_70B],
-        }
-    } else {
-        match tier {
-            Tier::VeryLight | Tier::Light => &[&TINYLLAMA],
-            Tier::Default => &[&TINYLLAMA, &DEEPSEEK_R1_8B],
-            Tier::High => &[&TINYLLAMA, &DEEPSEEK_R1_8B, &DEEPSEEK_R1_32B],
-            Tier::VeryHigh => &[&TINYLLAMA, &DEEPSEEK_R1_8B, &DEEPSEEK_R1_32B, &LLAMA_3_3_70B_OFFICIAL],
-        }
-    }
-}
-
-/// Both lineups combined — resolves a model name/id regardless of era.
+/// Resolves a model name/id.
 pub const REGISTRY: &[&ModelSpec] = &[
-    &GEMMA_3_4B,
-    &DOLPHIN_LLAMA3_8B,
-    &QWEN3_32B,
-    &LLAMA_3_3_70B,
-    &LLAMA_3_3_70B_Q2,
-    &QWEN3_1_7B,
     &EXAONE_4_0_1_2B,
     &MISTRAL_7B_V03,
     &GLM_4_9B_0414,
     &QWEN3_6_27B,
     &KIMI_LINEAR_48B,
-    &TINYLLAMA,
-    &DEEPSEEK_R1_8B,
-    &DEEPSEEK_R1_32B,
-    &LLAMA_3_3_70B_OFFICIAL,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {

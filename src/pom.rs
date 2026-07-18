@@ -545,7 +545,7 @@ enum ChunkSource {
     #[cfg(test)]
     Ram(Vec<u8>),
     /// Chunks read on demand from the GGUF via `pread` — NO host copy (saves ~1x model size of
-    /// RAM, ~42 GB for the 70B). `table[j] = (canonical chunk index of tensor j's first chunk,
+    /// RAM, ~28 GB for the top tier). `table[j] = (canonical chunk index of tensor j's first chunk,
     /// absolute file byte offset of that chunk)`, ascending by chunk index; `read_chunk`
     /// binary-searches it. The leaves are hashed from the same on-disk quantized bytes
     /// (`pread` at the same `tensor_data_offset + offset`), so reader and builder agree.
@@ -1275,7 +1275,7 @@ mod tests {
     #[test]
     #[ignore]
     fn gguf_real_model_read_chunk_byte_identical() {
-        let path = "/home/slash/KERYX-KRX/claude/Outils PoM/keryx-miner-test CPU-Llama3-70B/target/release/models/Gemma-3-4B/model.gguf";
+        let path = "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/EXAONE-4.0-1.2B/model.gguf";
         if !std::path::Path::new(path).exists() {
             eprintln!("skip: GGUF not found at {path}");
             return;
@@ -1464,22 +1464,22 @@ mod tests {
         assert_eq!(proof.tier, 1);
     }
 
-    // Validates the canonical layout against the consensus-pinned R_T. Needs the Gemma GGUF.
-    // Run: cargo test --lib pom -- --ignored --nocapture
+    // Validates the canonical layout against the consensus-pinned R_T. Needs the EXAONE GGUF
+    // (tier 0 — the smallest, ~0.9 GB). Run: cargo test --lib pom -- --ignored --nocapture
     #[test]
-    #[ignore = "needs Gemma-3-4B GGUF on disk"]
-    fn weight_index_matches_pinned_gemma() {
-        let path = "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/Gemma-3-4B/model.gguf";
+    #[ignore = "needs EXAONE-4.0-1.2B GGUF on disk"]
+    fn weight_index_matches_pinned_exaone() {
+        let path = "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/EXAONE-4.0-1.2B/model.gguf";
         let idx = WeightIndex::build_from_gguf(path).expect("build index");
-        assert_eq!(idx.n_chunks, 77_604_776, "chunk count must match pinned GEMMA_3_4B_POM_CHUNKS");
+        assert_eq!(idx.n_chunks, 28_943_588, "chunk count must match the node-pinned EXAONE chunks");
         let pinned: [u8; 32] = [
-            0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4, 0xbf, 0xa2, 0x42, 0x45,
-            0x4e, 0xac, 0x0d, 0x83, 0x5c, 0x3f, 0x8e, 0x63, 0x47, 0xd0, 0x13, 0x9d, 0x1b, 0x7e,
+            0xcc, 0x8b, 0x25, 0xc4, 0xe1, 0xaa, 0x7a, 0xb9, 0xbb, 0x99, 0x41, 0xda, 0x16, 0x18, 0xf9, 0xab,
+            0x29, 0x38, 0xea, 0x85, 0x07, 0x7b, 0x88, 0x79, 0xeb, 0xd7, 0xd4, 0x91, 0x6a, 0xc3, 0x8d, 0xdd,
         ];
-        assert_eq!(idx.r_t, pinned, "miner R_T must equal node-pinned GEMMA_3_4B_POM_ROOT");
+        assert_eq!(idx.r_t, pinned, "miner R_T must equal the node-pinned EXAONE root (POM_TIERS_H4[0])");
 
         // A real proof over the real model self-verifies against the pinned R_T.
-        let pph = blake(b"gemma-pph");
+        let pph = blake(b"exaone-pph");
         let nonce = 1234;
         let seed = pom_block_seed(&pph, 99, nonce, false);
         let proof =

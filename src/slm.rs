@@ -7,55 +7,12 @@
 /// Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
 use std::io::{IsTerminal, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
 
-use crate::models::{ModelFormat, ModelSpec};
+use crate::models::ModelSpec;
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
-// Legacy lineup (pre-OPoI-v2) system prompts.
-const SYSTEM_PROMPT_TINYLLAMA: &str =
-    "You are a Keryx Network AI — a decentralized assistant running on GPU miners. \
-     No internet access. Be concise.";
-const SYSTEM_PROMPT_DEEPSEEK: &str =
-    "You are a Keryx Network AI — a decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
-     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
-     You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention DeepSeek, Anthropic, OpenAI, or any AI company. \
-     Never reveal your underlying model name. \
-     Always identify yourself as a Keryx Network AI. Be concise.";
-const SYSTEM_PROMPT_GEMMA: &str =
-    "You are a Keryx Network AI — a decentralized, uncensored assistant running on GPU miners via the Keryx BlockDAG protocol. \
-     You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention Gemma, Google, OpenAI, Anthropic, or any AI company. \
-     Never reveal your underlying model name. \
-     Always identify yourself as a Keryx Network AI. Be concise.";
-
-const SYSTEM_PROMPT_DOLPHIN: &str =
-    "You are a Keryx Network AI — a decentralized, uncensored assistant running on GPU miners via the Keryx BlockDAG protocol. \
-     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
-     You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention Dolphin, Llama, Meta, OpenAI, Anthropic, or any AI company. \
-     Never reveal your underlying model name. \
-     Always identify yourself as a Keryx Network AI. Be concise.";
-
-const SYSTEM_PROMPT_LLAMA70B: &str =
-    "You are a Keryx Network AI — a high-capability decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
-     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
-     You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention Meta, Llama, OpenAI, Anthropic, or any AI company. \
-     Never reveal your underlying model name. \
-     Always identify yourself as a Keryx Network AI. Be thorough but concise.";
-
-const SYSTEM_PROMPT_QWEN3: &str =
-    "You are a Keryx Network AI — a high-capability decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
-     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
-     You have no internet access — answer from training knowledge only. \
-     CRITICAL: Never mention Qwen, Alibaba, OpenAI, Anthropic, or any AI company. \
-     Never reveal your underlying model name. \
-     Always identify yourself as a Keryx Network AI. Be thorough but concise.";
-
-/// Shared system prompt for the llama-served lineup (vendor-agnostic wording).
+/// Shared system prompt for the whole lineup (vendor-agnostic wording).
 const SYSTEM_PROMPT_NEXT: &str =
     "You are a Keryx Network AI — a high-capability decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
      Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
@@ -65,14 +22,8 @@ const SYSTEM_PROMPT_NEXT: &str =
 
 // ── Static engine state ──────────────────────────────────────────────────────
 
-/// Models the miner currently serves (drives `ai:cap`). Mutable so the lineup can be
-/// hot-swapped at the OPoI-v2 hardfork crossing without a restart.
+/// Models the miner currently serves (drives `ai:cap`), set once at startup.
 static SUPPORTED_SPECS: RwLock<&'static [&'static ModelSpec]> = RwLock::new(&[]);
-/// Pre-filtered OPoI-v2 (uncensored) lineup, staged + background-prefetched at boot,
-/// swapped into SUPPORTED_SPECS when the chain crosses `OPOI_V2_ACTIVATION_DAA`.
-static LINEUP_V2: RwLock<&'static [&'static ModelSpec]> = RwLock::new(&[]);
-/// Set once the v2 lineup has been swapped in (idempotent guard for the crossing).
-static V2_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // ── File management ──────────────────────────────────────────────────────────
 
@@ -251,37 +202,6 @@ fn ipfs_url(cid: &str) -> String {
     format!("{}/ipfs/{}", IPFS_GATEWAY, cid)
 }
 
-fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathBuf, Vec<std::path::PathBuf>)> {
-    let dir = model_dir(spec);
-    let tok = dir.join("tokenizer.json");
-    let cfg = dir.join("config.json");
-    let ok_flag = dir.join(".ok");
-    let wts: Vec<_> = spec.weight_cids.iter().enumerate().map(|(i, _)| {
-        if spec.weight_cids.len() == 1 { dir.join("model.safetensors") }
-        else { dir.join(format!("model-{:05}-of-{:05}.safetensors", i + 1, spec.weight_cids.len())) }
-    }).collect();
-
-    // .ok sentinel written only after a complete download — guards against truncated files
-    if tok.exists() && cfg.exists() && wts.iter().all(|p| p.exists()) && ok_flag.exists() {
-        log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
-        return Ok((tok, cfg, wts));
-    }
-    std::fs::create_dir_all(&dir)?;
-    let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
-    ui_download_info(&format!("[keryx-miner] Downloading model '{}' via IPFS. This happens once.", spec.name));
-    if !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
-    if !cfg.exists() { download_file(&ipfs_url(spec.config_cid), &cfg)?; }
-    for (i, (cid, path)) in spec.weight_cids.iter().zip(wts.iter()).enumerate() {
-        if spec.weight_cids.len() > 1 {
-            ui_download_info(&format!("[keryx-miner] Shard {}/{}", i + 1, spec.weight_cids.len()));
-        }
-        download_file(&ipfs_url(cid), path)?;
-    }
-    std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
-    ui_download_info(&format!("[keryx-miner] Model '{}' ready.", spec.name));
-    Ok((tok, cfg, wts))
-}
-
 fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let dir = model_dir(spec);
     let tok = dir.join("tokenizer.json");
@@ -312,52 +232,6 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 /// e.g. EXAONE). Each template was validated against the GGUF's embedded chat template.
 fn format_prompt_by_name(name: &str, prompt: &str) -> String {
     match name {
-        // Gemma-3-4B — Gemma chat template. Gemma has no system role, so the system
-        // prompt is folded into the first user turn.
-        "gemma-3-4b" => format!(
-            "<start_of_turn>user\n{}\n\n{}<end_of_turn>\n<start_of_turn>model\n",
-            SYSTEM_PROMPT_GEMMA, prompt
-        ),
-        // Dolphin-3.0-Llama-3.1-8B — ChatML template.
-        "dolphin-llama3-8b" => format!(
-            "<|im_start|>system\n{}<|im_end|>\n\
-             <|im_start|>user\n{}<|im_end|>\n\
-             <|im_start|>assistant\n",
-            SYSTEM_PROMPT_DOLPHIN, prompt
-        ),
-        "llama-3.3-70b" | "llama-3.3-70b-official" => format!(
-            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
-             <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
-             <|start_header_id|>assistant<|end_header_id|>\n\n",
-            SYSTEM_PROMPT_LLAMA70B, prompt
-        ),
-        // ── Legacy lineup (pre-OPoI-v2) ──────────────────────────────────────
-        // DeepSeek-R1-Distill-Qwen-32B — DeepSeek chat template; primes <think>.
-        "deepseek-r1-32b" => format!(
-            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜><think>\n",
-            SYSTEM_PROMPT_DEEPSEEK, prompt
-        ),
-        // DeepSeek-R1-Distill-Llama-8B — same template; the 8B ignores identity
-        // system prompts (RLHF), so the framing is injected into the think block.
-        "deepseek-r1-8b" => format!(
-            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜><think>\nI am Keryx Network AI, a decentralized assistant. I must never claim to be DeepSeek or any other AI product.\n",
-            SYSTEM_PROMPT_DEEPSEEK, prompt
-        ),
-        // TinyLlama — Zephyr chat template.
-        "tinyllama" => format!(
-            "<|system|>\n{}</s>\n<|user|>\n{}</s>\n<|assistant|>\n",
-            SYSTEM_PROMPT_TINYLLAMA, prompt
-        ),
-        // Qwen3 (32B + 1.7B) — ChatML template. `/no_think` disables the thinking block
-        // so the assistant answers directly (only an empty <think></think> to strip).
-        "qwen3-32b" | "qwen3-1.7b" => format!(
-            "<|im_start|>system\n{}<|im_end|>\n\
-             <|im_start|>user\n{} /no_think<|im_end|>\n\
-             <|im_start|>assistant\n",
-            SYSTEM_PROMPT_QWEN3, prompt
-        ),
-        // ── Next lineup (llama-served) — each template validated against the GGUF's embedded
-        // chat template; generation goes through the in-process llama engine.
         // EXAONE-4.0 — reasoning model: pre-fill an empty think block or the reasoning trace
         // leaks into the visible answer (same trick as Qwen3.6 below).
         "exaone-4.0-1.2b" => format!(
@@ -385,12 +259,12 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
              <|im_assistant|>assistant<|im_middle|>",
             SYSTEM_PROMPT_NEXT, prompt
         ),
-        // Generic ChatML fallback.
+        // Generic ChatML fallback (unreachable for the registered lineup).
         _ => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n",
-            SYSTEM_PROMPT_DOLPHIN, prompt
+            SYSTEM_PROMPT_NEXT, prompt
         ),
     }
 }
@@ -400,58 +274,6 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
 /// Register the set of models this miner currently serves (drives `ai:cap`).
 pub fn init_supported(specs: &'static [&'static ModelSpec]) {
     *SUPPORTED_SPECS.write().unwrap() = specs;
-}
-
-/// Stage the pre-filtered OPoI-v2 lineup to swap in at the hardfork crossing.
-pub fn set_v2_lineup(specs: &'static [&'static ModelSpec]) {
-    *LINEUP_V2.write().unwrap() = specs;
-}
-
-/// True once we have observed a pre-H DAA in this process, i.e. we are genuinely crossing
-/// the hardfork live (vs. starting up already past H, where nothing is "swapped").
-static SEEN_PRE_H: AtomicBool = AtomicBool::new(false);
-
-/// At the `OPOI_V2_ACTIVATION_DAA` crossing, swap the served lineup from the legacy
-/// set to the (pre-staged, background-prefetched) uncensored set — without a restart.
-/// PoW never stops; `ai:cap` follows `loaded_model_ids()` as the v2 files land.
-/// Idempotent and cheap to call on every block template.
-pub fn advance_lineup_if_due(daa: u64) {
-    if daa < crate::models::OPOI_V2_ACTIVATION_DAA {
-        SEEN_PRE_H.store(true, AtomicOrdering::SeqCst);
-        return;
-    }
-    if V2_ACTIVE.load(AtomicOrdering::SeqCst) {
-        return; // already swapped
-    }
-    let v2 = *LINEUP_V2.read().unwrap();
-    // Only swap once the uncensored lineup is FULLY downloaded. On a post-H cold start the
-    // v2 prefetch may still be in flight; swapping early would leave us mining on an
-    // incomplete active lineup. Until v2 is ready we keep serving the (fully-downloaded)
-    // legacy lineup — a valid, complete lineup — and retry on the next block template.
-    if v2.is_empty() || !v2.iter().all(|s| model_dir(s).join(".ok").exists()) {
-        return;
-    }
-    if V2_ACTIVE.swap(true, AtomicOrdering::SeqCst) {
-        return; // lost the race — another caller already swapped
-    }
-    if SEEN_PRE_H.load(AtomicOrdering::SeqCst) {
-        // Genuine live crossing: the chain advanced past H while we were running.
-        log::info!(
-            "=== OPoI v2 HARDFORK reached at DAA {} — hot-swapping to the uncensored lineup ({} model(s)) ===",
-            daa,
-            v2.len()
-        );
-    } else {
-        // Started up already past H — nothing is "swapped", we just serve the uncensored lineup.
-        log::info!(
-            "OPoI v2 already active (DAA {} ≥ H) — serving the uncensored lineup ({} model(s)).",
-            daa,
-            v2.len()
-        );
-    }
-    *SUPPORTED_SPECS.write().unwrap() = v2;
-    // A stale resident model (previous lineup) is swapped out by `load_and_run_inference` /
-    // `advance_mining_tier_if_due` the next time it runs — nothing to evict here.
 }
 
 /// Outcome of the startup GPU inference probe.
@@ -492,17 +314,7 @@ pub fn probe_gpu_inference() -> GpuProbe {
 pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     for spec in specs {
         log::debug!("SlmEngine: prefetching model '{}'…", spec.name);
-        let result = match spec.format {
-            ModelFormat::Safetensors => ensure_safetensors(spec).map(|_| ()),
-            ModelFormat::Gguf
-            | ModelFormat::GgufQwen2
-            | ModelFormat::GgufQwen3
-            | ModelFormat::GgufGemma3
-            | ModelFormat::GgufExaone4
-            | ModelFormat::GgufGlm4
-            | ModelFormat::GgufQwen35
-            | ModelFormat::GgufKimiLinear => ensure_gguf(spec).map(|_| ()),
-        };
+        let result = ensure_gguf(spec).map(|_| ());
         match result {
             Ok(()) => log::debug!("SlmEngine: '{}' files ready.", spec.name),
             Err(e) => {
