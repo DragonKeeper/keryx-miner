@@ -90,13 +90,14 @@ cd /tmp
 wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -O cuda-keyring.deb
 dpkg -i cuda-keyring.deb
 apt-get update -qq
-apt-get install -y -qq libcublas-12-2 libcurand-12-2
+apt-get install -y -qq libcublas-12-2 libcurand-12-2 cuda-cudart-12-2
 CUBLAS_PATH=$(find /usr/local /usr/lib -name 'libcublas.so.12' 2>/dev/null | head -1)
 if [ -z "$CUBLAS_PATH" ]; then echo "libcublas.so.12 not found after install"; exit 1; fi
 echo "$(dirname "$CUBLAS_PATH")" > /etc/ld.so.conf.d/keryx-cuda.conf
 ldconfig
 ldconfig -p | grep -q libcublas.so.12 || { echo "libcublas still not in loader cache"; exit 1; }
 ldconfig -p | grep -q libcurand.so   || { echo "libcurand still not in loader cache"; exit 1; }
+ldconfig -p | grep -q libcudart.so.12 || { echo "libcudart still not in loader cache"; exit 1; }
 rm -f cuda-keyring.deb"#;
     Command::new("bash")
         .args(["-c", script])
@@ -698,7 +699,7 @@ async fn run() -> Result<(), Error> {
                 let installed = tokio::task::spawn_blocking(install_cuda_libs).await.unwrap_or(false);
                 if !installed {
                     error!("Automatic CUDA lib install failed — install them manually then restart:");
-                    error!("  apt-get install -y libcublas-12-2 libcurand-12-2");
+                    error!("  apt-get install -y libcublas-12-2 libcurand-12-2 cuda-cudart-12-2");
                     return Err("CUDA runtime libs missing — cannot start OPoI mining".into());
                 }
                 // Re-probe in-process. The dynamic loader may still hold a stale cache, so if

@@ -296,12 +296,17 @@ pub fn probe_gpu_inference() -> GpuProbe {
         return GpuProbe::NoCuda;
     }
     // The binary links CUDA 12; probe the versioned soname first, then the generic one.
-    for so in ["libcublas.so.12", "libcublas.so"] {
-        let c = std::ffi::CString::new(so).unwrap();
-        let h = unsafe { nix::libc::dlopen(c.as_ptr(), nix::libc::RTLD_NOW | nix::libc::RTLD_LOCAL) };
-        if !h.is_null() {
-            return GpuProbe::Ok;
-        }
+    // libkeryx-llama.so needs the CUDA runtime on top of cuBLAS, and a missing libcudart
+    // would otherwise only surface at the first dlopen of the engine, mid-session.
+    let loads = |candidates: &[&str]| {
+        candidates.iter().any(|so| {
+            let c = std::ffi::CString::new(*so).unwrap();
+            let h = unsafe { nix::libc::dlopen(c.as_ptr(), nix::libc::RTLD_NOW | nix::libc::RTLD_LOCAL) };
+            !h.is_null()
+        })
+    };
+    if loads(&["libcublas.so.12", "libcublas.so"]) && loads(&["libcudart.so.12", "libcudart.so"]) {
+        return GpuProbe::Ok;
     }
     GpuProbe::CublasMissing
 }
