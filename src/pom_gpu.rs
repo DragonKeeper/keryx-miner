@@ -123,7 +123,7 @@ impl LoadedPomKernel {
 
     fn launch(
         &self,
-        stream: &CudaStream,
+        stream: &Arc<CudaStream>,
         bases_dev: &CudaSlice<u64>,
         prefix_dev: &CudaSlice<u64>,
         t_count: u32,
@@ -136,7 +136,7 @@ impl LoadedPomKernel {
     ) -> Result<Option<u64>> {
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
-        let winner = stream.memcpy_stod(&[u64::MAX])?;
+        let winner = stream.clone_htod(&[u64::MAX])?;
         let grid = ((batch + 255) / 256) as u32;
         let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
 
@@ -167,7 +167,7 @@ impl LoadedPomKernel {
         unsafe { result::launch_kernel(self.function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
         stream.synchronize()?;
 
-        let w = stream.memcpy_dtov(&winner)?[0];
+        let w = stream.clone_dtoh(&winner)?[0];
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
 }
@@ -377,7 +377,7 @@ impl PomGpuMiner {
             }
             host_buf.resize(t.nbytes as usize, 0);
             crate::pom::read_exact_at(&file, &mut host_buf, meta.tensor_data_offset + t.offset)?;
-            let dev = stream.memcpy_stod(host_buf.as_slice())?;
+            let dev = stream.clone_htod(host_buf.as_slice())?;
             bases.push(dev.device_ptr(&stream).0 as u64);
             uploads.push(dev);
             prefix.push(prefix.last().unwrap() + chunks);
@@ -387,8 +387,8 @@ impl PomGpuMiner {
             return Err(anyhow!("PoM GPU: model produced 0 chunks"));
         }
 
-        let bases_dev = stream.memcpy_stod(bases.as_slice())?;
-        let prefix_dev = stream.memcpy_stod(prefix.as_slice())?;
+        let bases_dev = stream.clone_htod(bases.as_slice())?;
+        let prefix_dev = stream.clone_htod(prefix.as_slice())?;
         // Load the best prebuilt module for this card and keep the raw CUfunction cached.
         let kernel = select_pom_kernel(device_id)?;
 
@@ -430,7 +430,7 @@ impl PomGpuMiner {
                 // Host-resident in ggml (CPU buffer): the walk needs device memory — upload our own
                 // copy of the raw bytes (identical to the GGUF bytes, same as the pointer).
                 let host: &[u8] = unsafe { std::slice::from_raw_parts(*ptr as *const u8, *nbytes) };
-                let dev = stream.memcpy_stod(host)?;
+                let dev = stream.clone_htod(host)?;
                 let p = dev.device_ptr(&stream).0 as u64;
                 uploads.push(dev);
                 n_uploaded += 1;
@@ -472,8 +472,8 @@ impl PomGpuMiner {
             }
         }
 
-        let bases_dev = stream.memcpy_stod(bases.as_slice())?;
-        let prefix_dev = stream.memcpy_stod(prefix.as_slice())?;
+        let bases_dev = stream.clone_htod(bases.as_slice())?;
+        let prefix_dev = stream.clone_htod(prefix.as_slice())?;
         let kernel = select_pom_kernel(device_id)?;
 
         Ok(Self {
