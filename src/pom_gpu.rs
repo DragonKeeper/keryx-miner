@@ -723,6 +723,13 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         info!("PoM[gpu{}]: era crossing at DAA {} — mining model → {}.", dev, daa, spec.name);
         set_mining_tier(dev, spec.model_id, gguf);
+        // The host possession index is keyed by tier POSITION and the crossing swaps which model
+        // occupies that position (e.g. tier 0: Qwen3-1.7B → EXAONE), so the pre-crossing index
+        // must be dropped — otherwise `ensure_installed` keeps it (key already present) and the
+        // gather/index N-guard refuses to mine forever.
+        if let Some(t) = crate::models::pom_tier_index(&spec.model_id, daa) {
+            crate::pom::clear_index(t);
+        }
         uninstall(dev); // force a resident reload of the new model on the next ensure_installed
     }
 }

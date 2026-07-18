@@ -1064,6 +1064,16 @@ pub fn set_index(tier: u8, index: WeightIndex) {
     }
 }
 
+/// Drop a tier's possession index so the next `ensure_installed` rebuilds it from the CURRENT
+/// model. Needed at an era crossing: the map is keyed by tier POSITION, and the crossing swaps
+/// which model occupies that position, so the built index no longer matches the resident model
+/// (the gather/index N-guard would refuse to mine forever otherwise).
+pub fn clear_index(tier: u8) {
+    if let Ok(mut g) = pom_indices().lock() {
+        g.remove(&tier);
+    }
+}
+
 /// The possession index for a specific tier, if built.
 pub fn active_index_for_tier(tier: u8) -> Option<Arc<WeightIndex>> {
     pom_indices().lock().ok().and_then(|g| g.get(&tier).cloned())
