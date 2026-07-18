@@ -3,13 +3,12 @@ use std::any::Any;
 use std::error::Error as StdError;
 use std::io::IsTerminal;
 
+pub mod gguf;
 pub mod inference;
 pub mod llama_engine;
 pub mod models;
 pub mod pom;
 pub mod pom_gpu;
-pub mod quantized_llama_split;
-pub mod quantized_qwen3_split;
 pub mod slm;
 pub mod xoshiro256starstar;
 use libloading::{Library, Symbol};

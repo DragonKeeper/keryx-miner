@@ -10,7 +10,7 @@
 ///   --high        Qwen3-32B-abliterated (Q4_K_M) (Qwen)   — 24 GB (3090 / 4090 / 5090)
 ///   --very-high   Llama-3.3-70B-abliterated      (Meta)   — Q4 48 GB (pre-H2) → Q2_K_L 32 GB / 5090 (post-H2)
 ///
-/// H4 (candle-free) lineup — all five tiers swap at `COIN_AGE_VERIFICATION_ACTIVATION_DAA`,
+/// H4 lineup — all five tiers swap at `COIN_AGE_VERIFICATION_ACTIVATION_DAA`,
 /// every model untied so llama hosts walk + inference in one resident copy:
 ///   --very-light  EXAONE-4.0-1.2B  Q4_K_M (LG)       — 4 GB+
 ///   --light       Mistral-7B-v0.3  Q6_K   (Mistral)  — 8 GB
@@ -33,13 +33,13 @@ pub enum ModelFormat {
     GgufQwen3,
     /// GGUF quantized — Gemma 3 architecture (Gemma-3-4B, baseline tier).
     GgufGemma3,
-    /// GGUF quantized — EXAONE 4 architecture (H4 tier 0). llama-served only (no candle loader).
+    /// GGUF quantized — EXAONE 4 architecture (H4 tier 0). llama-served.
     GgufExaone4,
-    /// GGUF quantized — GLM 4 architecture (H4 tier 2). llama-served only (no candle loader).
+    /// GGUF quantized — GLM 4 architecture (H4 tier 2). llama-served.
     GgufGlm4,
-    /// GGUF quantized — Qwen3.5 hybrid-SSM architecture (H4 tier 3). llama-served only (no candle loader).
+    /// GGUF quantized — Qwen3.5 hybrid-SSM architecture (H4 tier 3). llama-served.
     GgufQwen35,
-    /// GGUF quantized — Kimi-Linear MoE architecture (H4 tier 4). llama-served only (no candle loader).
+    /// GGUF quantized — Kimi-Linear MoE architecture (H4 tier 4). llama-served.
     GgufKimiLinear,
 }
 
@@ -178,10 +178,10 @@ pub const LLAMA_3_3_70B_Q2: ModelSpec = ModelSpec {
     min_vram_mb: 30_000,
 };
 
-// ── H4 lineup (candle-free) ───────────────────────────────────────────────────
+// ── H4 lineup ───────────────────────────────────────────────────
 // Active at `crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA` (the H4 hardfork). Every model is
-// UNTIED so the in-process llama engine hosts walk + inference in one resident copy; candle has no
-// loader for these architectures, so `libkeryx-llama.so` is REQUIRED to serve them.
+// UNTIED so the in-process llama engine hosts walk + inference in one resident copy;
+// `libkeryx-llama.so` is REQUIRED to serve them.
 // `tokenizer_cid` is empty: llama uses the tokenizer embedded in the GGUF, no separate file.
 // model_id bytes MUST equal the node's `params.rs` H4 constants (CIDv0[2..34] of the pinned GGUF).
 
@@ -305,7 +305,7 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
 
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     if daa >= crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA {
-        // H4 candle-free 5-tier scheme: the WHOLE lineup swaps at once (all five models are
+        // H4 5-tier scheme: the WHOLE lineup swaps at once (all five models are
         // untied so llama hosts walk + inference in one copy). MUST mirror the node's
         // `POM_TIERS_H4` order; recomputed per block from that block's DAA (see gate rationale below).
         if *model_id == EXAONE_4_0_1_2B.model_id {
@@ -502,7 +502,7 @@ pub fn pom_models_all_eras(tier: Tier) -> Vec<&'static ModelSpec> {
 
 pub fn specs_for(daa: u64, tier: Tier) -> &'static [&'static ModelSpec] {
     if daa >= crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA {
-        // H4 candle-free lineup: one flag = one model, all five tiers swap together.
+        // H4 lineup: one flag = one model, all five tiers swap together.
         return match tier {
             Tier::VeryLight => &[&EXAONE_4_0_1_2B],
             Tier::Light => &[&MISTRAL_7B_V03],

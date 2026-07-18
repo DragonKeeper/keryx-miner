@@ -1,4 +1,4 @@
-// libkeryx-llama.{so,dylib} — the miner's in-process llama.cpp engine (candle-independence Phase 2
+// libkeryx-llama.{so,dylib} — the miner's in-process llama.cpp engine (Phase 2
 // on CUDA, Phase 3b on Apple Silicon Metal).
 //
 // One llama.cpp instance per loaded model: it OWNS the resident GGUF copy on the inference GPU
@@ -8,7 +8,7 @@
 // (`pom_gpu_metal` Phase 3a) so the tensor-pointer contract there only feeds the future zero-dup
 // Metal walk; today it just satisfies the loader-side count/name enumeration.
 //
-// The miner dlopens this next to its own binary; absent = the candle fallback stays active.
+// The miner dlopens this next to its own binary; absent = inference is unavailable.
 // Built by hiveos/build-keryx-llama.sh (CUDA) or hiveos/build-keryx-llama-macos.sh (Metal).
 #include "llama.h"
 #include "llama-model.h"
@@ -76,7 +76,7 @@ KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) { llama_model_free(model); return nullptr; }
 
-    // Same user-facing sampling the candle path uses (temperature 0.7 / top_p 0.9) — the OPoI
+    // User-facing sampling (temperature 0.7 / top_p 0.9) — the OPoI
     // text is not consensus-relevant, but keep the flavor consistent.
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));

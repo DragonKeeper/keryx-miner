@@ -1,10 +1,11 @@
-//! In-process llama.cpp engine via a dlopen'd `libkeryx-llama.so` (Phase 2 candle-independence).
+//! In-process llama.cpp engine via a dlopen'd `libkeryx-llama.so`.
 //!
-//! When the .so sits next to the miner binary (or `KERYX_LLAMA_SO` points at it), it becomes the
-//! DEFAULT engine for the primary model on the inference GPU: llama.cpp owns the single resident
-//! VRAM copy, the PoM walk gathers straight over its tensor pointers (zero-dup — byte-identity
-//! proven by tools/llama_zerodup_spike), and OPoI text generation runs in-process. Absent .so =
-//! the candle paths stay active as the (dormant) fallback, byte-identical to before.
+//! The .so sits next to the miner binary (or `KERYX_LLAMA_SO` points at it) — `cargo build`
+//! produces it there. It is THE inference engine: llama.cpp owns the single resident VRAM copy
+//! of the model on the inference GPU, the PoM walk gathers straight over its tensor pointers
+//! (zero-dup — byte-identity proven by tools/llama_zerodup_spike), and OPoI text generation
+//! runs in-process. Absent .so = no inference (responses are dropped); mining still works via
+//! the standalone raw-upload walk (`pom_gpu::load_raw`).
 //!
 //! Consensus safety: this module only changes WHO HOSTS the model bytes and WHO GENERATES the
 //! user-facing OPoI text. The walk kernel, the host possession index, proofs and `tag_fixed` are
@@ -99,7 +100,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
         if lib.is_null() {
             let err = libc::dlerror();
             let msg = if err.is_null() { "?".into() } else { CStr::from_ptr(err).to_string_lossy().into_owned() };
-            log::warn!("llama engine: dlopen({}) failed: {} — candle fallback stays active.", so.display(), msg);
+            log::warn!("llama engine: dlopen({}) failed: {} — inference unavailable.", so.display(), msg);
             return false;
         }
         let (Some(abi), Some(load), Some(count), Some(info), Some(gen), Some(free)) = (
@@ -110,12 +111,12 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
             sym::<GenFn>(lib, "keryx_llama_generate"),
             sym::<FreeFn>(lib, "keryx_llama_free"),
         ) else {
-            log::warn!("llama engine: {} is missing symbols — candle fallback stays active.", so.display());
+            log::warn!("llama engine: {} is missing symbols — inference unavailable.", so.display());
             return false;
         };
         let got = abi();
         if got != ABI {
-            log::warn!("llama engine: {} ABI {} != expected {} — candle fallback stays active.", so.display(), got, ABI);
+            log::warn!("llama engine: {} ABI {} != expected {} — inference unavailable.", so.display(), got, ABI);
             return false;
         }
         let cg = match CString::new(gguf) {
@@ -126,11 +127,11 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
         let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
         let model = load(cg.as_ptr(), gpu as c_int, n_ctx);
         if model.is_null() {
-            log::warn!("llama engine: model load failed (VRAM? arch?) — candle fallback stays active.");
+            log::warn!("llama engine: model load failed (VRAM? arch?) — inference unavailable.");
             return false;
         }
         *g = Some(Engine { model, count, info, generate: gen, free, gpu, gguf: gguf.to_string() });
-        log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference (candle dormant).");
+        log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference.");
         true
     }
 }
@@ -155,10 +156,11 @@ pub fn available() -> bool {
     }
 }
 
-/// Free the resident model and disable the engine (available() -> false). Used when llama's
-/// resident layout for this model is NOT byte-compatible with the canonical possession index
-/// (e.g. llama repacks Gemma's tied embeddings) — the walk must gather the canonical GGUF bytes,
-/// so we free llama's VRAM and let the caller fall back to candle for BOTH walk and inference.
+/// Free the resident model and disable the engine (available() -> false). Used when swapping
+/// the engine to another model (inference request / era crossing), and when llama's resident
+/// layout is NOT byte-compatible with the canonical possession index (e.g. repacked tied
+/// embeddings) — the walk must gather the canonical GGUF bytes, so we free llama's VRAM and
+/// the caller walks a raw canonical upload instead.
 pub fn unload() {
     if let Ok(mut g) = engine().lock() {
         if let Some(e) = g.take() {

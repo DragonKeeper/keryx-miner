@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto/rpc.proto", "proto/p2p.proto", "proto/messages.proto"],
             &["proto"],
         )?;
-    // PoM mining kernel → PTX set (loaded at runtime into candle's CUDA context).
+    // PoM mining kernel → PTX set (loaded at runtime into the miner's CUDA context).
     // Build a fallback ladder so mixed/older rigs don't fail on a single too-new .target.
     println!("cargo:rerun-if-changed=cuda/pom_mine.cu");
     println!("cargo:rerun-if-env-changed=NVCC");

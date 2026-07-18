@@ -575,7 +575,7 @@ impl KeryxdHandler {
                     // OPoI v2 hardfork: hot-swap the served model lineup the moment the
                     // chain reaches OPOI_V2_ACTIVATION_DAA (idempotent, no restart).
                     keryx_miner::slm::advance_lineup_if_due(daa);
-                    // H4 (candle-free) crossing: swap each GPU's resident PoM mining model to the
+                    // H4 crossing: swap each GPU's resident PoM mining model to the
                     // era-correct one for its tier at this block DAA (idempotent, no restart).
                     keryx_miner::pom_gpu::advance_mining_tier_if_due(daa);
                 }

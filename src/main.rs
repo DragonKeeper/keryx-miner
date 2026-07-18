@@ -57,15 +57,15 @@ pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 
 type Hash = Uint256;
 
-/// Attempt to install the CUDA runtime libraries candle needs, on a Debian/Ubuntu host (HiveOS).
+/// Attempt to install the CUDA runtime libraries inference needs, on a Debian/Ubuntu host (HiveOS).
 ///
-/// OPoI GPU inference needs cuBLAS, cuBLASLt and cuRAND — candle creates handles for all three
-/// when it opens the CUDA device. These ship with the CUDA toolkit but not with the bare NVIDIA
+/// OPoI GPU inference (the in-process llama engine) needs cuBLAS/cuBLASLt; cuRAND is kept for
+/// compatibility. These ship with the CUDA toolkit but not with the bare NVIDIA
 /// driver that mining rigs usually have. Rather than forcing miners to run apt by hand, we add
 /// the NVIDIA CUDA repo and install `libcublas-12-2` (cuBLAS + cuBLASLt) and `libcurand-12-2`
 /// ourselves, then register their directory with ldconfig. Runs as root on HiveOS, so no sudo.
 ///
-/// Version 12-2 (not 12-6) is deliberate: the binary's candle kernels are compiled with the
+/// Version 12-2 (not 12-6) is deliberate: the shipped kernels and the .so are compiled with the
 /// CUDA 12.2 toolkit so they JIT on driver >= 535 (typical HiveOS), and the cuBLAS runtime must
 /// match that minimum. Installing 12-6 here would pull a runtime needing driver >= 560.
 /// Returns true on success.
@@ -718,10 +718,8 @@ async fn run() -> Result<(), Error> {
     // immediately). The possession index AND the GPU walk are built by the mining loop the first
     // time PoM is active (DAA >= POM_ACTIVATION_DAA). Here we only record cheap config.
     if !pom_assignments.is_empty() {
-        // Force the split loader so a mining tier exposes its quant tensors for zero-dup sharing on
-        // the inference GPU. The tier *index* is computed per block from the block DAA (it shifts at
+        // The tier *index* is computed per block from the block DAA (it shifts at
         // the very-light H2 hardfork), so only the model is recorded here.
-        keryx_miner::slm::set_pom_force_split(true);
         for (device_id, gpu_tier, spec) in &pom_assignments {
             let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
             // Record the stable hardware tier so the era crossing can recompute this GPU's model,

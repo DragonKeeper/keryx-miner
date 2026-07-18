@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shippable `libkeryx-llama.so` — the miner's in-process llama.cpp engine (Phase 2
-# candle-independence: hosts the model for the PoM walk zero-dup + serves OPoI inference).
+# in-process engine: hosts the model for the PoM walk zero-dup + serves OPoI inference).
 # Built inside the glibc-2.31 container; links the SAME CUDA line as the package it ships in
 # (cublas/cudart resolve from the package's lib/ at runtime).
 #

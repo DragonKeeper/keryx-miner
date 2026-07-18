@@ -10,14 +10,13 @@
 //! (borsh wire format), and the primitives MUST stay bit-identical (the node re-derives the
 //! same challenges and recomputes the same transitions). See POM_CONSENSUS_SPEC.md.
 
+use anyhow::{anyhow, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
-use candle_core::quantized::gguf_file;
-use candle_core::Device;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::fs::FileExt;
@@ -548,8 +547,8 @@ enum ChunkSource {
     /// Chunks read on demand from the GGUF via `pread` — NO host copy (saves ~1x model size of
     /// RAM, ~42 GB for the 70B). `table[j] = (canonical chunk index of tensor j's first chunk,
     /// absolute file byte offset of that chunk)`, ascending by chunk index; `read_chunk`
-    /// binary-searches it. The GGUF's on-disk quantized bytes are byte-identical to candle's
-    /// `qt.data()` used to build the leaves (`tensor` seeks to the same `tensor_data_offset + offset`).
+    /// binary-searches it. The leaves are hashed from the same on-disk quantized bytes
+    /// (`pread` at the same `tensor_data_offset + offset`), so reader and builder agree.
     Gguf { file: File, table: Vec<(u64, u64)> },
 }
 
@@ -620,34 +619,31 @@ fn compute_checkpoint_offsets(n_chunks: u64) -> (Vec<StoredLevel>, u32) {
 
 /// Open an existing checkpoint tree file and reconstruct the WeightIndex.
 /// Detects legacy full-tree files (size mismatch) and returns an error so the caller can rebuild.
-fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> candle_core::Result<WeightIndex> {
-    let mut file = File::open(gguf_path).map_err(candle_core::Error::wrap)?;
-    let content = gguf_file::Content::read(&mut file)?;
-    let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
-    names.sort();
+fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> Result<WeightIndex> {
+    let mut file = File::open(gguf_path)?;
+    let meta = crate::gguf::GgufMeta::read(&mut file)?;
+    let names = meta.sorted_names();
 
-    // Compute n_chunks (fast — only reads headers, no full tensor data).
-    let device = Device::Cpu;
+    // Compute n_chunks (fast — header arithmetic only, no tensor data reads).
     let mut n_chunks: u64 = 0;
     let mut table: Vec<(u64, u64)> = Vec::with_capacity(names.len());
     for name in &names {
-        let file_off = content.tensor_data_offset + content.tensor_infos[name].offset;
-        let qt = content.tensor(&mut file, name, &device)?;
-        let bytes = qt.data()?;
-        let full = bytes.len() / 32;
+        let t = &meta.tensors[name];
+        let file_off = meta.tensor_data_offset + t.offset;
+        let full = t.nbytes / 32;
         if full > 0 {
             table.push((n_chunks, file_off));
         }
-        n_chunks += full as u64;
+        n_chunks += full;
     }
     if n_chunks == 0 {
-        return Err(candle_core::Error::Msg("PoM: model produced 0 chunks".into()));
+        return Err(anyhow!("PoM: model produced 0 chunks"));
     }
     drop(file);
 
     let (checkpoints, total_levels) = compute_checkpoint_offsets(n_chunks);
     let expected_size = checkpoints.last().map(|cp| cp.offset + 32).unwrap_or(0);
-    let actual_size = std::fs::metadata(tree_path).map_err(candle_core::Error::wrap)?.len();
+    let actual_size = std::fs::metadata(tree_path)?.len();
 
     // Detect legacy full-tree file: it's ~2× the checkpoint size.
     if actual_size > expected_size + expected_size {
@@ -658,25 +654,25 @@ fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> candle_co
             expected_size / 1_048_576,
             actual_size / expected_size.max(1),
         );
-        return Err(candle_core::Error::Msg(format!(
+        return Err(anyhow!(
             "PoM: legacy full-tree detected ({} bytes) — rebuild with sparse checkpoints (expect ~{} bytes)",
             actual_size, expected_size
-        )));
+        ));
     }
     if actual_size != expected_size {
-        return Err(candle_core::Error::Msg(format!(
+        return Err(anyhow!(
             "PoM: cached tree size mismatch (expected {}, got {}) — delete pom-tree.bin to rebuild",
             expected_size, actual_size
-        )));
+        ));
     }
 
-    let tree_file = OpenOptions::new().read(true).open(tree_path).map_err(candle_core::Error::wrap)?;
+    let tree_file = OpenOptions::new().read(true).open(tree_path)?;
 
     let root_cp = checkpoints.last().unwrap();
     let mut r_t = [0u8; 32];
-    read_exact_at(&tree_file, &mut r_t, root_cp.offset).map_err(candle_core::Error::wrap)?;
+    read_exact_at(&tree_file, &mut r_t, root_cp.offset)?;
 
-    let gguf = File::open(gguf_path).map_err(candle_core::Error::wrap)?;
+    let gguf = File::open(gguf_path)?;
     Ok(WeightIndex {
         n_chunks,
         r_t,
@@ -689,12 +685,12 @@ fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> candle_co
 }
 
 impl WeightIndex {
-    /// Build from a GGUF on disk (CPU dtoh of each tensor). The bytes are candle's exact quantized
-    /// bytes — the same the miner serves in VRAM and the builder pinned in `R_T`. The sparse
-    /// checkpoint Merkle tree is persisted to `pom-tree.bin` next to the GGUF: only every
-    /// K-th level is stored (~N/(2^K-1) nodes vs ~2N for a full tree). On subsequent restarts
-    /// the existing tree is reused (GGUF is immutable), avoiding a rebuild.
-    pub fn build_from_gguf(path: &str) -> candle_core::Result<Self> {
+    /// Build from a GGUF on disk (pread of each tensor's raw bytes). The bytes are the GGUF's
+    /// exact on-disk quantized bytes — the same the miner serves in VRAM and the builder pinned
+    /// in `R_T`. The sparse checkpoint Merkle tree is persisted to `pom-tree.bin` next to the
+    /// GGUF: only every K-th level is stored (~N/(2^K-1) nodes vs ~2N for a full tree). On
+    /// subsequent restarts the existing tree is reused (GGUF is immutable), avoiding a rebuild.
+    pub fn build_from_gguf(path: &str) -> Result<Self> {
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
         let tree_path = dir.join("pom-tree.bin");
 
@@ -724,11 +720,9 @@ impl WeightIndex {
             }
         }
 
-        let device = Device::Cpu;
-        let mut file = File::open(path).map_err(candle_core::Error::wrap)?;
-        let content = gguf_file::Content::read(&mut file)?;
-        let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
-        names.sort(); // canonical order
+        let mut file = File::open(path)?;
+        let meta = crate::gguf::GgufMeta::read(&mut file)?;
+        let names = meta.sorted_names(); // canonical order
 
         // Phase 0: hash leaves from GGUF chunks → write first checkpoint level (level K) to disk.
         // Process in batches of 2^K leaves, building a mini-tree per batch and writing only
@@ -742,51 +736,60 @@ impl WeightIndex {
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(&tree_path)
-                .map_err(candle_core::Error::wrap)?,
+                .open(&tree_path)?,
         );
 
         let mut table: Vec<(u64, u64)> = Vec::with_capacity(names.len());
         let mut n_chunks: u64 = 0;
         let mut batch_buf: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
 
+        // Stream each tensor's raw on-disk bytes in bounded slabs (the biggest tensors are
+        // multi-GB — no full-tensor buffering needed to hash 32 B chunks).
+        const SLAB_CHUNKS: u64 = 1 << 16; // 2 MiB per read
+        let mut slab = vec![0u8; (SLAB_CHUNKS * 32) as usize];
         for name in &names {
-            let file_off = content.tensor_data_offset + content.tensor_infos[name].offset;
-            let qt = content.tensor(&mut file, name, &device)?;
-            let bytes = qt.data()?;
-            let full = bytes.len() / 32;
+            let t = &meta.tensors[name];
+            let file_off = meta.tensor_data_offset + t.offset;
+            let full = t.nbytes / 32;
             if full > 0 {
                 table.push((n_chunks, file_off));
             }
-            for c in 0..full {
-                let chunk = &bytes[c * 32..c * 32 + 32];
-                batch_buf.push(blake(chunk));
-                n_chunks += 1;
-                if batch_buf.len() == batch_size as usize {
-                    let level_k_node = fold_levels(&batch_buf, k);
-                    writer.write_all(&level_k_node).map_err(candle_core::Error::wrap)?;
-                    batch_buf.clear();
+            let mut done: u64 = 0;
+            while done < full {
+                let take = SLAB_CHUNKS.min(full - done);
+                let buf = &mut slab[..(take * 32) as usize];
+                read_exact_at(&file, buf, file_off + done * 32)?;
+                for c in 0..take as usize {
+                    let chunk = &buf[c * 32..c * 32 + 32];
+                    batch_buf.push(blake(chunk));
+                    n_chunks += 1;
+                    if batch_buf.len() == batch_size as usize {
+                        let level_k_node = fold_levels(&batch_buf, k);
+                        writer.write_all(&level_k_node)?;
+                        batch_buf.clear();
+                    }
                 }
+                done += take;
             }
         }
         // Final partial batch: fold_levels carries the partial tail the full K levels (duplicate-last).
         // Do NOT pad to batch_size — padding at level 0 changes intermediate hashes.
         if !batch_buf.is_empty() {
             let level_k_node = fold_levels(&batch_buf, k);
-            writer.write_all(&level_k_node).map_err(candle_core::Error::wrap)?;
+            writer.write_all(&level_k_node)?;
         }
 
         if n_chunks == 0 {
-            return Err(candle_core::Error::Msg("PoM: model produced 0 chunks".into()));
+            return Err(anyhow!("PoM: model produced 0 chunks"));
         }
 
         // Build higher checkpoint levels (2K, 3K, ..., root) from level-K nodes.
-        writer.flush().map_err(candle_core::Error::wrap)?;
+        writer.flush()?;
         drop(writer);
         let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n_chunks)?;
 
-        let gguf = File::open(path).map_err(candle_core::Error::wrap)?;
-        let tree_file = File::open(&tree_path).map_err(candle_core::Error::wrap)?;
+        let gguf = File::open(path)?;
+        let tree_file = File::open(&tree_path)?;
         Ok(WeightIndex {
             n_chunks,
             r_t,
@@ -963,16 +966,16 @@ fn fold_levels(batch: &[[u8; 32]], rounds: u32) -> [u8; 32] {
 fn finalize_checkpoint_upper(
     tree_path: &std::path::Path,
     n_chunks: u64,
-) -> candle_core::Result<(Vec<StoredLevel>, u32, [u8; 32])> {
+) -> Result<(Vec<StoredLevel>, u32, [u8; 32])> {
     let (checkpoints, total_levels) = compute_checkpoint_offsets(n_chunks);
-    let mut file_for_read = File::open(tree_path).map_err(candle_core::Error::wrap)?;
+    let mut file_for_read = File::open(tree_path)?;
     let mut prev_offset: u64 = checkpoints[0].offset;
     let mut prev_count = checkpoints[0].count;
     let mut prev_level = checkpoints[0].level;
 
     // Open for appending higher levels
-    let mut writer = OpenOptions::new().read(true).write(true).open(tree_path).map_err(candle_core::Error::wrap)?;
-    writer.seek(SeekFrom::End(0)).map_err(candle_core::Error::wrap)?;
+    let mut writer = OpenOptions::new().read(true).write(true).open(tree_path)?;
+    writer.seek(SeekFrom::End(0))?;
     let mut buf_writer = BufWriter::new(writer);
 
     for cp in &checkpoints[1..] {
@@ -992,16 +995,16 @@ fn finalize_checkpoint_upper(
             for i in 0..take {
                 let index = read_idx + i;
                 let mut node = [0u8; 32];
-                read_exact_at(&file_for_read, &mut node, prev_offset + index * 32).map_err(candle_core::Error::wrap)?;
+                read_exact_at(&file_for_read, &mut node, prev_offset + index * 32)?;
                 batch.push(node);
             }
             let parent_node = fold_levels(&batch, rounds);
-            buf_writer.write_all(&parent_node).map_err(candle_core::Error::wrap)?;
+            buf_writer.write_all(&parent_node)?;
             read_idx += take;
         }
 
-        buf_writer.flush().map_err(candle_core::Error::wrap)?;
-        file_for_read = File::open(tree_path).map_err(candle_core::Error::wrap)?;
+        buf_writer.flush()?;
+        file_for_read = File::open(tree_path)?;
         prev_offset = cp.offset;
         prev_count = cp.count;
         prev_level = cp.level;
@@ -1010,7 +1013,7 @@ fn finalize_checkpoint_upper(
     // Read R_T from the last checkpoint (root)
     let root_cp = checkpoints.last().unwrap();
     let mut r_t = [0u8; 32];
-    read_exact_at(&file_for_read, &mut r_t, root_cp.offset).map_err(candle_core::Error::wrap)?;
+    read_exact_at(&file_for_read, &mut r_t, root_cp.offset)?;
 
     Ok((checkpoints, total_levels, r_t))
 }
@@ -1169,7 +1172,7 @@ mod tests {
     /// End-to-end check against a node-pinned root: build the sparse index from a real GGUF and
     /// assert its R_T equals the value `pom-rt-builder` pinned in the node's `POM_TIERS`. This closes
     /// the loop the synthetic test can't (real chunking: name-sorted tensors, floor(len/32), the exact
-    /// candle quantized bytes). `#[ignore]`d — needs the GGUF on disk; run with:
+    /// on-disk quantized bytes). `#[ignore]`d — needs the GGUF on disk; run with:
     ///   KERYX_POM_TEST_GGUF=/path/model.gguf KERYX_POM_TEST_ROOT=<hex> \
     ///     cargo test --release weight_index_matches_pinned_root -- --ignored --nocapture
     #[test]
@@ -1265,9 +1268,10 @@ mod tests {
     }
 
     /// Real-GGUF byte-identity: build the index from a downloaded model and prove that chunks
-    /// read by `pread` (GGUF) verify against the model's own `R_T` (whose leaves were hashed from
-    /// candle's `qt.data()`). Confirms `pread(tensor_data_offset + offset)` == `qt.data()` for real
-    /// quant types. Ignored (needs the GGUF); run: `cargo test -p keryx-miner -- --ignored gguf_real`.
+    /// read by `pread` (GGUF) verify against the model's own freshly-built `R_T`. Confirms the
+    /// header arithmetic (`tensor_data_offset + offset`, per-dtype sizes) addresses the exact
+    /// on-disk bytes for real quant types. Ignored (needs the GGUF); run:
+    /// `cargo test -p keryx-miner -- --ignored gguf_real`.
     #[test]
     #[ignore]
     fn gguf_real_model_read_chunk_byte_identical() {
