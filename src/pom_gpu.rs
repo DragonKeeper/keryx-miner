@@ -688,6 +688,45 @@ pub fn set_mining_tier(device_id: u32, model_id: [u8; 32], gguf_path: String) {
     }
 }
 
+/// Each GPU's hardware tier (the highest its VRAM holds ≤ the flag ceiling), fixed at startup.
+/// Unlike the resident *model* (which changes at an era crossing), the hardware tier is stable, so
+/// the crossing swap recomputes the era-correct model per block from this.
+static DEVICE_TIERS: OnceLock<Mutex<HashMap<u32, crate::models::Tier>>> = OnceLock::new();
+
+fn device_tiers() -> &'static Mutex<HashMap<u32, crate::models::Tier>> {
+    DEVICE_TIERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a GPU's stable hardware tier so the era crossing can recompute its era-correct model.
+pub fn set_device_tier(device_id: u32, tier: crate::models::Tier) {
+    if let Ok(mut g) = device_tiers().lock() {
+        g.insert(device_id, tier);
+    }
+}
+
+/// At an era crossing (H2→H4), swap each GPU's resident PoM mining model to the model valid for its
+/// hardware tier at `daa` — mirroring the node's per-block tier table. Idempotent: swaps only when
+/// the era-correct model differs from the one currently set, then `uninstall`s so the walk rebuilds
+/// on the new resident weights at the next `ensure_installed`. Called per block template, cheap when
+/// no crossing is due (a map lookup + comparison).
+pub fn advance_mining_tier_if_due(daa: u64) {
+    let devices: Vec<(u32, crate::models::Tier)> = match device_tiers().lock() {
+        Ok(g) => g.iter().map(|(d, t)| (*d, *t)).collect(),
+        Err(_) => return,
+    };
+    for &(dev, tier) in &devices {
+        let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
+        let current = mining_tiers().lock().ok().and_then(|g| g.get(&dev).map(|(id, _)| *id));
+        if current == Some(spec.model_id) {
+            continue;
+        }
+        let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+        info!("PoM[gpu{}]: era crossing at DAA {} — mining model → {}.", dev, daa, spec.name);
+        set_mining_tier(dev, spec.model_id, gguf);
+        uninstall(dev); // force a resident reload of the new model on the next ensure_installed
+    }
+}
+
 /// Ensure the GPU miner is installed; if an inference evicted the mining model, reload it
 /// (resident again) and rebuild the zero-dup gather. Heavy (model reload) but only when needed —
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if

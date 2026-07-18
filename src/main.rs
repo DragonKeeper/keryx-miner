@@ -279,37 +279,41 @@ fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
 /// user's ceiling. VRAM is CUDA-driver-sourced (`query_all_gpus_vram`), so `device_id`s match the
 /// devices the walk loads onto. Empty when PoM is disabled on this network; a single device-0 entry
 /// (highest tier ≤ ceiling) when no CUDA device is enumerated, so the fallback walk still has a tier.
-fn assign_pom_tiers(ceiling: keryx_miner::models::Tier) -> Vec<(u32, &'static keryx_miner::models::ModelSpec)> {
+/// Returns `(device_id, hardware_tier, representative_spec)` per GPU. The tier is the stable
+/// VRAM-picked hardware tier; the spec is the current-era model for that tier (the resident mining
+/// model is swapped per era by `pom_gpu::advance_mining_tier_if_due`, keyed by the tier recorded here).
+fn assign_pom_tiers(
+    ceiling: keryx_miner::models::Tier,
+) -> Vec<(u32, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> {
     if keryx_miner::pom::POM_ACTIVATION_DAA == u64::MAX {
         return Vec::new(); // PoM disabled on this network — serve only, don't mine possession.
     }
     let ceiling_rank = tier_rank(ceiling);
-    // PoM model + assignment floor for each tier ≤ ceiling, largest first.
-    let candidates: Vec<(u64, &'static keryx_miner::models::ModelSpec)> = pom_tier_ladder()
+    // Assignment floor + tier + pre-crossing (H2-era) model for each tier ≤ ceiling, largest first.
+    // The model is the pre-crossing one so a fresh chain starts on a valid, loadable tier; the era
+    // crossing swaps it to the H4 model at the boundary.
+    let candidates: Vec<(u64, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> = pom_tier_ladder()
         .iter()
         .filter(|(t, _)| tier_rank(*t) <= ceiling_rank)
         .filter_map(|(t, floor)| {
-            keryx_miner::models::specs_for(keryx_miner::models::staging_daa(), *t)
-                .iter()
-                .copied()
-                .find(|s| keryx_miner::models::is_pom_model(&s.model_id))
-                .map(|s| (*floor, s))
+            keryx_miner::models::pom_model_for_tier(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, *t)
+                .map(|s| (*floor, *t, s))
         })
         .collect();
 
-    let pick = |vram_mb: u64| -> Option<&'static keryx_miner::models::ModelSpec> {
-        candidates.iter().copied().find(|(floor, _)| *floor <= vram_mb).map(|(_, s)| s)
+    let pick = |vram_mb: u64| -> Option<(keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> {
+        candidates.iter().copied().find(|(floor, _, _)| *floor <= vram_mb).map(|(_, t, s)| (t, s))
     };
 
     let devices = keryx_miner::pom_gpu::query_all_gpus_vram();
     if devices.is_empty() {
         log::warn!("No CUDA device enumerated for PoM tier assignment — assigning the ceiling tier to device 0 (fallback).");
-        return candidates.first().map(|(_, s)| vec![(0u32, *s)]).unwrap_or_default();
+        return candidates.first().map(|(_, t, s)| vec![(0u32, *t, *s)]).unwrap_or_default();
     }
     let mut out = Vec::with_capacity(devices.len());
     for (id, vram_mb) in devices {
         match pick(vram_mb) {
-            Some(spec) => out.push((id as u32, spec)),
+            Some((t, spec)) => out.push((id as u32, t, spec)),
             None => log::warn!("PoM: GPU {} ({} MB VRAM) fits no tier ≤ the ceiling — it will not mine PoM.", id, vram_mb),
         }
     }
@@ -320,11 +324,11 @@ fn assign_pom_tiers(ceiling: keryx_miner::models::Tier) -> Vec<(u32, &'static ke
 /// Falls back to the `ceiling` tier's model when nothing was assigned (PoM disabled, or every GPU too
 /// small), so `ai:cap`/inference still have a lineup.
 fn lineup_from_assignments(
-    assignments: &[(u32, &'static keryx_miner::models::ModelSpec)],
+    assignments: &[(u32, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)],
     ceiling: keryx_miner::models::Tier,
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
     let mut union: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();
-    for (_, spec) in assignments {
+    for (_, _, spec) in assignments {
         if !union.iter().any(|s| s.model_id == spec.model_id) {
             union.push(*spec);
         }
@@ -683,10 +687,23 @@ async fn run() -> Result<(), Error> {
         "OPoI Phase-3 active — {} uncensored model(s) staged (legacy lineup dropped, post-fork).",
         specs_v2.len(),
     );
-    // Block until the uncensored lineup is fully downloaded before mining: never start hashing
-    // while a model this miner will serve is still downloading.
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
-        Ok(Ok(())) => info!("Model files ready — starting mining."),
+    // Prefetch EVERY model any assigned GPU may mine across the scheduled eras (pre-crossing H2 model
+    // now + H4 model at the crossing), so the era swap never stalls mining on a mid-run download.
+    let prefetch_set: &'static [&'static keryx_miner::models::ModelSpec] = {
+        let mut union: Vec<&'static keryx_miner::models::ModelSpec> = specs_v2.to_vec();
+        for (_, t, _) in &pom_assignments {
+            for s in keryx_miner::models::pom_models_all_eras(*t) {
+                if !union.iter().any(|x| x.model_id == s.model_id) {
+                    union.push(s);
+                }
+            }
+        }
+        Box::leak(union.into_boxed_slice())
+    };
+    // Block until every model this miner may mine/serve is downloaded before mining: never start
+    // hashing while a model is still downloading.
+    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(prefetch_set)).await {
+        Ok(Ok(())) => info!("Model files ready ({} across scheduled eras) — starting mining.", prefetch_set.len()),
         Ok(Err(e)) => {
             error!("OPoI v2 prefetch failed — refusing to mine without the post-hardfork lineup: {}", e);
             return Err(e.into());
@@ -705,8 +722,13 @@ async fn run() -> Result<(), Error> {
         // the inference GPU. The tier *index* is computed per block from the block DAA (it shifts at
         // the very-light H2 hardfork), so only the model is recorded here.
         keryx_miner::slm::set_pom_force_split(true);
-        for (device_id, spec) in &pom_assignments {
+        for (device_id, gpu_tier, spec) in &pom_assignments {
             let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+            // Record the stable hardware tier so the era crossing can recompute this GPU's model,
+            // and set the initial (pre-crossing / H2-era) model. advance_mining_tier_if_due swaps it
+            // to the H4 model at the crossing; on the first block template it also corrects the model
+            // to whatever era the chain tip is actually in.
+            keryx_miner::pom_gpu::set_device_tier(*device_id, *gpu_tier);
             keryx_miner::pom_gpu::set_mining_tier(*device_id, spec.model_id, gpath);
             info!("PoM: GPU {} → {} (index + GPU walk load lazily when PoM activates, DAA {}).",
                 device_id, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);

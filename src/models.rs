@@ -457,11 +457,12 @@ pub enum Tier {
 /// DAA-gated to mirror the node's `opoi_v2_activation`: one binary runs the legacy
 /// lineup before H and the uncensored lineup at/after H (hot-swapped at the crossing),
 /// so miners can upgrade before the hardfork without a flag-day restart.
-/// DAA the startup staging sites pin to select "the latest scheduled lineup". While H4 is
-/// unscheduled (`COIN_AGE_VERIFICATION_ACTIVATION_DAA == u64::MAX`) this is the H2 constant, so
-/// behaviour is unchanged. Once the H4 DAA is set, staging pins the H4 lineup directly — same
-/// operational pattern as the H2 rollout (stage the final lineup; a tier idles between binary
-/// release and the crossing rather than paying a double download + hot-swap).
+/// DAA marking the latest scheduled era for staging (VRAM ladder + the H4-era model in the prefetch
+/// union). While H4 is unscheduled (`COIN_AGE_VERIFICATION_ACTIVATION_DAA == u64::MAX`) this is the
+/// H2 constant, so behaviour is unchanged. Once the H4 DAA is set it is the H4 gate. The miner does
+/// NOT idle until the crossing: it stages the pre-crossing (H2) model as the initial mining model,
+/// prefetches both eras (`pom_models_all_eras`), and hot-swaps the resident model at the crossing
+/// (`pom_gpu::advance_mining_tier_if_due`).
 pub fn staging_daa() -> u64 {
     if h4_staged() {
         crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA
@@ -474,6 +475,29 @@ pub fn staging_daa() -> u64 {
 /// then targets the H4 lineup instead of H2.
 pub fn h4_staged() -> bool {
     crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA != u64::MAX
+}
+
+/// The PoM model a GPU on `tier` must mine at block `daa` — the era-correct single model, matching
+/// the node's per-block tier table. Drives the resident-model crossing swap: the mining loop keeps
+/// this model loaded, and the H2→H4 crossing swaps it in place at `daa >= H4`.
+pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
+    specs_for(daa, tier).iter().copied().find(|s| is_pom_model(&s.model_id))
+}
+
+/// Every PoM model a GPU on `tier` may mine across the currently-scheduled eras — the pre-crossing
+/// (H2) model and, once H4 is scheduled, the H4 model. Prefetched together at startup so the era
+/// crossing hot-swaps the resident mining model without stalling on a mid-run download.
+pub fn pom_models_all_eras(tier: Tier) -> Vec<&'static ModelSpec> {
+    let mut out: Vec<&'static ModelSpec> = Vec::new();
+    // Pre-crossing (H2) era = a DAA below any H4 gate; H4 era = staging_daa() (the H4 gate when set).
+    for daa in [VERY_LIGHT_ACTIVATION_DAA, staging_daa()] {
+        if let Some(s) = pom_model_for_tier(daa, tier) {
+            if !out.iter().any(|x| x.model_id == s.model_id) {
+                out.push(s);
+            }
+        }
+    }
+    out
 }
 
 pub fn specs_for(daa: u64, tier: Tier) -> &'static [&'static ModelSpec] {
