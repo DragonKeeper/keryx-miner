@@ -714,12 +714,14 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         Ok(g) => g.iter().map(|(d, t)| (*d, *t)).collect(),
         Err(_) => return,
     };
+    let mut swapped = false;
     for &(dev, tier) in &devices {
         let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
         let current = mining_tiers().lock().ok().and_then(|g| g.get(&dev).map(|(id, _)| *id));
         if current == Some(spec.model_id) {
             continue;
         }
+        swapped = true;
         let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         info!("PoM[gpu{}]: era crossing at DAA {} — mining model → {}.", dev, daa, spec.name);
         set_mining_tier(dev, spec.model_id, gguf.clone());
@@ -738,6 +740,25 @@ pub fn advance_mining_tier_if_due(daa: u64) {
             crate::llama_engine::unload();
         }
         uninstall(dev); // force a resident reload of the new model on the next ensure_installed
+    }
+    // The served lineup (`SUPPORTED_SPECS`) is boot-time state in slm and drives the coinbase
+    // `ai:cap` announcement + inference routing — without a refresh the miner keeps announcing
+    // and serving the previous era's model_ids after the crossing. Rebuild it as the union of
+    // era-correct models across all devices, and evict the cached inference engine so the next
+    // request loads from the new lineup instead of a model that is no longer served.
+    if swapped {
+        let mut union: Vec<&'static crate::models::ModelSpec> = Vec::new();
+        for &(_, tier) in &devices {
+            let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
+            if !union.iter().any(|s| s.model_id == spec.model_id) {
+                union.push(spec);
+            }
+        }
+        if !union.is_empty() {
+            // Leaked to satisfy the &'static lineup API — at most once per era crossing.
+            crate::slm::init_supported(Box::leak(union.into_boxed_slice()));
+            crate::slm::evict_engine();
+        }
     }
 }
 
