@@ -143,6 +143,11 @@ pub fn active_for(gguf: &str, gpu: usize) -> bool {
     }
 }
 
+/// The CUDA ordinal hosting the engine's resident model, if the engine is active.
+pub fn active_gpu() -> Option<usize> {
+    engine().lock().ok()?.as_ref().map(|e| e.gpu)
+}
+
 pub fn available() -> bool {
     match engine().lock() {
         Ok(g) => g.is_some(),
