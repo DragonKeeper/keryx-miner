@@ -25,12 +25,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=POM_FATBIN_NEXTGEN");
     println!("cargo:rerun-if-changed=cuda/pom_mine_legacy.fatbin");
     println!("cargo:rerun-if-changed=cuda/pom_mine_nextgen.fatbin");
+    let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
+        let pinned = "/home/slash/cuda-12.2/bin/nvcc";
+        if std::path::Path::new(pinned).exists() { pinned.to_string() } else { "nvcc".to_string() }
+    });
     {
         let out_dir = env::var("OUT_DIR").unwrap();
-        let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
-            let pinned = "/home/slash/cuda-12.2/bin/nvcc";
-            if std::path::Path::new(pinned).exists() { pinned.to_string() } else { "nvcc".to_string() }
-        });
         let sm_list = env::var("POM_SM_LIST").unwrap_or_else(|_| "90,89,86,80,75,70,61".to_string());
         let sms: Vec<String> = sm_list
             .split(',')
@@ -92,6 +92,132 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if target_arch == "x86_64" && target_os == "macos" {
         cc::Build::new().flag("-c").file("src/keccakf1600_x86-64-osx.s").compile("libkeccak.a");
+    }
+
+    // In-process llama.cpp engine: build `libkeryx-llama.so` next to the miner binary.
+    // llama.cpp is PINNED to b10015 — the SAME pin as hiveos/build-keryx-llama.sh and the
+    // byte-identity proof in tools/llama_zerodup_spike. Bump all together, then re-verify.
+    println!("cargo:rerun-if-changed=tools/keryx-llama/keryx_llama.cpp");
+    println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SKIP");
+    println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SRC");
+    println!("cargo:rerun-if-env-changed=KERYX_LLAMA_ARCHS");
+    if env::var("KERYX_LLAMA_SKIP").as_deref() == Ok("1") {
+        println!("cargo:warning=KERYX_LLAMA_SKIP=1 — libkeryx-llama.so not built; a prebuilt one must sit next to the miner binary or in-process llama tiers cannot be mined");
+    } else if target_arch == "x86_64" && target_os == "linux" {
+        build_keryx_llama(&nvcc)?;
+    }
+    Ok(())
+}
+
+const LLAMA_TAG: &str = "b10015";
+const LLAMA_ESCAPE_HINT: &str = "set KERYX_LLAMA_SKIP=1 to build the miner without it (a prebuilt libkeryx-llama.so must then be placed next to the binary)";
+
+/// Builds `libkeryx-llama.so` into the cargo profile dir (next to the miner binary):
+/// clones llama.cpp at `LLAMA_TAG` (cached under target/), builds its static libs via
+/// cmake (incremental — near no-op on rebuilds), then links the keryx wrapper.
+fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = std::path::PathBuf::from(env::var("OUT_DIR")?);
+    // OUT_DIR = target/<profile>/build/<crate>-<hash>/out
+    let profile_dir = out_dir.ancestors().nth(3).ok_or("cannot locate cargo profile dir from OUT_DIR")?;
+    let target_root = profile_dir.parent().ok_or("cannot locate cargo target dir")?;
+
+    let src = env::var("KERYX_LLAMA_SRC")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| target_root.join(format!("llama-src-{LLAMA_TAG}")));
+    if !src.join("CMakeLists.txt").exists() {
+        println!("cargo:warning=cloning llama.cpp {LLAMA_TAG} (first build only; use KERYX_LLAMA_SRC for an offline checkout)");
+        run(
+            "git clone of llama.cpp",
+            std::process::Command::new("git").args([
+                "clone", "--quiet", "--depth", "1", "--branch", LLAMA_TAG,
+                "https://github.com/ggml-org/llama.cpp",
+            ]).arg(&src),
+        )?;
+    }
+
+    let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
+    // "native" targets the GPU(s) present at build time; headless builders must pass
+    // an explicit list, e.g. KERYX_LLAMA_ARCHS="75;80;86;89;90".
+    let archs = env::var("KERYX_LLAMA_ARCHS").unwrap_or_else(|_| "native".to_string());
+    run(
+        "cmake configure of llama.cpp (if it cannot detect a GPU, set KERYX_LLAMA_ARCHS explicitly)",
+        std::process::Command::new("cmake")
+            .arg("-S").arg(&src)
+            .arg("-B").arg(&build_dir)
+            .args([
+                "-DGGML_CUDA=ON",
+                &format!("-DCMAKE_CUDA_ARCHITECTURES={archs}"),
+                "-DBUILD_SHARED_LIBS=OFF",
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                "-DLLAMA_CURL=OFF",
+                "-DGGML_NATIVE=OFF",
+                "-DGGML_CUDA_NCCL=OFF",
+                "-DCMAKE_BUILD_TYPE=Release",
+                &format!("-DCMAKE_CUDA_COMPILER={nvcc}"),
+            ]),
+    )?;
+    let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "8".to_string());
+    run(
+        "cmake build of llama.cpp static libs",
+        std::process::Command::new("cmake")
+            .arg("--build").arg(&build_dir)
+            .args(["--target", "llama", "-j", &jobs]),
+    )?;
+
+    let cuda_home = cuda_home_from_nvcc(nvcc)?;
+    let so = profile_dir.join("libkeryx-llama.so");
+    let lib = |p: &str| build_dir.join(p).into_os_string();
+    run(
+        "link of libkeryx-llama.so",
+        std::process::Command::new("g++")
+            .args(["-O2", "-std=c++17", "-shared", "-fPIC", "-fopenmp", "tools/keryx-llama/keryx_llama.cpp"])
+            .arg("-I").arg(src.join("include"))
+            .arg("-I").arg(src.join("ggml/include"))
+            .arg("-I").arg(src.join("src"))
+            .arg("-I").arg(src.join("common"))
+            .arg("-I").arg(cuda_home.join("include"))
+            .arg("-Wl,--start-group")
+            .arg(lib("src/libllama.a"))
+            .arg(lib("ggml/src/ggml-cuda/libggml-cuda.a"))
+            .arg(lib("ggml/src/libggml-cpu.a"))
+            .arg(lib("ggml/src/libggml.a"))
+            .arg(lib("ggml/src/libggml-base.a"))
+            .arg("-Wl,--end-group")
+            .arg(format!("-L{}", cuda_home.join("lib64").display()))
+            .arg(format!("-L{}", cuda_home.join("targets/x86_64-linux/lib").display()))
+            .args(["-lcudart", "-lcublas", "-lcublasLt"])
+            .arg(format!("-L{}", cuda_home.join("lib64/stubs").display()))
+            .arg(format!("-L{}", cuda_home.join("targets/x86_64-linux/lib/stubs").display()))
+            .args(["-lcuda", "-lpthread", "-ldl"])
+            .arg("-o").arg(&so),
+    )?;
+    Ok(())
+}
+
+/// Resolves the CUDA toolkit root for include/lib paths from the nvcc in use.
+fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let p = std::path::Path::new(nvcc);
+    if let Some(root) = p.parent().and_then(|bin| bin.parent()) {
+        if root.components().count() > 0 && root.join("include").exists() {
+            return Ok(root.to_path_buf());
+        }
+    }
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Ok(v) = env::var(var) {
+            return Ok(std::path::PathBuf::from(v));
+        }
+    }
+    let default = std::path::Path::new("/usr/local/cuda");
+    if default.exists() {
+        return Ok(default.to_path_buf());
+    }
+    Err(format!("cannot locate the CUDA toolkit root (needed to link libkeryx-llama.so); set CUDA_HOME, or {LLAMA_ESCAPE_HINT}").into())
+}
+
+fn run(desc: &str, cmd: &mut std::process::Command) -> Result<(), Box<dyn std::error::Error>> {
+    let status = cmd.status().map_err(|e| format!("{desc}: failed to launch: {e} — {LLAMA_ESCAPE_HINT}"))?;
+    if !status.success() {
+        return Err(format!("{desc} failed ({status}) — {LLAMA_ESCAPE_HINT}").into());
     }
     Ok(())
 }
