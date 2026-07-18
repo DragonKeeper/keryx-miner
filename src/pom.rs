@@ -1047,10 +1047,10 @@ pub const POM_LEVEL_ACTIVATION_DAA: u64 = 43_450_000;
 /// recompute-from-chunks proof (`build_proof_v2`: all K chunks the walk read, each Merkle-proven
 /// under R_T, no trace tree / no spot-check) instead of the 32/256-opening `build_proof`. The node
 /// switches its verifier at the SAME score (`coin_age_verification_activation`) — node↔miner
-/// lockstep, exactly like POM_LEVEL_ACTIVATION_DAA. Mainnet H4: 54_668_000 (2026-07-18 ~17:54
+/// lockstep, exactly like POM_LEVEL_ACTIVATION_DAA. Mainnet H4: 54_726_000 (2026-07-18 ~19:31
 /// UTC). MUST equal the node's MAINNET_PARAMS.coin_age_verification_activation (=
 /// H4_ACTIVATION_DAA). Testnet builds: 3_000.
-pub const COIN_AGE_VERIFICATION_ACTIVATION_DAA: u64 = 54_668_000;
+pub const COIN_AGE_VERIFICATION_ACTIVATION_DAA: u64 = 54_726_000;
 
 /// Per-tier resident possession indices, built lazily when PoM activates. A heterogeneous rig can
 /// mine several tiers at once (one per GPU), so the index is keyed by tier rather than a single
