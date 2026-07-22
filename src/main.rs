@@ -271,7 +271,7 @@ fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
 fn assign_pom_tiers(
     ceiling: keryx_miner::models::Tier,
 ) -> Vec<(u32, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> {
-    if keryx_miner::pom::POM_ACTIVATION_DAA == u64::MAX {
+    if keryx_miner::pom::pom_activation_daa() == u64::MAX {
         return Vec::new(); // PoM disabled on this network — serve only, don't mine possession.
     }
     let ceiling_rank = tier_rank(ceiling);

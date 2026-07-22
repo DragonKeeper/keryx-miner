@@ -3,7 +3,7 @@
 /// model_id = sha2-256(primary_weight_file) = CIDv0_bytes[2..34].
 /// Verifiable: decode the weight CID from base58btc, skip the 2-byte multihash prefix.
 ///
-/// Uncensored five-tier lineup, active at `COIN_AGE_VERIFICATION_ACTIVATION_DAA` (the H4
+/// Uncensored five-tier lineup, active at `coin_age_verification_activation_daa()` (the H4
 /// hardfork) — below that DAA this binary refuses to mine (`pom_tier_index` = None). Every
 /// model is untied so the in-process llama engine hosts walk + inference in one resident copy:
 ///   --very-light  EXAONE-4.0-1.2B  Q4_K_M (LG)       — 2 GB+
@@ -48,7 +48,7 @@ pub struct ModelSpec {
 }
 
 // ── H4 lineup ───────────────────────────────────────────────────
-// Active at `crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA` (the H4 hardfork). Every model is
+// Active at `crate::pom::coin_age_verification_activation_daa()` (the H4 hardfork). Every model is
 // UNTIED so the in-process llama engine hosts walk + inference in one resident copy;
 // `libkeryx-llama.so` is REQUIRED to serve them.
 // `tokenizer_cid` is empty: llama uses the tokenizer embedded in the GGUF, no separate file.
@@ -142,12 +142,12 @@ pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
     min_vram_mb: 30_000,
 };
 
-/// H5 tier-0 model — Qwen3-8B-abliterated, replacing EXAONE at `crate::pom::H5_ACTIVATION_DAA`
+/// H5 tier-0 model — Qwen3-8B-abliterated, replacing EXAONE at `crate::pom::h5_activation_daa()`
 /// to raise the tier-0 VRAM floor to ~6 GB (closes the "any 2 GB card mines tier 0" gap).
 /// ⚠️ PLACEHOLDER — the 0xDEADBEEF-prefixed `model_id` and empty `weight_cids` are sentinels.
 /// At H5 release, fill `model_id` = CIDv0[2..34] of the published Qwen3-8B GGUF, and `weight_cids`
 /// = its IPFS CID (mirror the node's `POM_TIERS_H5[0]` R_T). Never selected while H5 is dormant
-/// (`H5_ACTIVATION_DAA == u64::MAX`).
+/// (`h5_activation_daa() == u64::MAX`).
 pub const QWEN3_8B_ABLITERATED: ModelSpec = ModelSpec {
     name: "qwen3-8b-abliterated",
     model_id: [
@@ -179,12 +179,12 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     // H4 gate: below the flip this binary refuses to mine (None) — it never produces a
     // pre-H4-era block. MUST mirror the node's per-block tier table, recomputed from the block DAA.
-    if daa < crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA {
+    if daa < crate::pom::coin_age_verification_activation_daa() {
         return None;
     }
     // Tier 0 swaps model at H5: EXAONE below the gate, Qwen3-8B at/after. A model claimed on the
     // wrong side of H5 is not a valid tier (its R_T won't match the node's `POM_TIERS_H5`).
-    let h5 = daa >= crate::pom::H5_ACTIVATION_DAA;
+    let h5 = daa >= crate::pom::h5_activation_daa();
     if *model_id == EXAONE_4_0_1_2B.model_id {
         if h5 { None } else { Some(0) }
     } else if *model_id == QWEN3_8B_ABLITERATED.model_id {
@@ -214,7 +214,7 @@ pub enum Tier {
 /// True once the H5 hardfork has a scheduled DAA — startup staging (lineup + VRAM ladder) then
 /// targets the H5 lineup (tier-0 Qwen3-8B) instead of H4 (tier-0 EXAONE).
 pub fn h5_staged() -> bool {
-    crate::pom::H5_ACTIVATION_DAA != u64::MAX
+    crate::pom::h5_activation_daa() != u64::MAX
 }
 
 /// DAA marking the latest scheduled era for startup staging (VRAM ladder + initial mining model).
@@ -224,9 +224,9 @@ pub fn h5_staged() -> bool {
 /// crossing (`pom_gpu::advance_mining_tier_if_due`).
 pub fn staging_daa() -> u64 {
     if h5_staged() {
-        crate::pom::H5_ACTIVATION_DAA
+        crate::pom::h5_activation_daa()
     } else {
-        crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA
+        crate::pom::coin_age_verification_activation_daa()
     }
 }
 
@@ -235,7 +235,7 @@ pub fn staging_daa() -> u64 {
 pub fn pom_model_for_tier(daa: u64, tier: Tier) -> &'static ModelSpec {
     match tier {
         Tier::VeryLight => {
-            if daa >= crate::pom::H5_ACTIVATION_DAA {
+            if daa >= crate::pom::h5_activation_daa() {
                 &QWEN3_8B_ABLITERATED
             } else {
                 &EXAONE_4_0_1_2B
@@ -253,7 +253,7 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> &'static ModelSpec {
 /// crossing hot-swaps the resident mining model without stalling on a mid-run download.
 pub fn pom_models_all_eras(tier: Tier) -> Vec<&'static ModelSpec> {
     let mut out: Vec<&'static ModelSpec> = Vec::new();
-    for daa in [crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA, staging_daa()] {
+    for daa in [crate::pom::coin_age_verification_activation_daa(), staging_daa()] {
         let s = pom_model_for_tier(daa, tier);
         if !out.iter().any(|x| x.model_id == s.model_id) {
             out.push(s);

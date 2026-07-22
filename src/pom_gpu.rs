@@ -623,7 +623,7 @@ pub fn set_device_tier(device_id: u32, tier: crate::models::Tier) {
 }
 
 /// Hot-swap the resident mining model at the H4→H5 era crossing: when `daa` reaches
-/// `H5_ACTIVATION_DAA`, every tier-0 GPU switches EXAONE → Qwen3-8B in place, no restart. No-op
+/// `h5_activation_daa()`, every tier-0 GPU switches EXAONE → Qwen3-8B in place, no restart. No-op
 /// each block until a device's era-correct model actually changes. Called each tick from the loop,
 /// so a miner upgraded before the gate crosses over on its own.
 pub fn advance_mining_tier_if_due(daa: u64) {

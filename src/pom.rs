@@ -1041,15 +1041,45 @@ fn finalize_checkpoint_upper(
     Ok((checkpoints, total_levels, r_t))
 }
 
+/// Runtime network selector for every DAA activation gate below (plus the PoW salt gates in
+/// `pow::heavy_hash`). Set once at startup from the `--testnet` CLI flag, before any mining
+/// state is built. Runtime rather than a compile-time edit so ONE binary serves both networks —
+/// the testnet gate set MUST mirror the node's `TESTNET_PARAMS` exactly, the same node↔miner
+/// lockstep rule as the mainnet constants.
+static TESTNET_GATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Switches every activation gate (PoM + PoW salts) to its testnet value. Called once at
+/// startup when `--testnet` is passed, before mining starts.
+pub fn set_testnet(enabled: bool) {
+    TESTNET_GATES.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when the miner runs with testnet gate values (`--testnet`).
+#[inline(always)]
+pub fn is_testnet() -> bool {
+    TESTNET_GATES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Picks the gate value for the selected network (`--testnet`).
+#[inline(always)]
+fn gate(mainnet: u64, testnet: u64) -> u64 {
+    if is_testnet() {
+        testnet
+    } else {
+        mainnet
+    }
+}
+
 /// PoM possession activation DAA score — MUST match the node's `pom_activation`.
 /// `u64::MAX` = never (dormant): mining stays on legacy kHeavyHash, no proof produced.
 ///
-/// Testnet: `5_000` = mid-chain activation, to observe the kHeavyHash→PoM transition (incl.
-/// the difficulty drift: PoM ~30x slower → blocks slow at the cutover, then the DAA window
-/// recovers). Mainnet will need a difficulty reset at H.
 /// Mainnet: 37_780_000 (2026-06-26 18:00 UTC) — MUST equal the node's
 /// MAINNET_PARAMS.pom_activation = new(37_780_000).
-pub const POM_ACTIVATION_DAA: u64 = 37_780_000;
+/// Testnet: 0 (PoM from genesis) — node TESTNET_PARAMS.pom_activation = new(0).
+#[inline(always)]
+pub fn pom_activation_daa() -> u64 {
+    gate(37_780_000, 0)
+}
 
 /// H3 (PoM block-level hardfork) activation DAA score. At/after this score the block header
 /// commits to the winning walk's `final_state` (`pomFinalState`): the node hashes it into the
@@ -1063,25 +1093,37 @@ pub const POM_ACTIVATION_DAA: u64 = 37_780_000;
 ///
 /// Mainnet: 43_450_000 — picked 2026-07-05 08:49 UTC (tip 43,117,871) targeting activation
 /// ≈ 2026-07-05 18:00 UTC. MUST equal the node's MAINNET_PARAMS.pom_level_activation
-/// = new(43_450_000). Testnet builds: 2_000.
-pub const POM_LEVEL_ACTIVATION_DAA: u64 = 43_450_000;
+/// = new(43_450_000).
+/// Testnet: 1 — node TESTNET_PARAMS.pom_level_activation = new(1).
+#[inline(always)]
+pub fn pom_level_activation_daa() -> u64 {
+    gate(43_450_000, 1)
+}
 
 /// H4 (coin-age + PoM verifier v2) activation DAA score. At/after this score the miner builds the
 /// recompute-from-chunks proof (`build_proof_v2`: all K chunks the walk read, each Merkle-proven
 /// under R_T, no trace tree / no spot-check) instead of the 32/256-opening `build_proof`. The node
 /// switches its verifier at the SAME score (`coin_age_verification_activation`) — node↔miner
-/// lockstep, exactly like POM_LEVEL_ACTIVATION_DAA. Mainnet H4: 54_766_000 (2026-07-18 ~20:31
+/// lockstep, exactly like `pom_level_activation_daa`. Mainnet H4: 54_766_000 (2026-07-18 ~20:31
 /// UTC). MUST equal the node's MAINNET_PARAMS.coin_age_verification_activation (=
-/// H4_ACTIVATION_DAA). Testnet builds: 3_000.
-pub const COIN_AGE_VERIFICATION_ACTIVATION_DAA: u64 = 54_766_000;
+/// H4_ACTIVATION_DAA).
+/// Testnet: 3_000 — node TESTNET_PARAMS.coin_age_verification_activation = new(3_000).
+#[inline(always)]
+pub fn coin_age_verification_activation_daa() -> u64 {
+    gate(54_766_000, 3_000)
+}
 
 /// H5 activation DAA score. At/after this score the possession walk switches from the frozen v1
 /// XOR-fold (`transition_v1`) to the non-foldable mix64-chained `transition_v2`, both on the GPU
 /// kernel (`pom_mine.cu`, `walk_v2` param) and the CPU walk/proof path — closing the pre-H5 fold
 /// shortcut. MUST equal the node's `MAINNET_PARAMS.h5_activation` (= node `H5_ACTIVATION_DAA`),
-/// node↔miner lockstep exactly like `COIN_AGE_VERIFICATION_ACTIVATION_DAA`. `u64::MAX` = dormant
-/// until H5 is scheduled; set the real DAA at release. Testnet builds: 3_000.
-pub const H5_ACTIVATION_DAA: u64 = u64::MAX;
+/// node↔miner lockstep exactly like `coin_age_verification_activation_daa`. `u64::MAX` = dormant
+/// until H5 is scheduled; set the real mainnet DAA at release.
+/// Testnet: 3_000 — node TESTNET_PARAMS.h5_activation = new(3_000) (E2E crossing + hot-swap).
+#[inline(always)]
+pub fn h5_activation_daa() -> u64 {
+    gate(u64::MAX, 3_000)
+}
 
 /// Per-tier resident possession indices, built lazily when PoM activates. A heterogeneous rig can
 /// mine several tiers at once (one per GPU), so the index is keyed by tier rather than a single

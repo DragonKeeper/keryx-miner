@@ -110,7 +110,10 @@ pub struct Opt {
     #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
     port: Option<u16>,
 
-    #[clap(long, help = "Use testnet instead of mainnet [default: false]")]
+    #[clap(
+        long,
+        help = "Use testnet instead of mainnet: default port 22211 and testnet DAA activation gates (PoM/H3 from genesis, H4/H5 at 3000) [default: false]"
+    )]
     testnet: bool,
 
     #[clap(short = 't', long = "threads", help = "Amount of CPU miner threads to launch [default: 0]")]
@@ -180,6 +183,9 @@ fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {
 
 impl Opt {
     pub fn process(&mut self) -> Result<(), Error> {
+        // Switch every DAA activation gate (PoM + PoW salts) to its testnet value before any
+        // mining state is built — see `pom::set_testnet`.
+        keryx_miner::pom::set_testnet(self.testnet);
         if self.recover_escrow {
             return Ok(());
         }
