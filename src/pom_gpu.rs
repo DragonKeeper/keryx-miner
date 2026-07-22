@@ -133,6 +133,7 @@ impl LoadedPomKernel {
         target_le: &[u8; 32],
         start: u64,
         batch: u64,
+        walk_v2: u32,
     ) -> Result<Option<u64>> {
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
@@ -144,7 +145,7 @@ impl LoadedPomKernel {
         let (prefix_ptr, _prefix_guard) = prefix_dev.device_ptr(stream);
         let (winner_ptr, _winner_guard) = winner.device_ptr(stream);
 
-        let mut params: [*mut c_void; 17] = [
+        let mut params: [*mut c_void; 18] = [
             (&bases_ptr as *const _ as *mut c_void),
             (&prefix_ptr as *const _ as *mut c_void),
             (&t_count as *const _ as *mut c_void),
@@ -162,6 +163,7 @@ impl LoadedPomKernel {
             (&start as *const _ as *mut c_void),
             (&batch as *const _ as *mut c_void),
             (&winner_ptr as *const _ as *mut c_void),
+            (&walk_v2 as *const _ as *mut c_void),
         ];
 
         unsafe { result::launch_kernel(self.function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
@@ -496,7 +498,7 @@ impl PomGpuMiner {
     /// is `<= target_le`, or None. `target_le` is the header's compact target as 32 LE bytes.
     /// `h3` salts the pph words host-side (POM_H3_PPH_SALT) — the kernel itself is era-agnostic,
     /// it folds whatever words it receives, so no PTX change at the H3 gate.
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool) -> Result<Option<u64>> {
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool) -> Result<Option<u64>> {
         // Worker threads rotate; make sure this device's context is current before raw launches.
         self.ctx.bind_to_thread()?;
         let p_words = crate::pom::pph_words_for_era(pre_pow_hash, h3);
@@ -511,6 +513,7 @@ impl PomGpuMiner {
             target_le,
             start,
             batch,
+            walk_v2 as u32,
         )
     }
 }
@@ -578,12 +581,12 @@ pub fn is_loading() -> bool {
 }
 
 /// Convenience: search a nonce batch via the installed miner for a specific device.
-pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool) -> Option<u64> {
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool) -> Option<u64> {
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3).ok().flatten()
+    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2).ok().flatten()
 }
 
 /// Per-GPU mining-tier identity for rebuilds: `device_id -> (model_id, gguf_path)`. A heterogeneous

@@ -141,13 +141,34 @@ pub fn seed_state(pow_seed: u64) -> u64 {
     mix64(pow_seed ^ SEED_SALT)
 }
 
+/// Pre-H5 possession transition (FROZEN — produces all blocks below `H5_ACTIVATION_DAA`). The 4
+/// chunk words are XOR-folded into one accumulator before a single `mix64`, so only their XOR
+/// (8 bytes) is load-bearing. Kept verbatim for historical parity with the node's `transition_v1`.
 #[inline]
-pub fn transition(state: u64, chunk: &[u64; CHUNK_WORDS]) -> u64 {
+pub fn transition_v1(state: u64, chunk: &[u64; CHUNK_WORDS]) -> u64 {
     let mut h = state;
     for &w in chunk.iter() {
         h ^= w;
     }
     mix64(h)
+}
+
+/// H5 possession transition (active at/after `H5_ACTIVATION_DAA`). `mix64` is chained through each
+/// of the 4 chunk words, so all 32 bytes are load-bearing and order-dependent — the v1 fold
+/// shortcut is closed. Byte-exact mirror of the node's `transition_v2`.
+#[inline]
+pub fn transition_v2(state: u64, chunk: &[u64; CHUNK_WORDS]) -> u64 {
+    let mut h = state;
+    for &w in chunk.iter() {
+        h = mix64(h ^ w);
+    }
+    h
+}
+
+/// Selects the era transition by `walk_v2` (from `H5_ACTIVATION_DAA` on the block's daa_score).
+#[inline]
+pub fn transition(state: u64, chunk: &[u64; CHUNK_WORDS], walk_v2: bool) -> u64 {
+    if walk_v2 { transition_v2(state, chunk) } else { transition_v1(state, chunk) }
 }
 
 #[inline]
@@ -323,11 +344,11 @@ pub fn challenges(pre_pow_hash: &[u8; 32], nonce: u64, trace_root: &[u8; 32], po
 
 /// The hot search walk: K data-dependent reads, returns only `state[K]` (no trace recording).
 /// This is the per-nonce work; on GPU (slice 3b) this becomes the kernel over VRAM weights.
-pub fn walk_final<F: Fn(u64) -> [u64; CHUNK_WORDS]>(seed: u64, n_chunks: u64, k: u32, read_chunk: F) -> u64 {
+pub fn walk_final<F: Fn(u64) -> [u64; CHUNK_WORDS]>(seed: u64, n_chunks: u64, k: u32, read_chunk: F, walk_v2: bool) -> u64 {
     let mut state = seed;
     let mut off = state % n_chunks;
     for _ in 0..k {
-        state = transition(state, &read_chunk(off));
+        state = transition(state, &read_chunk(off), walk_v2);
         off = state % n_chunks;
     }
     state
@@ -352,7 +373,8 @@ pub fn mine_pom(
 ) -> Option<(u64, PomProof)> {
     for nonce in nonce_start..nonce_start.saturating_add(max_nonces) {
         let seed = pom_block_seed(pre_pow_hash, timestamp, nonce, h3);
-        let final_state = walk_final(seed, index.n_chunks, k, |o| index.read_chunk(o));
+        // mine_pom pairs with the v1 spot-check `build_proof`, so the search walk stays v1.
+        let final_state = walk_final(seed, index.n_chunks, k, |o| index.read_chunk(o), false);
         if le_leq(&pom_pow_value(final_state, pre_pow_hash, h3), target) {
             let proof = build_proof(tier, pre_pow_hash, nonce, seed, index.n_chunks, k, t, |o| index.read_chunk(o), |o| index.merkle_path(o), h3);
             return Some((nonce, proof));
@@ -387,7 +409,7 @@ where
     trace.push(state);
     let mut off = state % n_chunks;
     for _ in 0..k {
-        state = transition(state, &read_chunk(off));
+        state = transition_v1(state, &read_chunk(off));
         trace.push(state);
         off = state % n_chunks;
     }
@@ -440,6 +462,7 @@ pub fn build_proof_v2<F, WP>(
     read_chunk: F,
     weight_path: WP,
     h3: bool,
+    walk_v2: bool,
 ) -> PomProof
 where
     F: Fn(u64) -> [u64; CHUNK_WORDS],
@@ -451,7 +474,7 @@ where
         let off = state % n_chunks;
         let chunk_words = read_chunk(off);
         steps.push(PomStep { chunk: words_to_bytes(&chunk_words), weight_path: weight_path(off) });
-        state = transition(state, &chunk_words);
+        state = transition(state, &chunk_words, walk_v2);
     }
     let final_state = state;
     let pow_value = pom_pow_value(final_state, pre_pow_hash, h3);
@@ -471,7 +494,7 @@ where
 /// Self-check a built v2 proof before submit — same logic the node's `verify_pom_proof_v2` runs.
 /// Cheap insurance against emitting a block the node will reject.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_proof_v2(proof: &PomProof, pre_pow_hash: &[u8; 32], seed: u64, n_chunks: u64, k: u32, r_t: &[u8; 32], target: &[u8; 32], h3: bool) -> bool {
+pub fn verify_proof_v2(proof: &PomProof, pre_pow_hash: &[u8; 32], seed: u64, n_chunks: u64, k: u32, r_t: &[u8; 32], target: &[u8; 32], h3: bool, walk_v2: bool) -> bool {
     let steps = match &proof.steps_v2 {
         Some(s) if s.len() == k as usize => s,
         _ => return false,
@@ -489,7 +512,7 @@ pub fn verify_proof_v2(proof: &PomProof, pre_pow_hash: &[u8; 32], seed: u64, n_c
         if !verify_merkle(blake(&step.chunk), off, &step.weight_path, r_t) {
             return false;
         }
-        state = transition(state, &chunk_to_words(&step.chunk));
+        state = transition(state, &chunk_to_words(&step.chunk), walk_v2);
     }
     if state != proof.final_state {
         return false;
@@ -530,7 +553,7 @@ pub fn verify_proof(pre_pow_hash: &[u8; 32], nonce: u64, seed: u64, proof: &PomP
         if !verify_merkle(blake(&op.chunk), off, &op.weight_path, r_t) {
             return false;
         }
-        let state_after = transition(op.state_before, &chunk_to_words(&op.chunk));
+        let state_after = transition_v1(op.state_before, &chunk_to_words(&op.chunk));
         if !verify_merkle(trace_leaf(state_after), i + 1, &op.trace_path_after, &proof.trace_root) {
             return false;
         }
@@ -1052,6 +1075,14 @@ pub const POM_LEVEL_ACTIVATION_DAA: u64 = 43_450_000;
 /// H4_ACTIVATION_DAA). Testnet builds: 3_000.
 pub const COIN_AGE_VERIFICATION_ACTIVATION_DAA: u64 = 54_766_000;
 
+/// H5 activation DAA score. At/after this score the possession walk switches from the frozen v1
+/// XOR-fold (`transition_v1`) to the non-foldable mix64-chained `transition_v2`, both on the GPU
+/// kernel (`pom_mine.cu`, `walk_v2` param) and the CPU walk/proof path — closing the pre-H5 fold
+/// shortcut. MUST equal the node's `MAINNET_PARAMS.h5_activation` (= node `H5_ACTIVATION_DAA`),
+/// node↔miner lockstep exactly like `COIN_AGE_VERIFICATION_ACTIVATION_DAA`. `u64::MAX` = dormant
+/// until H5 is scheduled; set the real DAA at release. Testnet builds: 3_000.
+pub const H5_ACTIVATION_DAA: u64 = u64::MAX;
+
 /// Per-tier resident possession indices, built lazily when PoM activates. A heterogeneous rig can
 /// mine several tiers at once (one per GPU), so the index is keyed by tier rather than a single
 /// process-wide slot. Each tier's index is built once and shared (`Arc`) across every GPU on it.
@@ -1370,21 +1401,46 @@ mod tests {
         let pph = blake(b"v2-pph");
         let seed = pom_block_seed(&pph, 111, 0xabc, true);
 
-        let proof = build_proof_v2(3, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true);
+        let proof = build_proof_v2(3, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true, false);
         assert_eq!(proof.tier, 3);
         assert!(proof.steps_v2.as_ref().unwrap().len() == k as usize);
         assert!(proof.openings.is_empty() && proof.trace_root == [0u8; 32]);
-        assert!(verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
+        assert!(verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, false));
 
         // Wrong seed / wrong root / wrong target all fail the self-check.
-        assert!(!verify_proof_v2(&proof, &pph, seed ^ 1, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
-        assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &blake(b"wrong"), &[0xff; 32], true));
-        assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0u8; 32], true));
+        assert!(!verify_proof_v2(&proof, &pph, seed ^ 1, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, false));
+        assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &blake(b"wrong"), &[0xff; 32], true, false));
+        assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0u8; 32], true, false));
 
         // borsh wire round-trips through to_wire_bytes (full struct for a v2 proof).
         let bytes = proof.to_wire_bytes();
         let back: PomProof = borsh::from_slice(&bytes).unwrap();
-        assert!(verify_proof_v2(&back, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true));
+        assert!(verify_proof_v2(&back, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, false));
+    }
+
+    /// H5 era-gating of the walk: the frozen v1 fold and the mix64-chained v2 walk produce different
+    /// final states from the same weights/seed, and a proof built for one era is rejected when
+    /// re-walked under the other. Mirrors the node's `v2_walk_era_gating`.
+    #[test]
+    fn v2_walk_era_gating() {
+        let k = 256u32;
+        let idx = synth_index(4096);
+        let pph = blake(b"h5-era");
+        let seed = pom_block_seed(&pph, 1, 42, true);
+
+        let p_v1 = build_proof_v2(0, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true, false);
+        let p_v2 = build_proof_v2(0, &pph, seed, idx.n_chunks, k, |o| idx.read_chunk(o), |o| idx.merkle_path(o), true, true);
+
+        // Same weights + seed, different walk -> different derived final_state.
+        assert_ne!(p_v1.final_state, p_v2.final_state);
+
+        // Each proof self-checks only under its own era.
+        assert!(verify_proof_v2(&p_v1, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, false));
+        assert!(verify_proof_v2(&p_v2, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, true));
+
+        // Cross-era: re-walking with the wrong transition diverges -> rejected.
+        assert!(!verify_proof_v2(&p_v2, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, false));
+        assert!(!verify_proof_v2(&p_v1, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, true));
     }
 
     /// A pre-H4 proof MUST wire-encode byte-identically to the 7-field `PomProofPreH4` layout —

@@ -183,8 +183,11 @@ impl State {
 
         // H3 salts the pph words feeding both PoM folds (forced update — POM_H3_PPH_SALT).
         let h3 = self.daa_score >= pom::POM_LEVEL_ACTIVATION_DAA;
+        // H5: non-foldable mix64-chained walk at/after the gate. MUST match the GPU search era
+        // (`pom_gpu::mine(.., walk_v2)`) or the CPU rebuild derives a different final_state.
+        let walk_v2 = self.daa_score >= pom::H5_ACTIVATION_DAA;
         let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3);
-        let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o));
+        let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), walk_v2);
         if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
             return None;
         }
@@ -193,7 +196,7 @@ impl State {
         // 32/256-opening proof. Node switches its verifier at the SAME score — lockstep.
         let h4 = self.daa_score >= pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA;
         let proof = if h4 {
-            pom::build_proof_v2(tier, &pph, seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), |o| index.merkle_path(o), h3)
+            pom::build_proof_v2(tier, &pph, seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), |o| index.merkle_path(o), h3, walk_v2)
         } else {
             pom::build_proof(
                 tier,
