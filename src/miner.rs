@@ -348,6 +348,10 @@ impl MinerManager {
                                     None => { state = None; continue; }
                                 }
                             }
+                            // H5 era crossing: swap tier-0's resident model (EXAONE → Qwen3-8B) in
+                            // place at the gate before (re)installing, so an already-running miner
+                            // crosses over without a restart.
+                            keryx_miner::pom_gpu::advance_mining_tier_if_due(daa);
                             keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa);
                         }
                         let h3 = daa >= keryx_miner::pom::POM_LEVEL_ACTIVATION_DAA;

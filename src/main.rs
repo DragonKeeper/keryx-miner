@@ -279,7 +279,16 @@ fn assign_pom_tiers(
     let candidates: Vec<(u64, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> = POM_TIER_LADDER
         .iter()
         .filter(|(t, _)| tier_rank(*t) <= ceiling_rank)
-        .map(|(t, floor)| (*floor, *t, keryx_miner::models::spec_for_tier(*t)))
+        .map(|(t, floor)| {
+            // H5 raises the tier-0 (VeryLight) VRAM floor to 6 GB once staged (Qwen3-8B replaces
+            // EXAONE); other tiers keep their PR#19 headroom floors untouched.
+            let floor = if *t == keryx_miner::models::Tier::VeryLight && keryx_miner::models::h5_staged() {
+                6_000
+            } else {
+                *floor
+            };
+            (floor, *t, keryx_miner::models::spec_for_tier(*t))
+        })
         .collect();
 
     let pick = |vram_mb: u64| -> Option<(keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> {
@@ -318,6 +327,31 @@ fn lineup_from_assignments(
         return Box::leak(vec![keryx_miner::models::spec_for_tier(ceiling)].into_boxed_slice());
     }
     // Leaked once at startup to keep the &'static API of init_supported / prefetch.
+    Box::leak(union.into_boxed_slice())
+}
+
+/// The prefetch lineup = every model each assigned tier may mine across the currently-scheduled
+/// eras (`pom_models_all_eras`), so the H5 crossing hot-swaps without a mid-run download stall.
+/// While H5 is unscheduled this equals `lineup_from_assignments` (only the current-era model).
+fn prefetch_lineup_from_assignments(
+    assignments: &[(u32, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)],
+    ceiling: keryx_miner::models::Tier,
+) -> &'static [&'static keryx_miner::models::ModelSpec] {
+    let mut union: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();
+    for (_, gpu_tier, _) in assignments {
+        for spec in keryx_miner::models::pom_models_all_eras(*gpu_tier) {
+            if !union.iter().any(|s| s.model_id == spec.model_id) {
+                union.push(spec);
+            }
+        }
+    }
+    if union.is_empty() {
+        for spec in keryx_miner::models::pom_models_all_eras(ceiling) {
+            if !union.iter().any(|s| s.model_id == spec.model_id) {
+                union.push(spec);
+            }
+        }
+    }
     Box::leak(union.into_boxed_slice())
 }
 
@@ -652,14 +686,16 @@ async fn run() -> Result<(), Error> {
     // VRAM holds (small cards downgrade instead of failing; big cards are not pushed past the
     // ceiling). VRAM is CUDA-driver-sourced so device_ids match the devices the walk loads onto.
     let pom_assignments = assign_pom_tiers(tier);
-    // The served lineup (ai:cap + prefetch) = the union of distinct models across all GPUs.
+    // The served/announced lineup (ai:cap) = the current-era models across all GPUs.
     let specs = lineup_from_assignments(&pom_assignments, tier);
     keryx_miner::slm::init_supported(specs);
     log::debug!("OPoI Phase-3 active — {} model(s) staged.", specs.len());
-    // Block until every model this miner may mine/serve is downloaded before mining: never start
-    // hashing while a model is still downloading.
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs)).await {
-        Ok(Ok(())) => info!("Model files ready ({}) — starting mining.", specs.len()),
+    // Prefetch BOTH scheduled eras so the H5 crossing hot-swaps without a mid-run download stall
+    // (equals `specs` while H5 is unscheduled). Block until every such model is downloaded before
+    // mining: never start hashing while a model is still downloading.
+    let prefetch_specs = prefetch_lineup_from_assignments(&pom_assignments, tier);
+    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(prefetch_specs)).await {
+        Ok(Ok(())) => info!("Model files ready ({}) — starting mining.", prefetch_specs.len()),
         Ok(Err(e)) => {
             error!("Model prefetch failed — refusing to mine without the lineup: {}", e);
             return Err(e.into());
@@ -674,11 +710,13 @@ async fn run() -> Result<(), Error> {
     // active for the block being mined. Here we only record cheap config.
     if !pom_assignments.is_empty() {
         // The tier *index* is computed per block from the block DAA (None below the H4 gate —
-        // this binary refuses to mine pre-H4 blocks), so only the model is recorded here.
-        for (device_id, _gpu_tier, spec) in &pom_assignments {
+        // this binary refuses to mine pre-H4 blocks), so only the model is recorded here. The
+        // fixed hardware tier is recorded too, so the H5 era crossing can hot-swap tier 0's model.
+        for (device_id, gpu_tier, spec) in &pom_assignments {
             let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
             keryx_miner::pom_gpu::set_mining_tier(*device_id, spec.model_id, gpath);
-            info!("PoM: GPU {} → {} (index + GPU walk load lazily once the H4 lineup is active).",
+            keryx_miner::pom_gpu::set_device_tier(*device_id, *gpu_tier);
+            info!("PoM: GPU {} → {} (index + GPU walk load lazily once the lineup is active).",
                 device_id, spec.dir_name);
         }
     }

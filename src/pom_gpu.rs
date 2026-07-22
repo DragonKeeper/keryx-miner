@@ -605,6 +605,76 @@ pub fn set_mining_tier(device_id: u32, model_id: [u8; 32], gguf_path: String) {
     }
 }
 
+/// Per-GPU **hardware** tier (VRAM-derived, DAA-independent). Distinct from `mining_tiers` (the
+/// per-GPU *model*, which the H5 crossing swaps): a device keeps its hardware tier for life; only
+/// the model that tier mines changes at the era boundary.
+static DEVICE_TIERS: OnceLock<Mutex<HashMap<u32, crate::models::Tier>>> = OnceLock::new();
+
+fn device_tiers() -> &'static Mutex<HashMap<u32, crate::models::Tier>> {
+    DEVICE_TIERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record a GPU's fixed hardware tier so the era crossing can look up which model that tier must
+/// mine at the new DAA (`pom_model_for_tier`).
+pub fn set_device_tier(device_id: u32, tier: crate::models::Tier) {
+    if let Ok(mut g) = device_tiers().lock() {
+        g.insert(device_id, tier);
+    }
+}
+
+/// Hot-swap the resident mining model at the H4→H5 era crossing: when `daa` reaches
+/// `H5_ACTIVATION_DAA`, every tier-0 GPU switches EXAONE → Qwen3-8B in place, no restart. No-op
+/// each block until a device's era-correct model actually changes. Called each tick from the loop,
+/// so a miner upgraded before the gate crosses over on its own.
+pub fn advance_mining_tier_if_due(daa: u64) {
+    let devices: Vec<(u32, crate::models::Tier)> = match device_tiers().lock() {
+        Ok(g) => g.iter().map(|(d, t)| (*d, *t)).collect(),
+        Err(_) => return,
+    };
+    let mut swapped = false;
+    for &(dev, tier) in &devices {
+        let spec = crate::models::pom_model_for_tier(daa, tier);
+        let current = mining_tiers().lock().ok().and_then(|g| g.get(&dev).map(|(id, _)| *id));
+        if current == Some(spec.model_id) {
+            continue;
+        }
+        swapped = true;
+        let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+        info!("PoM[gpu{}]: era crossing at DAA {} — mining model → {}.", dev, daa, spec.name);
+        set_mining_tier(dev, spec.model_id, gguf.clone());
+        // The host possession index is keyed by tier POSITION and the crossing swaps which model
+        // occupies that position (tier 0: EXAONE → Qwen3-8B), so the pre-crossing index must be
+        // dropped — otherwise `ensure_installed` keeps it (key present) and the gather/index
+        // N-guard refuses to mine forever.
+        if let Some(t) = crate::models::pom_tier_index(&spec.model_id, daa) {
+            crate::pom::clear_index(t);
+        }
+        // Same staleness for the in-process llama engine: `ensure_loaded` is load-once, so after the
+        // crossing it would keep hosting the previous era's model. Unload it when it lives on this
+        // GPU with a different GGUF so the next `ensure_installed` brings up the new model.
+        if crate::llama_engine::active_gpu() == Some(dev as usize) && !crate::llama_engine::active_for(&gguf, dev as usize) {
+            crate::llama_engine::unload();
+        }
+        uninstall(dev); // force a resident reload of the new model on the next ensure_installed
+    }
+    // The served lineup (`SUPPORTED_SPECS`) drives the coinbase `ai:cap` announcement + inference
+    // routing — refresh it as the union of era-correct models so the miner stops announcing the
+    // previous era's model_ids after the crossing.
+    if swapped {
+        let mut union: Vec<&'static crate::models::ModelSpec> = Vec::new();
+        for &(_, tier) in &devices {
+            let spec = crate::models::pom_model_for_tier(daa, tier);
+            if !union.iter().any(|s| s.model_id == spec.model_id) {
+                union.push(spec);
+            }
+        }
+        if !union.is_empty() {
+            // Leaked to satisfy the &'static lineup API — at most once per era crossing.
+            crate::slm::init_supported(Box::leak(union.into_boxed_slice()));
+        }
+    }
+}
+
 /// Ensure the GPU miner is installed; if an inference evicted the mining model, reload it
 /// (resident again) and rebuild the zero-dup gather. Heavy (model reload) but only when needed —
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if

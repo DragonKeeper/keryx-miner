@@ -142,11 +142,34 @@ pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
     min_vram_mb: 30_000,
 };
 
+/// H5 tier-0 model — Qwen3-8B-abliterated, replacing EXAONE at `crate::pom::H5_ACTIVATION_DAA`
+/// to raise the tier-0 VRAM floor to ~6 GB (closes the "any 2 GB card mines tier 0" gap).
+/// ⚠️ PLACEHOLDER — the 0xDEADBEEF-prefixed `model_id` and empty `weight_cids` are sentinels.
+/// At H5 release, fill `model_id` = CIDv0[2..34] of the published Qwen3-8B GGUF, and `weight_cids`
+/// = its IPFS CID (mirror the node's `POM_TIERS_H5[0]` R_T). Never selected while H5 is dormant
+/// (`H5_ACTIVATION_DAA == u64::MAX`).
+pub const QWEN3_8B_ABLITERATED: ModelSpec = ModelSpec {
+    name: "qwen3-8b-abliterated",
+    model_id: [
+        0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &[""],
+    dir_name: "Qwen3-8B-abliterated",
+    // ~4.6 GB Q4_K_S weights + ~1.2 GB KV/workspace → fits a 6 GB card (measured 5,409 MiB @ ctx 4096).
+    min_vram_mb: 6_000,
+};
+
 /// Whether `model_id` is one of the Proof-of-Model tier models (any era). DAA-independent —
 /// used at startup to pick a mineable PoM model before any block DAA is known (the tier *index*
 /// is then computed per block via `pom_tier_index`).
 pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
     *model_id == EXAONE_4_0_1_2B.model_id
+        || *model_id == QWEN3_8B_ABLITERATED.model_id
         || *model_id == MISTRAL_7B_V03.model_id
         || *model_id == GLM_4_9B_0414.model_id
         || *model_id == QWEN3_6_27B.model_id
@@ -155,13 +178,17 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
 
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     // H4 gate: below the flip this binary refuses to mine (None) — it never produces a
-    // pre-H4-era block. MUST mirror the node's `POM_TIERS_H4` order, recomputed per block
-    // from that block's DAA.
+    // pre-H4-era block. MUST mirror the node's per-block tier table, recomputed from the block DAA.
     if daa < crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA {
         return None;
     }
+    // Tier 0 swaps model at H5: EXAONE below the gate, Qwen3-8B at/after. A model claimed on the
+    // wrong side of H5 is not a valid tier (its R_T won't match the node's `POM_TIERS_H5`).
+    let h5 = daa >= crate::pom::H5_ACTIVATION_DAA;
     if *model_id == EXAONE_4_0_1_2B.model_id {
-        Some(0)
+        if h5 { None } else { Some(0) }
+    } else if *model_id == QWEN3_8B_ABLITERATED.model_id {
+        if h5 { Some(0) } else { None }
     } else if *model_id == MISTRAL_7B_V03.model_id {
         Some(1)
     } else if *model_id == GLM_4_9B_0414.model_id {
@@ -184,13 +211,36 @@ pub enum Tier {
     VeryHigh,
 }
 
-/// The single model a hardware tier mines AND serves — one flag = one model. A PoM GPU is
-/// bound to its tier (serving a lower tier would mean unloading the mined model and pausing
-/// mining); multi-tier coverage is a network property (different miners per tier), not a
-/// per-GPU one.
-pub fn spec_for_tier(tier: Tier) -> &'static ModelSpec {
+/// True once the H5 hardfork has a scheduled DAA — startup staging (lineup + VRAM ladder) then
+/// targets the H5 lineup (tier-0 Qwen3-8B) instead of H4 (tier-0 EXAONE).
+pub fn h5_staged() -> bool {
+    crate::pom::H5_ACTIVATION_DAA != u64::MAX
+}
+
+/// DAA marking the latest scheduled era for startup staging (VRAM ladder + initial mining model).
+/// While H5 is unscheduled this is the H4 gate, so behaviour is unchanged; once H5 is scheduled it
+/// is the H5 gate. The miner does NOT idle until the crossing — it stages the pre-crossing (H4)
+/// model, prefetches both eras (`pom_models_all_eras`), and hot-swaps the resident model at the
+/// crossing (`pom_gpu::advance_mining_tier_if_due`).
+pub fn staging_daa() -> u64 {
+    if h5_staged() {
+        crate::pom::H5_ACTIVATION_DAA
+    } else {
+        crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA
+    }
+}
+
+/// The era-correct single model a hardware `tier` mines AND serves at block `daa` — matching the
+/// node's per-block tier table. Only tier 0 is era-dependent (EXAONE < H5, Qwen3-8B at/after).
+pub fn pom_model_for_tier(daa: u64, tier: Tier) -> &'static ModelSpec {
     match tier {
-        Tier::VeryLight => &EXAONE_4_0_1_2B,
+        Tier::VeryLight => {
+            if daa >= crate::pom::H5_ACTIVATION_DAA {
+                &QWEN3_8B_ABLITERATED
+            } else {
+                &EXAONE_4_0_1_2B
+            }
+        }
         Tier::Light => &MISTRAL_7B_V03,
         Tier::Default => &GLM_4_9B_0414,
         Tier::High => &QWEN3_6_27B,
@@ -198,9 +248,30 @@ pub fn spec_for_tier(tier: Tier) -> &'static ModelSpec {
     }
 }
 
+/// Every PoM model a `tier` may mine across the currently-scheduled eras — the pre-crossing (H4)
+/// model and, once H5 is scheduled, the H5 model. Prefetched together at startup so the era
+/// crossing hot-swaps the resident mining model without stalling on a mid-run download.
+pub fn pom_models_all_eras(tier: Tier) -> Vec<&'static ModelSpec> {
+    let mut out: Vec<&'static ModelSpec> = Vec::new();
+    for daa in [crate::pom::COIN_AGE_VERIFICATION_ACTIVATION_DAA, staging_daa()] {
+        let s = pom_model_for_tier(daa, tier);
+        if !out.iter().any(|x| x.model_id == s.model_id) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// The single model a hardware tier mines AND serves at **startup staging** (the latest scheduled
+/// era). A PoM GPU is bound to its tier; the era crossing swaps the resident model in place.
+pub fn spec_for_tier(tier: Tier) -> &'static ModelSpec {
+    pom_model_for_tier(staging_daa(), tier)
+}
+
 /// Resolves a model name/id.
 pub const REGISTRY: &[&ModelSpec] = &[
     &EXAONE_4_0_1_2B,
+    &QWEN3_8B_ABLITERATED,
     &MISTRAL_7B_V03,
     &GLM_4_9B_0414,
     &QWEN3_6_27B,
