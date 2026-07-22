@@ -20,8 +20,11 @@ case "$LINE" in
   modern) ARCHS="75;80;86;89;90;120"; CUDAMOUNT=(); KCUDA=/usr/local/cuda ;;
   legacy) ARCHS="70;75;80;86;89;90";  CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;
   pascal) ARCHS="60;61";              CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;
-  *) echo "usage: $0 <modern|legacy|pascal> [JOBS]"; exit 1 ;;
+  no-avx) ARCHS="70;75;80;86;89;90";  CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda
+          CPUFLAGS="-DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF" ;;
+  *) echo "usage: $0 <modern|legacy|pascal|no-avx> [JOBS]"; exit 1 ;;
 esac
+: "${CPUFLAGS:=}"
 OUT="$REPO/hiveos/dist-$LINE"
 mkdir -p "$OUT"
 SRC=/tmp/llama-src-$TAG
@@ -31,7 +34,7 @@ fi
 
 docker run --rm --network host \
   -v "$SRC":/llama -v "$REPO":/repo:ro -v "$OUT":/out "${CUDAMOUNT[@]}" \
-  -e KCUDA="$KCUDA" -e ARCHS="$ARCHS" -e JOBS="$JOBS" -e KERYX_SPIKE="${KERYX_SPIKE:-0}" \
+  -e KCUDA="$KCUDA" -e ARCHS="$ARCHS" -e JOBS="$JOBS" -e CPUFLAGS="$CPUFLAGS" -e KERYX_SPIKE="${KERYX_SPIKE:-0}" \
   keryx-build:offline bash -euo pipefail -c '
     if [ ! -x /tmp/cmk/bin/cmake ]; then
       curl -sL https://github.com/Kitware/CMake/releases/download/v3.28.6/cmake-3.28.6-linux-x86_64.tar.gz \
@@ -42,7 +45,7 @@ docker run --rm --network host \
     /tmp/cmk/bin/cmake -S /llama -B $B -DGGML_CUDA=ON \
       -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DBUILD_SHARED_LIBS=OFF \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release \
+      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF $CPUFLAGS -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_COMPILER=$KCUDA/bin/nvcc
     /tmp/cmk/bin/cmake --build $B --target llama -j "$JOBS"
     g++ -O2 -std=c++17 -shared -fPIC -fopenmp /repo/tools/keryx-llama/keryx_llama.cpp \
