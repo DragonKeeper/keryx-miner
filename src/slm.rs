@@ -301,7 +301,7 @@ pub fn probe_gpu_inference() -> GpuProbe {
     // Windows nvcc links cudart statically into keryx-llama.dll, so only cuBLAS is probed.
     // Each probe Library is dropped immediately — we only care that it CAN load; the
     // engine (re-)loads it for real later, and the OS loader refcounts it.
-    let loads = |candidates: &[&str]| candidates.iter().any(|so| libloading::Library::new(so).is_ok());
+    let loads = |candidates: &[&str]| candidates.iter().any(|so| unsafe { libloading::Library::new(so) }.is_ok());
     #[cfg(windows)]
     let ok = loads(&["cublas64_12.dll"]);
     #[cfg(not(windows))]

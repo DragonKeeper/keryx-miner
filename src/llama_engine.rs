@@ -89,7 +89,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
     let Some(so) = so_path() else { return false };
     // Never unloaded (the old dlopen path never dlclosed either): the Engine keeps raw fn
     // pointers into the library for the life of the process, so leak it deliberately.
-    let lib: &'static libloading::Library = match libloading::Library::new(&so) {
+    let lib: &'static libloading::Library = match unsafe { libloading::Library::new(&so) } {
         Ok(l) => Box::leak(Box::new(l)),
         Err(e) => {
             log::warn!("llama engine: load({}) failed: {} — inference unavailable.", so.display(), e);
