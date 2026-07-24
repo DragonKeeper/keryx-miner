@@ -241,10 +241,10 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
 /// for the smallest tiers (never gated out of `ai:cap`) and so can't rank tier 0 vs 1 by VRAM.
 /// Largest tier first, so a device picks the biggest tier it can hold.
 const POM_TIER_LADDER: &[(keryx_miner::models::Tier, u64)] = &[
-    (keryx_miner::models::Tier::VeryHigh, 30_000),
-    (keryx_miner::models::Tier::High, 24_000),
-    (keryx_miner::models::Tier::Default, 12_000),
-    (keryx_miner::models::Tier::Light, 8_000),
+    (keryx_miner::models::Tier::VeryHigh, 28_000),
+    (keryx_miner::models::Tier::High, 22_000),
+    (keryx_miner::models::Tier::Default, 11_000),
+    (keryx_miner::models::Tier::Light, 7_000),
     (keryx_miner::models::Tier::VeryLight, 2_000),
 ];
 

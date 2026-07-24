@@ -138,9 +138,10 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
-    // "native" targets the GPU(s) present at build time; headless builders must pass
-    // an explicit list, e.g. KERYX_LLAMA_ARCHS="75;80;86;89;90".
-    let archs = env::var("KERYX_LLAMA_ARCHS").unwrap_or_else(|_| "native".to_string());
+    // Ship real kernels for common GPUs plus compute_89 PTX, which drivers JIT-forward
+    // to newer architectures such as Blackwell. Override for machine-specific builds.
+    let archs = env::var("KERYX_LLAMA_ARCHS")
+        .unwrap_or_else(|_| "75-real;80-real;86-real;89-real;89-virtual".to_string());
     run(
         "cmake configure of llama.cpp (if it cannot detect a GPU, set KERYX_LLAMA_ARCHS explicitly)",
         std::process::Command::new("cmake")
