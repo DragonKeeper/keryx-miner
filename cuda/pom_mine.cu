@@ -45,7 +45,7 @@ extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsig
                                     unsigned long long time_,
                                     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
                                     unsigned long long nonce_base, unsigned long long n_nonces,
-                                    unsigned long long* winner) {
+                                    unsigned long long* winner, unsigned int walk_v2) {
     unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_nonces) return;
     unsigned long long nonce = nonce_base + tid;
@@ -62,8 +62,20 @@ extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsig
         const unsigned long long* p = (const unsigned long long*)bases[lo];
         unsigned long long base = local * 4ULL;
         unsigned long long h = state;
-        h ^= p[base]; h ^= p[base + 1]; h ^= p[base + 2]; h ^= p[base + 3];
-        state = mix64(h);
+        if (walk_v2) {
+            // H5 non-foldable walk: chain mix64 through each chunk word so all 32 bytes are
+            // load-bearing (closes the pre-H5 XOR-fold that let a miner hold a 4x-smaller table).
+            // walk_v2 is uniform across all threads -> no warp divergence.
+            h = mix64(h ^ p[base]);
+            h = mix64(h ^ p[base + 1]);
+            h = mix64(h ^ p[base + 2]);
+            h = mix64(h ^ p[base + 3]);
+            state = h;
+        } else {
+            // Pre-H5 fold (frozen — validates all blocks below H5_ACTIVATION_DAA).
+            h ^= p[base]; h ^= p[base + 1]; h ^= p[base + 2]; h ^= p[base + 3];
+            state = mix64(h);
+        }
         off = state % n_total_chunks;
     }
     unsigned long long pv[4];

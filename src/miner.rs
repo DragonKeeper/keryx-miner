@@ -326,7 +326,7 @@ impl MinerManager {
                     // PoM possession mining (design A): when active, the walk runs on the GPU
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
                     // the proof (host) and submit; the legacy plugin path below is skipped.
-                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
+                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::pom_activation_daa()) {
                         let (pph, time, target_le, daa) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];
@@ -348,10 +348,15 @@ impl MinerManager {
                                     None => { state = None; continue; }
                                 }
                             }
+                            // Era-crossing hook: swap a GPU's resident model in place at its gate
+                            // before (re)installing, so an already-running miner crosses over
+                            // without a restart. No-op with the current fixed post-H5 lineup.
+                            keryx_miner::pom_gpu::advance_mining_tier_if_due(daa);
                             keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa);
                         }
-                        let h3 = daa >= keryx_miner::pom::POM_LEVEL_ACTIVATION_DAA;
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH, h3);
+                        let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
+                        let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
+                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2);
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
@@ -396,7 +401,7 @@ impl MinerManager {
                     gpu_work.copy_output_to(&mut nonces)?;
                     // When PoM is active the GPU still runs kHeavyHash (3a is CPU-only); its
                     // solutions are NOT valid PoM blocks, so don't submit them. GPU PoM = 3b.
-                    if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::POM_ACTIVATION_DAA {
+                    if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::pom_activation_daa() {
                         if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(),
@@ -511,7 +516,7 @@ impl MinerManager {
                     nonce = (nonce & mask) | fixed;
 
                     // PoM possession path (CPU) once active; else legacy kHeavyHash.
-                    let found = if state_ref.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA {
+                    let found = if state_ref.daa_score >= keryx_miner::pom::pom_activation_daa() {
                         // The CPU/fallback walk has no per-device tier assignment — mine whichever
                         // tier's index is built (lowest present).
                         keryx_miner::pom::any_active_index().and_then(|(tier, idx)| {
