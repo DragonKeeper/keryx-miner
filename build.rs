@@ -179,7 +179,9 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
             "link of keryx-llama.dll",
             std::process::Command::new(nvcc)
                 .args(["-O2", "-std=c++17", "-shared", "tools/keryx-llama/keryx_llama.cpp"])
-                .args(["-Xcompiler", "/EHsc", "-Xcompiler", "/openmp", "-Xcompiler", "/utf-8"])
+                // /MD is required: the llama.cpp static libs are built by CMake against the
+                // dynamic CRT, and cl's /MT default breaks the link (LNK2001 __imp_modff etc.)
+                .args(["-Xcompiler", "/EHsc", "-Xcompiler", "/openmp", "-Xcompiler", "/utf-8", "-Xcompiler", "/MD"])
                 .arg("-I").arg(src.join("include"))
                 .arg("-I").arg(src.join("ggml/include"))
                 .arg("-I").arg(src.join("src"))
