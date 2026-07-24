@@ -622,10 +622,10 @@ pub fn set_device_tier(device_id: u32, tier: crate::models::Tier) {
     }
 }
 
-/// Hot-swap the resident mining model at the H4→H5 era crossing: when `daa` reaches
-/// `h5_activation_daa()`, every tier-0 GPU switches EXAONE → Qwen3-8B in place, no restart. No-op
-/// each block until a device's era-correct model actually changes. Called each tick from the loop,
-/// so a miner upgraded before the gate crosses over on its own.
+/// Hot-swap the resident mining model at an era crossing: when `daa` reaches a model's gate, the
+/// affected GPUs switch to the era-correct model in place, no restart. No-op each block until a
+/// device's era-correct model actually changes — and inert entirely with the current fixed post-H5
+/// lineup. Called each tick from the loop, so a miner upgraded before a gate crosses over on its own.
 pub fn advance_mining_tier_if_due(daa: u64) {
     let devices: Vec<(u32, crate::models::Tier)> = match device_tiers().lock() {
         Ok(g) => g.iter().map(|(d, t)| (*d, *t)).collect(),
@@ -642,10 +642,10 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         info!("PoM[gpu{}]: era crossing at DAA {} — mining model → {}.", dev, daa, spec.name);
         set_mining_tier(dev, spec.model_id, gguf.clone());
-        // The host possession index is keyed by tier POSITION and the crossing swaps which model
-        // occupies that position (tier 0: EXAONE → Qwen3-8B), so the pre-crossing index must be
-        // dropped — otherwise `ensure_installed` keeps it (key present) and the gather/index
-        // N-guard refuses to mine forever.
+        // The host possession index is keyed by tier POSITION and a crossing swaps which model
+        // occupies that position, so the pre-crossing index must be dropped — otherwise
+        // `ensure_installed` keeps it (key present) and the gather/index N-guard refuses to mine
+        // forever.
         if let Some(t) = crate::models::pom_tier_index(&spec.model_id, daa) {
             crate::pom::clear_index(t);
         }

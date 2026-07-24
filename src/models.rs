@@ -6,7 +6,7 @@
 /// Uncensored five-tier lineup, active at `coin_age_verification_activation_daa()` (the H4
 /// hardfork) — below that DAA this binary refuses to mine (`pom_tier_index` = None). Every
 /// model is untied so the in-process llama engine hosts walk + inference in one resident copy:
-///   --very-light  EXAONE-4.0-1.2B  Q4_K_M (LG)       — 2 GB+
+///   --very-light  Qwen3-8B-abliterated Q4_K_S        — 6 GB+
 ///   --light       Mistral-7B-v0.3  Q6_K   (Mistral)  — 8 GB
 ///   (default)     GLM-4-9B-0414    Q6_K   (Zhipu)    — 12 GB
 ///   --high        Qwen3.6-27B      Q4_K_M (Alibaba)  — 24 GB
@@ -19,8 +19,6 @@
 pub enum ModelFormat {
     /// GGUF quantized — LLaMA architecture (Mistral-7B). llama-served.
     Gguf,
-    /// GGUF quantized — EXAONE 4 architecture (H4 tier 0). llama-served.
-    GgufExaone4,
     /// GGUF quantized — GLM 4 architecture (H4 tier 2). llama-served.
     GgufGlm4,
     /// GGUF quantized — Qwen3.5 hybrid-SSM architecture (H4 tier 3). llama-served.
@@ -54,23 +52,6 @@ pub struct ModelSpec {
 // `tokenizer_cid` is empty: llama uses the tokenizer embedded in the GGUF, no separate file.
 // model_id bytes MUST equal the node's `params.rs` H4 constants (CIDv0[2..34] of the pinned GGUF).
 
-pub const EXAONE_4_0_1_2B: ModelSpec = ModelSpec {
-    name: "exaone-4.0-1.2b",
-    // CIDv0[2..34] of model.gguf — EXAONE-4.0-1.2B-abliterated Q4_K_M (mradermacher, i1)
-    model_id: [
-        0x30, 0x0a, 0x99, 0xb3, 0xa8, 0x5b, 0x0a, 0xb4,
-        0x5d, 0x1d, 0x93, 0x0b, 0xb7, 0xb1, 0xd4, 0xb0,
-        0xf3, 0x59, 0x83, 0xd5, 0x21, 0xe7, 0x9f, 0xf2,
-        0x11, 0x93, 0xa6, 0x90, 0x8d, 0xc4, 0xb8, 0x10,
-    ],
-    format: ModelFormat::GgufExaone4,
-    tokenizer_cid: "",
-    weight_cids: &["QmRaBetZg8SaeWeGrQDBhRMd362mf4Nm3w2YacCSQ8tocb"],
-    dir_name: "EXAONE-4.0-1.2B",
-    // ~0.9 GB Q4_K_M — smallest tier, runs on 4-6 GB GPUs. Never gated.
-    min_vram_mb: 0,
-};
-
 pub const MISTRAL_7B_V03: ModelSpec = ModelSpec {
     name: "mistral-7b-v0.3",
     // CIDv0[2..34] of model.gguf — Mistral-7B-Instruct-v0.3-abliterated Q6_K (mradermacher)
@@ -86,7 +67,7 @@ pub const MISTRAL_7B_V03: ModelSpec = ModelSpec {
     weight_cids: &["QmXmtATpJerCCcWWF515vAe5FanSvqJrD4L1ogZxDurQ3s"],
     dir_name: "Mistral-7B-v0.3",
     // ~5.9 GB Q6_K weights + ~1.5 GB KV/workspace. The Q6_K quant is deliberate VRAM gating:
-    // it does NOT fit a 6 GB card, so 6 GB stays on tier 0 (EXAONE) and 8 GB serves tier 1.
+    // it does NOT fit a 6 GB card, so 6 GB stays on tier 0 (Qwen3-8B) and 8 GB serves tier 1.
     min_vram_mb: 8_000,
 };
 
@@ -142,8 +123,8 @@ pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
     min_vram_mb: 30_000,
 };
 
-/// H5 tier-0 model — Qwen3-8B-abliterated Q4_K_S (huihui-ai, mradermacher GGUF), replacing EXAONE at
-/// `crate::pom::h5_activation_daa()` to raise the tier-0 VRAM floor to ~6 GB (closes the "any 2 GB
+/// H5 tier-0 model — Qwen3-8B-abliterated Q4_K_S (huihui-ai, mradermacher GGUF). Active from
+/// `crate::pom::h5_activation_daa()`, it raises the tier-0 VRAM floor to ~6 GB (closes the "any 2 GB
 /// card mines tier 0" gap). `model_id` = CIDv0[2..34] of the pinned GGUF; `weight_cids` points at the
 /// same GGUF the node's `POM_TIERS_H5[0]` R_T was built over, so the miner's runtime R_T matches.
 /// tokenizer.json is the shared Qwen3 tokenizer (same CID as Qwen3-32B tier 3).
@@ -167,8 +148,7 @@ pub const QWEN3_8B_ABLITERATED: ModelSpec = ModelSpec {
 /// used at startup to pick a mineable PoM model before any block DAA is known (the tier *index*
 /// is then computed per block via `pom_tier_index`).
 pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
-    *model_id == EXAONE_4_0_1_2B.model_id
-        || *model_id == QWEN3_8B_ABLITERATED.model_id
+    *model_id == QWEN3_8B_ABLITERATED.model_id
         || *model_id == MISTRAL_7B_V03.model_id
         || *model_id == GLM_4_9B_0414.model_id
         || *model_id == QWEN3_6_27B.model_id
@@ -181,13 +161,10 @@ pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     if daa < crate::pom::coin_age_verification_activation_daa() {
         return None;
     }
-    // Tier 0 swaps model at H5: EXAONE below the gate, Qwen3-8B at/after. A model claimed on the
-    // wrong side of H5 is not a valid tier (its R_T won't match the node's `POM_TIERS_H5`).
-    let h5 = daa >= crate::pom::h5_activation_daa();
-    if *model_id == EXAONE_4_0_1_2B.model_id {
-        if h5 { None } else { Some(0) }
-    } else if *model_id == QWEN3_8B_ABLITERATED.model_id {
-        if h5 { Some(0) } else { None }
+    // Tier 0 is Qwen3-8B at/after H5. A Qwen3-8B tier-0 block below the gate is not a valid tier
+    // (its R_T won't match the node's `POM_TIERS_H5`); the pre-H5 tier-0 model is retired.
+    if *model_id == QWEN3_8B_ABLITERATED.model_id {
+        if daa >= crate::pom::h5_activation_daa() { Some(0) } else { None }
     } else if *model_id == MISTRAL_7B_V03.model_id {
         Some(1)
     } else if *model_id == GLM_4_9B_0414.model_id {
@@ -211,7 +188,7 @@ pub enum Tier {
 }
 
 /// True once the H5 hardfork has a scheduled DAA — startup staging (lineup + VRAM ladder) then
-/// targets the H5 lineup (tier-0 Qwen3-8B) instead of H4 (tier-0 EXAONE).
+/// targets the H5 lineup (tier-0 Qwen3-8B).
 pub fn h5_staged() -> bool {
     crate::pom::h5_activation_daa() != u64::MAX
 }
@@ -229,17 +206,11 @@ pub fn staging_daa() -> u64 {
     }
 }
 
-/// The era-correct single model a hardware `tier` mines AND serves at block `daa` — matching the
-/// node's per-block tier table. Only tier 0 is era-dependent (EXAONE < H5, Qwen3-8B at/after).
-pub fn pom_model_for_tier(daa: u64, tier: Tier) -> &'static ModelSpec {
+/// The single model a hardware `tier` mines AND serves — matching the node's per-block tier table.
+/// Post-H5 the lineup is fixed (tier 0 = Qwen3-8B); `_daa` is kept for call-site symmetry.
+pub fn pom_model_for_tier(_daa: u64, tier: Tier) -> &'static ModelSpec {
     match tier {
-        Tier::VeryLight => {
-            if daa >= crate::pom::h5_activation_daa() {
-                &QWEN3_8B_ABLITERATED
-            } else {
-                &EXAONE_4_0_1_2B
-            }
-        }
+        Tier::VeryLight => &QWEN3_8B_ABLITERATED,
         Tier::Light => &MISTRAL_7B_V03,
         Tier::Default => &GLM_4_9B_0414,
         Tier::High => &QWEN3_6_27B,
@@ -269,7 +240,6 @@ pub fn spec_for_tier(tier: Tier) -> &'static ModelSpec {
 
 /// Resolves a model name/id.
 pub const REGISTRY: &[&ModelSpec] = &[
-    &EXAONE_4_0_1_2B,
     &QWEN3_8B_ABLITERATED,
     &MISTRAL_7B_V03,
     &GLM_4_9B_0414,

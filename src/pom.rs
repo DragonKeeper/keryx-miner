@@ -1349,7 +1349,7 @@ mod tests {
     #[test]
     #[ignore]
     fn gguf_real_model_read_chunk_byte_identical() {
-        let path = "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/EXAONE-4.0-1.2B/model.gguf";
+        let path = "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/Qwen3-8B-abliterated/model.gguf";
         if !std::path::Path::new(path).exists() {
             eprintln!("skip: GGUF not found at {path}");
             return;
@@ -1563,26 +1563,4 @@ mod tests {
         assert_eq!(proof.tier, 1);
     }
 
-    // Validates the canonical layout against the consensus-pinned R_T. Needs the EXAONE GGUF
-    // (tier 0 — the smallest, ~0.9 GB). Run: cargo test --lib pom -- --ignored --nocapture
-    #[test]
-    #[ignore = "needs EXAONE-4.0-1.2B GGUF on disk"]
-    fn weight_index_matches_pinned_exaone() {
-        let path = "/home/slash/KERYX-KRX/claude/keryx-miner/target/release/models/EXAONE-4.0-1.2B/model.gguf";
-        let idx = WeightIndex::build_from_gguf(path).expect("build index");
-        assert_eq!(idx.n_chunks, 28_943_588, "chunk count must match the node-pinned EXAONE chunks");
-        let pinned: [u8; 32] = [
-            0xcc, 0x8b, 0x25, 0xc4, 0xe1, 0xaa, 0x7a, 0xb9, 0xbb, 0x99, 0x41, 0xda, 0x16, 0x18, 0xf9, 0xab,
-            0x29, 0x38, 0xea, 0x85, 0x07, 0x7b, 0x88, 0x79, 0xeb, 0xd7, 0xd4, 0x91, 0x6a, 0xc3, 0x8d, 0xdd,
-        ];
-        assert_eq!(idx.r_t, pinned, "miner R_T must equal the node-pinned EXAONE root (POM_TIERS_H4[0])");
-
-        // A real proof over the real model self-verifies against the pinned R_T.
-        let pph = blake(b"exaone-pph");
-        let nonce = 1234;
-        let seed = pom_block_seed(&pph, 99, nonce, false);
-        let proof =
-            build_proof(0, &pph, nonce, seed, idx.n_chunks, 256, 32, |o| idx.read_chunk(o), |o| idx.merkle_path(o), false);
-        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, 256, 32, &idx.r_t, &[0xff; 32], false));
-    }
 }

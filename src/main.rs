@@ -173,7 +173,7 @@ extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
 /// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
 ///
 /// VRAM requirements (GGUF weights only, not counting CUDA workspace):
-///   EXAONE-4.0-1.2B →  ~0.9 GB
+///   Qwen3-8B-abliterated →  ~4.6 GB
 ///   Mistral-7B-v0.3 →  ~5.9 GB
 ///   GLM-4-9B        →  ~8.3 GB
 ///   Qwen3.6-27B     → ~16.5 GB  (requires ≥24 GB card)
@@ -280,8 +280,8 @@ fn assign_pom_tiers(
         .iter()
         .filter(|(t, _)| tier_rank(*t) <= ceiling_rank)
         .map(|(t, floor)| {
-            // H5 raises the tier-0 (VeryLight) VRAM floor to 6 GB once staged (Qwen3-8B replaces
-            // EXAONE); other tiers keep their PR#19 headroom floors untouched.
+            // H5 raises the tier-0 (VeryLight) VRAM floor to 6 GB once staged (Qwen3-8B);
+            // other tiers keep their PR#19 headroom floors untouched.
             let floor = if *t == keryx_miner::models::Tier::VeryLight && keryx_miner::models::h5_staged() {
                 6_000
             } else {
@@ -656,7 +656,7 @@ async fn run() -> Result<(), Error> {
     // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one.
-    //   --very-light → EXAONE-4.0-1.2B
+    //   --very-light → Qwen3-8B-abliterated
     //   --light      → Mistral-7B-v0.3
     //   (no flag)    → GLM-4-9B      [default]
     //   --high       → Qwen3.6-27B
@@ -676,7 +676,7 @@ async fn run() -> Result<(), Error> {
         info!("--light mode: light tier — mines Mistral-7B-v0.3 under PoM.");
         keryx_miner::models::Tier::Light
     } else if opt.very_light {
-        info!("--very-light mode: smallest tier — mines EXAONE-4.0-1.2B under PoM.");
+        info!("--very-light mode: smallest tier — mines Qwen3-8B-abliterated under PoM.");
         keryx_miner::models::Tier::VeryLight
     } else {
         info!("default mode: mines GLM-4-9B under PoM.");
