@@ -245,7 +245,10 @@ const POM_TIER_LADDER: &[(keryx_miner::models::Tier, u64)] = &[
     (keryx_miner::models::Tier::High, 22_000),
     (keryx_miner::models::Tier::Default, 11_000),
     (keryx_miner::models::Tier::Light, 7_000),
-    (keryx_miner::models::Tier::VeryLight, 2_000),
+    // Qwen3-8B tier 0 loads in ~5,409 MiB @ ctx 4096; floor sits ~300 MiB below its 6 GB min_vram so
+    // a 6 GB card reporting slightly under 6000 (total_mem) keeps tier 0, and ~300 MiB above the load
+    // need for OOM margin. Its need is close to min_vram, so it can't take the full −1000 headroom.
+    (keryx_miner::models::Tier::VeryLight, 5_700),
 ];
 
 /// Ordinal rank of a tier (VeryLight=0 … VeryHigh=4), for the "≤ ceiling" comparison.
@@ -279,16 +282,7 @@ fn assign_pom_tiers(
     let candidates: Vec<(u64, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> = POM_TIER_LADDER
         .iter()
         .filter(|(t, _)| tier_rank(*t) <= ceiling_rank)
-        .map(|(t, floor)| {
-            // H5 raises the tier-0 (VeryLight) VRAM floor to 6 GB once staged (Qwen3-8B);
-            // other tiers keep their PR#19 headroom floors untouched.
-            let floor = if *t == keryx_miner::models::Tier::VeryLight && keryx_miner::models::h5_staged() {
-                6_000
-            } else {
-                *floor
-            };
-            (floor, *t, keryx_miner::models::spec_for_tier(*t))
-        })
+        .map(|(t, floor)| (*floor, *t, keryx_miner::models::spec_for_tier(*t)))
         .collect();
 
     let pick = |vram_mb: u64| -> Option<(keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> {
