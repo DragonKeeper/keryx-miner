@@ -1118,11 +1118,11 @@ pub fn coin_age_verification_activation_daa() -> u64 {
 /// kernel (`pom_mine.cu`, `walk_v2` param) and the CPU walk/proof path — closing the pre-H5 fold
 /// shortcut. MUST equal the node's `MAINNET_PARAMS.h5_activation` (= node `H5_ACTIVATION_DAA`),
 /// node↔miner lockstep exactly like `coin_age_verification_activation_daa`. Set to the relaunch tip
-/// DAA — MUST equal node `MAINNET_PARAMS.h5_activation` / `H5_ACTIVATION_DAA` = 59_009_013.
+/// DAA — MUST equal node `MAINNET_PARAMS.h5_activation` / `H5_ACTIVATION_DAA` = 59_009_037.
 /// Testnet: 3_000 — node TESTNET_PARAMS.h5_activation = new(3_000) (E2E crossing + hot-swap).
 #[inline(always)]
 pub fn h5_activation_daa() -> u64 {
-    gate(59_009_013, 3_000)
+    gate(59_009_037, 3_000)
 }
 
 /// Per-tier resident possession indices, built lazily when PoM activates. A heterogeneous rig can
