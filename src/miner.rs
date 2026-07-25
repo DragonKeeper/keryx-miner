@@ -357,7 +357,8 @@ impl MinerManager {
                         let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
                         let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
                         let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1);
+                        let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
+                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1, h5_2);
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
