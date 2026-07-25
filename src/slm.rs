@@ -229,15 +229,9 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 
 /// Chat-template a raw user prompt for a model by name — llama.cpp's `generate` consumes an
 /// already-templated string (a raw prompt makes template-strict models emit EOG immediately,
-/// e.g. EXAONE). Each template was validated against the GGUF's embedded chat template.
+/// e.g. Qwen3). Each template was validated against the GGUF's embedded chat template.
 fn format_prompt_by_name(name: &str, prompt: &str) -> String {
     match name {
-        // EXAONE-4.0 — reasoning model: pre-fill an empty think block or the reasoning trace
-        // leaks into the visible answer (same trick as Qwen3.6 below).
-        "exaone-4.0-1.2b" => format!(
-            "[|system|]\n{}[|endofturn|]\n[|user|]\n{}\n[|assistant|]\n<think>\n\n</think>\n\n",
-            SYSTEM_PROMPT_NEXT, prompt
-        ),
         "mistral-7b-v0.3" => format!("[INST] {}\n\n{}[/INST]", SYSTEM_PROMPT_NEXT, prompt),
         // GLM-4-0414 ignores the <|system|> role identity (keeps claiming a foreign vendor) —
         // fold the system prompt into the user turn instead.
@@ -245,9 +239,10 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
             "[gMASK]<sop><|user|>\n{}\n\n{}\n<|assistant|>\n",
             SYSTEM_PROMPT_NEXT, prompt
         ),
-        // Qwen3.6 — ChatML + a pre-filled empty think block so the visible answer starts
-        // immediately (an open think block would eat the whole max_tokens budget).
-        "qwen3.6-27b" => format!(
+        // Qwen3 family (tier-0 Qwen3-8B + tier-3 Qwen3.6-27B) — ChatML + a pre-filled empty think
+        // block so the visible answer starts immediately (an open think block would eat the whole
+        // max_tokens budget).
+        "qwen3.6-27b" | "qwen3-8b-abliterated" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",
