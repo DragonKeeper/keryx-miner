@@ -4,6 +4,7 @@ models/
 escrow.key
 escrow_state.json
 .env
-
+.vscode/
 target-hive/
 Cargo.lock
+hiveos/dist*/
