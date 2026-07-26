@@ -41,6 +41,12 @@ __device__ __forceinline__ bool pom_le_leq(const unsigned long long a[4],
 
 // H5.1: the seed fold reads its own word set (s0..s3, host-salted per era) while the pow fold
 // keeps p0..p3 — pre-H5.1 the host passes identical words, keeping behavior bit-identical.
+//
+// ILP x2: each thread grinds TWO nonces with their walk steps interleaved. The walk is
+// memory-latency bound (a 3090 sits at ~24% of its bandwidth at 1 nonce/thread), so the
+// second walk's search/mix work overlaps the first walk's DRAM fetch and vice versa.
+// Byte-exact per nonce: each walk's math is untouched, only the instruction scheduling
+// interleaves. The host launches ceil(batch/2) threads (grid calc in src/pom_gpu.rs).
 extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsigned long long* prefix,
                                     unsigned int T, unsigned long long n_total_chunks, unsigned int K,
                                     unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
@@ -50,42 +56,68 @@ extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsig
                                     unsigned long long nonce_base, unsigned long long n_nonces,
                                     unsigned long long* winner, unsigned int walk_v2) {
     unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_nonces) return;
-    unsigned long long nonce = nonce_base + tid;
+    unsigned long long i0 = tid * 2ULL;
+    if (i0 >= n_nonces) return;
+    unsigned long long i1 = i0 + 1ULL;
+    bool has1 = i1 < n_nonces;
+    unsigned long long nonce0 = nonce_base + i0;
+    // Boundary thread of an odd batch: walk nonce0 twice (result discarded below) rather than
+    // branching the whole thread body on has1.
+    unsigned long long nonce1 = nonce_base + (has1 ? i1 : i0);
 
-    unsigned long long state = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
-    unsigned long long off = state % n_total_chunks;
+    unsigned long long state0 = pom_seed_fold(nonce0, time_, s0, s1, s2, s3);
+    unsigned long long state1 = pom_seed_fold(nonce1, time_, s0, s1, s2, s3);
+    unsigned long long off0 = state0 % n_total_chunks;
+    unsigned long long off1 = state1 % n_total_chunks;
     for (unsigned int i = 0; i < K; i++) {
-        unsigned int lo = 0, hi = T;
-        while (lo + 1 < hi) {
-            unsigned int mid = (lo + hi) >> 1;
-            if (prefix[mid] <= off) lo = mid; else hi = mid;
+        unsigned int lo0 = 0, hi0 = T;
+        while (lo0 + 1 < hi0) {
+            unsigned int mid = (lo0 + hi0) >> 1;
+            if (prefix[mid] <= off0) lo0 = mid; else hi0 = mid;
         }
-        unsigned long long local = off - prefix[lo];
-        // 128-bit vector loads: read the 32-byte chunk as 2x ulonglong2 (a.x,a.y,c.x,c.y = w0..w3)
-        // issued before the era branch. BYTE-EXACT vs the 4x u64 form — same words, same order,
-        // walk result is bit-identical. On latency-bound GDDR6X parts this is the difference
-        // between ~17 and ~25 MH/s on a 3090 (measured 2026-07-26); ~+1.8% on H200/HBM.
-        const ulonglong2* p = (const ulonglong2*)bases[lo];
-        unsigned long long base2 = local * 2ULL;
-        ulonglong2 a = p[base2], c = p[base2 + 1];
-        unsigned long long h = state;
+        unsigned int lo1 = 0, hi1 = T;
+        while (lo1 + 1 < hi1) {
+            unsigned int mid = (lo1 + hi1) >> 1;
+            if (prefix[mid] <= off1) lo1 = mid; else hi1 = mid;
+        }
+        // 128-bit vector loads: read each 32-byte chunk as 2x ulonglong2 (a.x,a.y,c.x,c.y =
+        // w0..w3), BYTE-EXACT vs the 4x u64 form. Both chunks' fetches issue back-to-back so
+        // their DRAM latencies overlap (the whole point of the x2 interleave).
+        const ulonglong2* q0 = (const ulonglong2*)bases[lo0];
+        const ulonglong2* q1 = (const ulonglong2*)bases[lo1];
+        unsigned long long b0 = (off0 - prefix[lo0]) * 2ULL;
+        unsigned long long b1 = (off1 - prefix[lo1]) * 2ULL;
+        ulonglong2 a0 = q0[b0], c0 = q0[b0 + 1];
+        ulonglong2 a1 = q1[b1], c1 = q1[b1 + 1];
+        unsigned long long h0 = state0, h1 = state1;
         if (walk_v2) {
             // H5 non-foldable walk: chain mix64 through each chunk word so all 32 bytes are
             // load-bearing (closes the pre-H5 XOR-fold that let a miner hold a 4x-smaller table).
-            // walk_v2 is uniform across all threads -> no warp divergence.
-            h = mix64(h ^ a.x); h = mix64(h ^ a.y); h = mix64(h ^ c.x); h = mix64(h ^ c.y);
-            state = h;
+            // walk_v2 is uniform across all threads -> no warp divergence. The two chains are
+            // independent and interleave in the pipeline.
+            h0 = mix64(h0 ^ a0.x); h1 = mix64(h1 ^ a1.x);
+            h0 = mix64(h0 ^ a0.y); h1 = mix64(h1 ^ a1.y);
+            h0 = mix64(h0 ^ c0.x); h1 = mix64(h1 ^ c1.x);
+            h0 = mix64(h0 ^ c0.y); h1 = mix64(h1 ^ c1.y);
+            state0 = h0; state1 = h1;
         } else {
             // Pre-H5 fold (frozen — validates all blocks below H5_ACTIVATION_DAA).
-            h ^= a.x; h ^= a.y; h ^= c.x; h ^= c.y;
-            state = mix64(h);
+            h0 ^= a0.x; h0 ^= a0.y; h0 ^= c0.x; h0 ^= c0.y;
+            h1 ^= a1.x; h1 ^= a1.y; h1 ^= c1.x; h1 ^= c1.y;
+            state0 = mix64(h0); state1 = mix64(h1);
         }
-        off = state % n_total_chunks;
+        off0 = state0 % n_total_chunks;
+        off1 = state1 % n_total_chunks;
     }
     unsigned long long pv[4];
-    pom_pow_fold(state, p0, p1, p2, p3, pv);
+    pom_pow_fold(state0, p0, p1, p2, p3, pv);
     if (pom_le_leq(pv, t0, t1, t2, t3)) {
-        atomicMin(winner, nonce);
+        atomicMin(winner, nonce0);
+    }
+    if (has1) {
+        pom_pow_fold(state1, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            atomicMin(winner, nonce1);
+        }
     }
 }

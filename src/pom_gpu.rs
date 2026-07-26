@@ -139,7 +139,10 @@ impl LoadedPomKernel {
         let t = words4(target_le);
         let k = crate::pom::POM_WALK_STEPS;
         let winner = stream.clone_htod(&[u64::MAX])?;
-        let grid = ((batch + 255) / 256) as u32;
+        // The kernel grinds 2 nonces per thread (ILP x2 — see cuda/pom_mine.cu), so the grid
+        // covers ceil(batch/2) threads. Nonce coverage of [start, start+batch) is unchanged.
+        let threads = (batch + 1) / 2;
+        let grid = ((threads + 255) / 256) as u32;
         let cfg = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
 
         let (bases_ptr, _bases_guard) = bases_dev.device_ptr(stream);
