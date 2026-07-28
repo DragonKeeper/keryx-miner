@@ -1,6 +1,8 @@
 # Keryx Miner
 
-A high-performance miner for **Keryx**, combining GPU PoW (kHeavyHash) with on-chain AI inference (OPoI — Optimistic Proof of Inference).
+A high-performance GPU miner for **Keryx**.
+
+Proof of work is **PoM — Proof of Model**: every nonce walks the weights of the AI model your GPU holds, so mining requires genuine possession of that model, and the tier you prove scales your share of the block reward. The same resident model answers on-chain inference requests (**OPoI** — Optimistic Proof of Inference). Legacy kHeavyHash is still in the code, but only to validate blocks below the PoM activation DAA.
 
 ---
 
