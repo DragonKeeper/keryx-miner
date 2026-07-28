@@ -2,7 +2,7 @@
 
 A high-performance GPU miner for **Keryx**.
 
-Proof of work is **PoM — Proof of Model**: every nonce walks the weights of the AI model your GPU holds, so mining requires genuine possession of that model, and the tier you prove scales your share of the block reward. The same resident model answers on-chain inference requests (**OPoI** — Optimistic Proof of Inference). Legacy kHeavyHash is still in the code, but only to validate blocks below the PoM activation DAA.
+Proof of work is **PoM — Proof of Model**: every nonce walks the weights of the AI model your GPU holds, so mining requires genuine possession of that model, and the tier you prove scales your share of the block reward. The same resident model answers on-chain inference requests (**OPoI** — Optimistic Proof of Inference).
 
 ---
 
@@ -14,25 +14,17 @@ Download the latest release from the [Releases page](https://github.com/Keryx-La
 
 ## Build from Source
 
-### Standard build (PoW only, no inference)
+### Requirements
 
-Requires: Rust + Cargo ([rustup.rs](https://rustup.rs/)), `protoc` (`protobuf-compiler`)
+- Rust + Cargo ([rustup.rs](https://rustup.rs/))
+- `protoc` (`protobuf-compiler`)
+- `cmake` and `git` (the inference engine builds llama.cpp from source)
+- **CUDA 12.2 toolkit** — `nvcc` is mandatory, there is no CUDA-less build: `build.rs` compiles the PoM mining kernel into a PTX ladder on every build, and the miner cannot mine without it
+- **GCC ≤ 12** (Ubuntu 22.04 / GCC 11 works out of the box); on newer hosts use Option B
 
-```bash
-git clone https://github.com/Keryx-Labs/keryx-miner.git
-cd keryx-miner
-cargo build --release --bin keryx-miner
-```
+CUDA **12.2** specifically: nvcc 12.2 emits code that runs on **NVIDIA driver ≥ 535**, whereas newer toolkits raise that floor (HiveOS commonly ships 535.x). The two prebuilt PoM fatbins are committed to the repo and are simply embedded by the build — you never need to regenerate them unless you change `cuda/pom_mine.cu`, in which case see [cuda/README.md](cuda/README.md).
 
-Binary: `target/release/keryx-miner`
-
----
-
-### CUDA build (PoW + GPU inference)
-
-The inference engine (candle) builds with the **CUDA 12.x** toolkit. We recommend **CUDA 12.2**: nvcc 12.2 emits kernels that JIT on **NVIDIA driver ≥ 535**, whereas 12.6 needs driver ≥ 560. Building with 12.2 runs on the widest range of hosts and mining rigs (HiveOS commonly ships driver 535.x) at no performance cost.
-
-#### Option A — CUDA 12.2 toolkit installed on host (recommended)
+### Option A — CUDA 12.2 toolkit installed on host (recommended)
 
 Install the toolkit side-by-side (runfile, toolkit-only, no driver), then point the build at it:
 
@@ -41,18 +33,24 @@ Install the toolkit side-by-side (runfile, toolkit-only, no driver), then point 
 wget https://developer.download.nvidia.com/compute/cuda/12.2.2/local_installers/cuda_12.2.2_535.104.05_linux.run
 bash cuda_12.2.2_535.104.05_linux.run --silent --toolkit --toolkitpath="$HOME/cuda-12.2" --override
 
+git clone https://github.com/Keryx-Labs/keryx-miner.git
 cd keryx-miner
-CUDA_COMPUTE_CAP=86 \
-  CUDA_ROOT="$HOME/cuda-12.2" CUDA_PATH="$HOME/cuda-12.2" \
+CUDA_ROOT="$HOME/cuda-12.2" CUDA_PATH="$HOME/cuda-12.2" \
   PATH="$HOME/cuda-12.2/bin:$PATH" \
-  cargo build --release --bin keryx-miner
+  cargo build --release
 ```
 
-Binary: `target/release/keryx-miner`
+Produces `target/release/keryx-miner` plus `libkeryx-llama.so` next to it. **Both are needed** — the inference engine is loaded from that shared object at runtime, so keep them together when you move the binary.
 
-> Compiling with CUDA 12.2 requires **GCC ≤ 12** (Ubuntu 22.04 / GCC 11 works out of the box). On newer hosts use Option B.
+The first build clones and compiles llama.cpp (cached under `target/`, near no-op on rebuilds). Its GPU architectures come from `KERYX_LLAMA_ARCHS`, default `75-real;80-real;86-real;89-real;89-virtual`. Official releases use a wider set:
 
-#### Option B — CUDA 13.x or incompatible gcc on host (build via container)
+```bash
+KERYX_LLAMA_ARCHS="70;75;80;86;89;90" cargo build --release
+```
+
+`KERYX_LLAMA_SKIP=1` skips that step entirely, but a prebuilt `libkeryx-llama.so` must then sit next to the binary or no tier can be mined.
+
+### Option B — CUDA 13.x or incompatible gcc on host (build via container)
 
 If your system has CUDA 13.x or gcc 13+ (e.g. Fedora 40+, Ubuntu 25+), build inside a CUDA 12.2 container. The binary runs on the host via driver forward-compatibility.
 
@@ -62,33 +60,25 @@ Requires: [Podman](https://podman.io/) (rootless) or Docker, NVIDIA driver ≥ 5
 cd keryx-miner
 podman run --rm --security-opt label=disable \
   -v "$PWD":/src -w /src \
-  -e CUDA_COMPUTE_CAP=86 \
   -e CARGO_TARGET_DIR=/src/target-cuda \
   docker.io/nvidia/cuda:12.2.2-devel-ubuntu22.04 \
   bash -c '
     apt-get update -qq && apt-get install -y -qq \
-      curl build-essential pkg-config libssl-dev ca-certificates protobuf-compiler >/dev/null 2>&1
+      curl build-essential cmake git pkg-config libssl-dev ca-certificates protobuf-compiler >/dev/null 2>&1
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1
     . "$HOME/.cargo/env"
     export CUDA_PATH=/usr/local/cuda PROTOC=/usr/bin/protoc
-    cargo build --release --bin keryx-miner'
+    export KERYX_LLAMA_ARCHS="70;75;80;86;89;90"
+    cargo build --release'
 ```
 
-Binary: `target-cuda/release/keryx-miner`
+Binary and `libkeryx-llama.so`: `target-cuda/release/`.
 
-> **Always pass `-e CUDA_COMPUTE_CAP`.** The container does **not** inherit your host shell env, so you must set the compute cap with `-e` (as above). If you omit it, `candle-kernels` auto-detects the installed GPU and a Blackwell card resolves to `100` — which nvcc 12.2 rejects (`nvcc cannot target gpu arch 100`). On a 5090, set `-e CUDA_COMPUTE_CAP=89` (not `100`). If a previous run already cached the wrong value, clear the build dir first: `rm -rf target-cuda`.
+> This path has **not been re-tested since the llama.cpp migration**. `cmake`, `git` and an explicit `KERYX_LLAMA_ARCHS` were added because the container has no GPU to auto-detect; if it fails, Option A on a distro with GCC ≤ 12 is the supported route.
 
-> **Runtime dependencies.** PoW needs only `libcuda.so.1` (the driver). GPU **inference** additionally `dlopen`s `libcublas.so.12` and `libcurand.so.10` at runtime, so the host must have the matching CUDA 12.2 runtime libs (`libcublas-12-2`, `libcurand-12-2`). On HiveOS the miner installs and registers them automatically on first run; on other hosts install them via your package manager or the CUDA 12.2 toolkit.
+> **Runtime dependencies.** Mining needs only `libcuda.so.1` (the driver). Inference additionally `dlopen`s `libcublas.so.12` and `libcurand.so.10`, so the host must have the matching CUDA 12.2 runtime libs (`libcublas-12-2`, `libcurand-12-2`). On HiveOS the miner installs and registers them automatically on first run; on other hosts install them via your package manager or the CUDA 12.2 toolkit.
 
-**CUDA_COMPUTE_CAP by GPU generation:**
-
-| GPU generation | Compute cap |
-|----------------|-------------|
-| RTX 30xx (Ampere) | `86` |
-| RTX 40xx (Ada Lovelace) | `89` |
-| RTX 50xx (Blackwell) | `89` |
-
-> **Blackwell (RTX 50xx) note.** The CUDA 12.2 toolkit cannot emit native `sm_100`/`sm_120` SASS (that needs CUDA ≥ 12.8), so do **not** set `CUDA_COMPUTE_CAP=100` with Option A/B — the build will fail. Use `89`: the `sm_89` PTX JIT-forwards to Blackwell at runtime via the driver, at no performance cost for these kernels. A native `sm_120` build would require a CUDA ≥ 12.8 toolchain and is currently untested.
+> **Blackwell (RTX 50xx).** Nothing to configure: the committed nextgen fatbin carries native `sm_89`/`sm_90`/`sm_100`/`sm_120` SASS, so a 50-series card runs native code with no JIT. This matters — a Blackwell card falling back to JIT from PTX emitted by CUDA 12.2 loses roughly half its hashrate (measured on RTX 5090 and 5080). If you ever rebuild the fatbins yourself, the nextgen one requires CUDA ≥ 12.8; see [cuda/README.md](cuda/README.md).
 
 ---
 
@@ -159,6 +149,17 @@ If the miner still downloads a model although the folder is there, check your ti
 ./keryx-miner --help
 ```
 
+
+---
+
+## Dev Fund
+
+2% of mining rewards support development by default.
+
+```bash
+--devfund-percent XX.YY
+```
+
 ---
 
 ## Connect
@@ -170,13 +171,3 @@ If the miner still downloads a model although the folder is there, check your ti
 ---
 
 > "Intelligence is the message. Keryx is the messenger."
-
----
-
-## Dev Fund
-
-2% of mining rewards support development by default.
-
-```bash
---devfund-percent XX.YY
-```
