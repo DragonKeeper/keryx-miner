@@ -96,22 +96,60 @@ Binary: `target-cuda/release/keryx-miner`
 ./keryx-miner --mining-address keryx:YOUR_ADDRESS
 ```
 
-### Inference tiers (OPoI)
+Inference is not optional. A miner that holds no model cannot prove possession and cannot mine — there is no PoW-only mode.
 
-| Flag | Models supported | Min VRAM |
-|------|-----------------|----------|
-| *(none)* | TinyLlama 1.1B + DeepSeek-R1-8B | 8 GB |
-| `--light` | TinyLlama 1.1B only | 4 GB |
-| `--high` | TinyLlama 1.1B + DeepSeek-R1-8B + DeepSeek-R1-32B | 24 GB |
-| `--very-high` | All 4 models (+ LLaMA-3.3-70B) | 32 GB |
+### Model tiers
 
-Models are loaded **on demand** when a request arrives and cached between requests. Mining pauses during inference, then resumes automatically.
+One tier, one model. The flag you pick decides which model your GPU must hold, and the tier you prove through PoM (Proof of Model) scales your share of the block reward: the higher the tier, the larger the miner cut.
 
-To run without inference (PoW only):
+| Flag | Model | Quant | Min VRAM |
+|------|-------|-------|----------|
+| `--very-light` | Qwen3-8B-abliterated | Q4_K_S | 6 GB+ |
+| `--light` | Mistral-7B-v0.3 | Q6_K | 8 GB+ |
+| *(none, default)* | GLM-4-9B-0414 | Q6_K | 12 GB+ |
+| `--high` | Qwen3.6-27B | Q4_K_M | 24 GB+ |
+| `--very-high` | Kimi-Linear-48B | Q4_K_M | 32 GB+ |
+
+Tiers are **not cumulative**: each one serves exactly one model, and a card that cannot hold the model you asked for falls back to a tier it can actually serve.
+
+On a multi-GPU rig the tier is assigned per card from its VRAM, so a mixed rig runs several tiers side by side. `--force-model` overrides that per GPU, in CUDA driver order:
 
 ```bash
-./keryx-miner --mining-address keryx:YOUR_ADDRESS --no-opoi
+./keryx-miner --mining-address keryx:YOUR_ADDRESS --force-model light,very-high
 ```
+
+The model is loaded **on demand** when a request arrives and cached between requests. Mining pauses on that GPU during inference, then resumes automatically.
+
+### Getting the models
+
+Nothing to download by hand: on first run the miner fetches the model for your tier over IPFS and caches it. It looks for the weights at:
+
+```
+<directory of the keryx-miner executable>/models/<Model-Name>/model.gguf
+```
+
+Point it somewhere else with `--models-dir /path/to/models` (or the `KERYX_MODELS_DIR` environment variable). The path you give is the **root** — the miner still appends `<Model-Name>/model.gguf` under it.
+
+If IPFS is slow or blocked on your network, download the archive and unzip it into that models folder. Keep the folder name exactly as listed below, and use `--ipfs-url` if you would rather point at a different gateway.
+
+| Model | Hugging Face | Direct | Torrent |
+|-------|--------------|--------|---------|
+| Qwen3-8B-abliterated | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Qwen3-8B-abliterated.zip) | [zip](https://keryx-labs.com/Qwen3-8B-abliterated.zip) | [torrent](https://keryx-labs.com/Qwen3-8B-abliterated.zip.torrent) |
+| Mistral-7B-v0.3 | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Mistral-7B-v0.3.zip) | [zip](https://keryx-labs.com/Mistral-7B-v0.3.zip) | [torrent](https://keryx-labs.com/Mistral-7B-v0.3.zip.torrent) |
+| GLM-4-9B-0414 | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/GLM-4-9B-0414.zip) | [zip](https://keryx-labs.com/GLM-4-9B-0414.zip) | [torrent](https://keryx-labs.com/GLM-4-9B-0414.zip.torrent) |
+| Qwen3.6-27B | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Qwen3.6-27B.zip) | [zip](https://keryx-labs.com/Qwen3.6-27B.zip) | [torrent](https://keryx-labs.com/Qwen3.6-27B.zip.torrent) |
+| Kimi-Linear-48B | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Kimi-Linear-48B.zip) | [zip](https://keryx-labs.com/Kimi-Linear-48B.zip) | [torrent](https://keryx-labs.com/Kimi-Linear-48B.zip.torrent) |
+
+A correct manual install looks like this — the miner writes the `.ok` marker itself once it has validated the file, so there is no need to create it:
+
+```
+keryx-miner
+models/
+└── Qwen3.6-27B/
+    └── model.gguf
+```
+
+If the miner still downloads a model although the folder is there, check your tier flag before anything else: the flag decides **which** model is requested, `--models-dir` only says **where** to look.
 
 ### All options
 
