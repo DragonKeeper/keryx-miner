@@ -1,3 +1,4 @@
+use nvml_wrapper::{structs::device::FieldId, Nvml};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -118,6 +119,39 @@ impl MinerStats {
     }
 
     pub fn refresh_gpu_telemetry(&self) {
+        let mut nvml_memory_temps = HashMap::new();
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(device_count) = nvml.device_count() {
+                for idx in 0..device_count {
+                    let Ok(device) = nvml.device_by_index(idx) else {
+                        continue;
+                    };
+                    let field_values = device.field_values_for(&[FieldId(82)]);
+                    let Ok(field_values) = field_values else {
+                        continue;
+                    };
+                    let Some(field_sample) = field_values.first() else {
+                        continue;
+                    };
+                    let Ok(field_sample) = field_sample else {
+                        continue;
+                    };
+                    let Ok(value) = &field_sample.value else {
+                        continue;
+                    };
+                    let temp = match value {
+                        nvml_wrapper::enums::device::SampleValue::I64(temp) => Some(*temp as i64),
+                        nvml_wrapper::enums::device::SampleValue::U32(temp) => Some(*temp as i64),
+                        nvml_wrapper::enums::device::SampleValue::U64(temp) => Some(*temp as i64),
+                        nvml_wrapper::enums::device::SampleValue::F64(_) => None,
+                    };
+                    if let Some(temp) = temp.filter(|temp| *temp > 0) {
+                        nvml_memory_temps.insert(idx as u32, temp as u32);
+                    }
+                }
+            }
+        }
+
         let output = Command::new("nvidia-smi")
             .args([
                 "--query-gpu=temperature.gpu,temperature.memory,fan.speed,power.draw",
@@ -137,9 +171,13 @@ impl MinerStats {
         for (idx, line) in stdout.lines().enumerate() {
             let mut parts = line.split(',').map(|s| s.trim());
             let temp_c = parts.next().and_then(parse_u32_field);
-            let memory_temp_c = parts.next().and_then(parse_u32_field);
+            let nvidia_smi_memory_temp_c = parts.next().and_then(parse_u32_field);
             let fan_percent = parts.next().and_then(parse_u32_field);
             let power_draw_w = parts.next().and_then(parse_f32_field);
+            let memory_temp_c = normalize_memory_temp_c(
+                nvidia_smi_memory_temp_c,
+                nvml_memory_temps.get(&(idx as u32)).copied(),
+            );
             fresh.insert(
                 idx as u32,
                 GpuTelemetry {
@@ -229,6 +267,30 @@ fn parse_f32_field(value: &str) -> Option<f32> {
         .split_whitespace()
         .next()
         .and_then(|x| x.parse::<f32>().ok())
+}
+
+fn normalize_memory_temp_c(nvidia_smi_temp_c: Option<u32>, nvml_temp_c: Option<u32>) -> Option<u32> {
+    nvml_temp_c.filter(|temp| *temp > 0).or_else(|| nvidia_smi_temp_c.filter(|temp| *temp > 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_memory_temp_c;
+
+    #[test]
+    fn prefers_nvml_memory_temp_when_available() {
+        assert_eq!(normalize_memory_temp_c(Some(70), Some(55)), Some(55));
+    }
+
+    #[test]
+    fn falls_back_to_nvidia_smi_when_nvml_is_missing() {
+        assert_eq!(normalize_memory_temp_c(Some(70), None), Some(70));
+    }
+
+    #[test]
+    fn ignores_zero_values() {
+        assert_eq!(normalize_memory_temp_c(Some(0), Some(0)), None);
+    }
 }
 
 pub fn spawn_stats_server(stats: Arc<MinerStats>, bind_addr: String, port: u16) -> std::io::Result<thread::JoinHandle<()>> {
