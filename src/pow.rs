@@ -38,7 +38,7 @@ pub enum BlockSeed {
 }
 
 impl BlockSeed {
-    pub fn report_block(&self) {
+    pub fn report_block(&self, device: &str) {
         match self {
             BlockSeed::FullBlock(block) => {
                 let block_hash =
@@ -47,14 +47,37 @@ impl BlockSeed {
                 let block_time = OffsetDateTime::from(
                     UNIX_EPOCH + Duration::from_millis(block.header.as_ref().unwrap().timestamp as u64),
                 );
-                info!(
-                    "Found a block: {:x} (Timestamp: {})",
-                    block_hash,
-                    block_time.format(format).unwrap_or_else(|_| "unknown".to_string())
-                );
+                let block_time_text = block_time.format(format).unwrap_or_else(|_| "unknown".to_string());
+                info!("{}", format_block_found_message(device, &format!("{:x}", block_hash), &block_time_text));
             }
-            BlockSeed::PartialBlock { .. } => info!("Found a share!"),
+            BlockSeed::PartialBlock { .. } => info!("{}", format_share_found_message(device)),
         }
+    }
+}
+
+fn format_block_found_message(device: &str, block_hash_hex: &str, block_time: &str) -> String {
+    format!("Found a block on {}: {} (Timestamp: {})", device, block_hash_hex, block_time)
+}
+
+fn format_share_found_message(device: &str) -> String {
+    format!("Found a share on {}", device)
+}
+
+#[cfg(test)]
+mod reporting_tests {
+    use super::{format_block_found_message, format_share_found_message};
+
+    #[test]
+    fn formats_block_found_message_with_device() {
+        assert_eq!(
+            format_block_found_message("GPU #2", "deadbeef", "2026-07-29 12:34:56"),
+            "Found a block on GPU #2: deadbeef (Timestamp: 2026-07-29 12:34:56)"
+        );
+    }
+
+    #[test]
+    fn formats_share_found_message_with_device() {
+        assert_eq!(format_share_found_message("CPU"), "Found a share on CPU");
     }
 }
 

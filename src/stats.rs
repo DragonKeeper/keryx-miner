@@ -1,4 +1,4 @@
-use nvml_wrapper::{structs::device::FieldId, Nvml};
+use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, structs::device::FieldId, Nvml};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -30,7 +30,10 @@ pub struct MinerStats {
     api_port: AtomicU64,
     mining_address: Mutex<Option<String>>,
     device_hashrate_hs: Mutex<HashMap<String, u64>>,
+    device_blocks_found: Mutex<HashMap<String, u64>>,
+    device_blocks_rejected: Mutex<HashMap<String, u64>>,
     gpu_telemetry: Mutex<HashMap<u32, GpuTelemetry>>,
+    hiveos: AtomicBool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -45,6 +48,8 @@ struct GpuTelemetry {
 pub struct DeviceRate {
     pub id: String,
     pub hashrate_hs: u64,
+    pub blocks_found: u64,
+    pub blocks_rejected: u64,
     // Backward-compatible alias for core temp.
     pub temp_c: Option<u32>,
     pub memory_temp_c: Option<u32>,
@@ -72,7 +77,7 @@ pub struct MinerStatsSnapshot {
 }
 
 impl MinerStats {
-    pub fn new() -> Self {
+    pub fn new(hiveos: bool) -> Self {
         let now = now_epoch_s();
         Self {
             started_at: Mutex::new(Some(Instant::now())),
@@ -90,7 +95,10 @@ impl MinerStats {
             api_port: AtomicU64::new(0),
             mining_address: Mutex::new(None),
             device_hashrate_hs: Mutex::new(HashMap::new()),
+            device_blocks_found: Mutex::new(HashMap::new()),
+            device_blocks_rejected: Mutex::new(HashMap::new()),
             gpu_telemetry: Mutex::new(HashMap::new()),
+            hiveos: AtomicBool::new(hiveos),
         }
     }
 
@@ -125,9 +133,19 @@ impl MinerStats {
         self.last_update_epoch_s.store(now_epoch_s(), Ordering::Release);
     }
 
+    pub fn inc_device_blocks_found(&self, device_id: &str) {
+        let mut map = self.device_blocks_found.lock().expect("device block count mutex poisoned");
+        *map.entry(device_id.to_string()).or_insert(0) += 1;
+    }
+
     pub fn inc_rejected_blocks(&self) {
         self.rejected_blocks.fetch_add(1, Ordering::AcqRel);
         self.last_update_epoch_s.store(now_epoch_s(), Ordering::Release);
+    }
+
+    pub fn inc_device_blocks_rejected(&self, device_id: &str) {
+        let mut map = self.device_blocks_rejected.lock().expect("device rejected block count mutex poisoned");
+        *map.entry(device_id.to_string()).or_insert(0) += 1;
     }
 
     pub fn add_claimed(&self, outputs: u64, amount_sompi: u64) {
@@ -142,78 +160,133 @@ impl MinerStats {
     }
 
     pub fn refresh_gpu_telemetry(&self) {
+        let mut fresh = HashMap::new();
         let mut nvml_memory_temps = HashMap::new();
+        let mut nvml_fallbacks = HashMap::new();
+
         if let Ok(nvml) = Nvml::init() {
             if let Ok(device_count) = nvml.device_count() {
                 for idx in 0..device_count {
                     let Ok(device) = nvml.device_by_index(idx) else {
                         continue;
                     };
-                    let field_values = device.field_values_for(&[FieldId(82)]);
-                    let Ok(field_values) = field_values else {
-                        continue;
-                    };
-                    let Some(field_sample) = field_values.first() else {
-                        continue;
-                    };
-                    let Ok(field_sample) = field_sample else {
-                        continue;
-                    };
-                    let Ok(value) = &field_sample.value else {
-                        continue;
-                    };
-                    let temp = match value {
-                        nvml_wrapper::enums::device::SampleValue::I64(temp) => Some(*temp as i64),
-                        nvml_wrapper::enums::device::SampleValue::U32(temp) => Some(*temp as i64),
-                        nvml_wrapper::enums::device::SampleValue::U64(temp) => Some(*temp as i64),
-                        nvml_wrapper::enums::device::SampleValue::F64(_) => None,
-                    };
-                    if let Some(temp) = temp.filter(|temp| *temp > 0) {
-                        nvml_memory_temps.insert(idx as u32, temp as u32);
+
+                    let temp_c = device.temperature(TemperatureSensor::Gpu).ok();
+                    let fan_percent = device.fan_speed(0).ok();
+                    let power_draw_w = device
+                        .power_usage()
+                        .ok()
+                        .map(|milliwatts| normalize_power_draw_w(Some(milliwatts as f32), None))
+                        .flatten();
+
+                    if let Ok(field_values) = device.field_values_for(&[FieldId(82)]) {
+                        if let Some(Ok(field_sample)) = field_values.first() {
+                            if let Ok(value) = &field_sample.value {
+                                let temp = match value {
+                                    nvml_wrapper::enums::device::SampleValue::I64(temp) => Some(*temp as i64),
+                                    nvml_wrapper::enums::device::SampleValue::U32(temp) => Some(*temp as i64),
+                                    nvml_wrapper::enums::device::SampleValue::U64(temp) => Some(*temp as i64),
+                                    nvml_wrapper::enums::device::SampleValue::F64(_) => None,
+                                };
+                                if let Some(temp) = temp.filter(|temp| *temp > 0) {
+                                    nvml_memory_temps.insert(idx as u32, temp as u32);
+                                }
+                            }
+                        }
+                    }
+
+                    nvml_fallbacks.insert(
+                        idx as u32,
+                        GpuTelemetry {
+                            temp_c: temp_c.map(|temp| temp as u32),
+                            memory_temp_c: nvml_memory_temps.get(&(idx as u32)).copied(),
+                            fan_percent: fan_percent.map(|fan| fan as u32),
+                            power_draw_w,
+                        },
+                    );
+                }
+            }
+        }
+
+        if !nvml_fallbacks.is_empty() {
+            fresh = nvml_fallbacks.clone();
+        }
+
+        let should_query_nvidia_smi = should_query_nvidia_smi(&fresh, self.hiveos.load(Ordering::Acquire));
+        let output = if should_query_nvidia_smi {
+            Some(
+                Command::new("nvidia-smi")
+                    .args([
+                        "--query-gpu=temperature.gpu,temperature.memory,fan.speed,power.draw",
+                        "--format=csv,noheader,nounits",
+                    ])
+                    .output(),
+            )
+        } else {
+            None
+        };
+
+        if let Some(Ok(output)) = output {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for (idx, line) in stdout.lines().enumerate() {
+                    let mut parts = line.split(',').map(|s| s.trim());
+                    let temp_c = parts.next().and_then(parse_u32_field);
+                    let nvidia_smi_memory_temp_c = parts.next().and_then(parse_u32_field);
+                    let fan_percent = parts.next().and_then(parse_u32_field);
+                    let power_draw_w = parts.next().and_then(parse_f32_field);
+
+                    if let Some(telemetry) = fresh.get_mut(&(idx as u32)) {
+                        telemetry.temp_c = prefer_nvml_u32_or_nvidia_smi(telemetry.temp_c, temp_c);
+                        telemetry.memory_temp_c = normalize_memory_temp_c(
+                            nvidia_smi_memory_temp_c,
+                            telemetry.memory_temp_c,
+                        );
+                        telemetry.fan_percent = prefer_nvml_u32_or_nvidia_smi(telemetry.fan_percent, fan_percent);
+                        telemetry.power_draw_w = prefer_nvml_f32_or_nvidia_smi(telemetry.power_draw_w, power_draw_w);
+                    } else {
+                        fresh.insert(
+                            idx as u32,
+                            GpuTelemetry {
+                                temp_c: temp_c,
+                                memory_temp_c: normalize_memory_temp_c(nvidia_smi_memory_temp_c, None),
+                                fan_percent,
+                                power_draw_w,
+                            },
+                        );
                     }
                 }
             }
         }
 
-        let output = Command::new("nvidia-smi")
-            .args([
-                "--query-gpu=temperature.gpu,temperature.memory,fan.speed,power.draw",
-                "--format=csv,noheader,nounits",
-            ])
-            .output();
-
-        let Ok(output) = output else {
-            return;
-        };
-        if !output.status.success() {
-            return;
+        if fresh.is_empty() {
+            fresh = nvml_fallbacks;
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut fresh = HashMap::new();
-        for (idx, line) in stdout.lines().enumerate() {
-            let mut parts = line.split(',').map(|s| s.trim());
-            let temp_c = parts.next().and_then(parse_u32_field);
-            let nvidia_smi_memory_temp_c = parts.next().and_then(parse_u32_field);
-            let fan_percent = parts.next().and_then(parse_u32_field);
-            let power_draw_w = parts.next().and_then(parse_f32_field);
-            let memory_temp_c = normalize_memory_temp_c(
-                nvidia_smi_memory_temp_c,
-                nvml_memory_temps.get(&(idx as u32)).copied(),
-            );
-            fresh.insert(
-                idx as u32,
-                GpuTelemetry {
-                    temp_c,
-                    memory_temp_c,
-                    fan_percent,
-                    power_draw_w,
-                },
-            );
-        }
-
+        let should_clear = fresh.is_empty();
+        let has_any_memory_temp = fresh.values().any(|entry| entry.memory_temp_c.is_some());
         if let Ok(mut map) = self.gpu_telemetry.lock() {
             *map = fresh;
+        }
+
+        if should_clear {
+            if let Ok(mut map) = self.gpu_telemetry.lock() {
+                *map = HashMap::new();
+            }
+        }
+
+        if self.hiveos.load(Ordering::Acquire) && !has_any_memory_temp {
+            if let Some(hiveos_memtemps) = read_hiveos_nvtool_memtemps() {
+                if let Ok(mut map) = self.gpu_telemetry.lock() {
+                    for (idx, memtemp) in hiveos_memtemps {
+                        if let Some(entry) = map.get_mut(&idx) {
+                            entry.memory_temp_c = Some(memtemp);
+                        } else {
+                            map.insert(idx, GpuTelemetry { temp_c: None, memory_temp_c: Some(memtemp), fan_percent: None, power_draw_w: None });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -237,6 +310,8 @@ impl MinerStats {
             .expect("mining address mutex poisoned")
             .clone();
 
+        let device_blocks_found = self.device_blocks_found.lock().expect("device block count mutex poisoned").clone();
+        let device_blocks_rejected = self.device_blocks_rejected.lock().expect("device rejected block count mutex poisoned").clone();
         let mut devices = self
             .device_hashrate_hs
             .lock()
@@ -248,6 +323,8 @@ impl MinerStats {
                 DeviceRate {
                     id: id.clone(),
                     hashrate_hs: *rate,
+                    blocks_found: device_blocks_found.get(id).copied().unwrap_or(0),
+                    blocks_rejected: device_blocks_rejected.get(id).copied().unwrap_or(0),
                     temp_c: telem.and_then(|t| t.temp_c),
                     memory_temp_c: telem.and_then(|t| t.memory_temp_c),
                     fan_percent: telem.and_then(|t| t.fan_percent),
@@ -296,13 +373,78 @@ fn parse_f32_field(value: &str) -> Option<f32> {
         .and_then(|x| x.parse::<f32>().ok())
 }
 
+fn prefer_nvml_u32_or_nvidia_smi(nvml_value: Option<u32>, nvidia_smi_value: Option<u32>) -> Option<u32> {
+    nvml_value.filter(|temp| *temp > 0).or_else(|| nvidia_smi_value.filter(|temp| *temp > 0))
+}
+
+fn prefer_nvml_f32_or_nvidia_smi(nvml_value: Option<f32>, nvidia_smi_value: Option<f32>) -> Option<f32> {
+    nvml_value.filter(|value| *value > 0.0).or_else(|| nvidia_smi_value.filter(|value| *value > 0.0))
+}
+
+fn normalize_power_draw_w(nvml_power_mw: Option<f32>, nvidia_smi_power_w: Option<f32>) -> Option<f32> {
+    let nvml_power_w = nvml_power_mw.map(|mw| mw / 1000.0);
+    let nvidia_smi_power_w = nvidia_smi_power_w.filter(|value| *value > 0.0);
+    nvml_power_w.filter(|value| *value > 0.0).or(nvidia_smi_power_w)
+}
+
+fn should_query_nvidia_smi(telemetry: &HashMap<u32, GpuTelemetry>, hiveos: bool) -> bool {
+    telemetry.is_empty()
+        || telemetry.values().any(|entry| {
+            entry.temp_c.is_none()
+                || entry.fan_percent.is_none()
+                || entry.power_draw_w.is_none()
+                || (entry.memory_temp_c.is_none() && !hiveos)
+        })
+}
+
 fn normalize_memory_temp_c(nvidia_smi_temp_c: Option<u32>, nvml_temp_c: Option<u32>) -> Option<u32> {
-    nvml_temp_c.filter(|temp| *temp > 0).or_else(|| nvidia_smi_temp_c.filter(|temp| *temp > 0))
+    prefer_nvml_u32_or_nvidia_smi(nvml_temp_c, nvidia_smi_temp_c)
+}
+
+fn read_hiveos_nvtool_memtemps() -> Option<HashMap<u32, u32>> {
+    let output = Command::new("nvtool").arg("--memtemp").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(parse_nvtool_memtemp_output(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn parse_nvtool_memtemp_output(output: &str) -> HashMap<u32, u32> {
+    let mut memtemps = HashMap::new();
+    let mut current_device: Option<u32> = None;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(device_id) = trimmed.strip_prefix("DEVICE #") {
+            if let Some(idx_str) = device_id.split(':').next() {
+                if let Ok(idx) = idx_str.parse::<u32>() {
+                    current_device = Some(idx);
+                }
+            }
+            continue;
+        }
+
+        if let Some(idx) = current_device {
+            if let Some(temp_text) = trimmed.split("MEM TEMPERATURE:").nth(1) {
+                let temp_text = temp_text.split('C').next().unwrap_or_default().trim();
+                if let Ok(temp) = temp_text.parse::<u32>() {
+                    if temp > 0 {
+                        memtemps.insert(idx, temp);
+                    }
+                }
+                current_device = None;
+            }
+        }
+    }
+
+    memtemps
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_memory_temp_c;
+    use super::{normalize_memory_temp_c, normalize_power_draw_w, parse_nvtool_memtemp_output, prefer_nvml_f32_or_nvidia_smi, prefer_nvml_u32_or_nvidia_smi, should_query_nvidia_smi};
+    use std::collections::HashMap;
 
     #[test]
     fn prefers_nvml_memory_temp_when_available() {
@@ -310,7 +452,27 @@ mod tests {
     }
 
     #[test]
+    fn prefers_nvml_u32_values_over_nvidia_smi_when_available() {
+        assert_eq!(prefer_nvml_u32_or_nvidia_smi(Some(55), Some(70)), Some(55));
+    }
+
+    #[test]
     fn falls_back_to_nvidia_smi_when_nvml_is_missing() {
+        assert_eq!(prefer_nvml_u32_or_nvidia_smi(None, Some(70)), Some(70));
+    }
+
+    #[test]
+    fn treats_zero_as_missing_for_nvml_u32_values() {
+        assert_eq!(prefer_nvml_u32_or_nvidia_smi(Some(0), Some(70)), Some(70));
+    }
+
+    #[test]
+    fn prefers_nvml_f32_values_over_nvidia_smi_when_available() {
+        assert_eq!(prefer_nvml_f32_or_nvidia_smi(Some(320.0), Some(350.0)), Some(320.0));
+    }
+
+    #[test]
+    fn falls_back_to_nvidia_smi_memory_temp_when_nvml_is_missing() {
         assert_eq!(normalize_memory_temp_c(Some(70), None), Some(70));
     }
 
@@ -318,6 +480,52 @@ mod tests {
     fn ignores_zero_values() {
         assert_eq!(normalize_memory_temp_c(Some(0), Some(0)), None);
     }
+
+    #[test]
+    fn parses_hiveos_nvtool_memtemps() {
+        let output = r#"HiveOS Nvtool 1.8.6
+DEVICE #0:
+  MEM TEMPERATURE: 72 C
+DEVICE #1:
+  MEM TEMPERATURE: 0 C [Not Supported]"#;
+
+        let memtemps = parse_nvtool_memtemp_output(output);
+        assert_eq!(memtemps.get(&0), Some(&72));
+        assert!(memtemps.get(&1).is_none());
+    }
+
+    #[test]
+    fn skips_nvidia_smi_when_nvml_already_has_complete_telemetry() {
+        let mut telemetry = HashMap::new();
+        telemetry.insert(
+            0,
+            super::GpuTelemetry {
+                temp_c: Some(70),
+                memory_temp_c: Some(72),
+                fan_percent: Some(80),
+                power_draw_w: Some(250.0),
+            },
+        );
+
+        assert!(!should_query_nvidia_smi(&telemetry, false));
+    }
+
+    #[test]
+    fn queries_nvidia_smi_when_any_nvml_value_is_missing() {
+        let mut telemetry = HashMap::new();
+        telemetry.insert(
+            0,
+            super::GpuTelemetry {
+                temp_c: Some(70),
+                memory_temp_c: Some(72),
+                fan_percent: Some(80),
+                power_draw_w: None,
+            },
+        );
+
+        assert!(should_query_nvidia_smi(&telemetry, false));
+    }
+
 }
 
 pub fn spawn_stats_server(stats: Arc<MinerStats>, bind_addr: String, port: u16) -> std::io::Result<thread::JoinHandle<()>> {

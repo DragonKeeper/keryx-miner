@@ -164,7 +164,7 @@ impl MinerManager {
         let opoi_challenge_active = Arc::new(AtomicBool::new(false));
         let (send, recv) = watch::channel(None);
         let mut handles =
-            Self::launch_cpu_threads(send_channel.clone(), Arc::clone(&hashes_tried), recv.clone(), n_cpus)
+            Self::launch_cpu_threads(send_channel.clone(), Arc::clone(&hashes_tried), recv.clone(), n_cpus, Arc::clone(&stats))
                 .collect::<Vec<MinerHandler>>();
         if manager.has_specs() {
             handles.append(&mut Self::launch_gpu_threads(
@@ -173,6 +173,7 @@ impl MinerManager {
                 recv,
                 manager,
                 hashes_by_worker.clone(),
+                Arc::clone(&stats),
             ));
         }
         let logger_stop = Arc::new(AtomicBool::new(false));
@@ -210,11 +211,12 @@ impl MinerManager {
         hashes_tried: Arc<AtomicU64>,
         work_channel: watch::Receiver<Option<WorkerCommand>>,
         n_cpus: Option<u16>,
+        stats: Arc<MinerStats>,
     ) -> impl Iterator<Item = MinerHandler> {
         let n_cpus = get_num_cpus(n_cpus);
         info!("launching: {} cpu miners", n_cpus);
         (0..n_cpus)
-            .map(move |_| Self::launch_cpu_miner(send_channel.clone(), work_channel.clone(), Arc::clone(&hashes_tried)))
+            .map(move |_| Self::launch_cpu_miner(send_channel.clone(), work_channel.clone(), Arc::clone(&hashes_tried), Arc::clone(&stats)))
     }
 
     fn launch_gpu_threads(
@@ -223,18 +225,22 @@ impl MinerManager {
         work_channel: watch::Receiver<Option<WorkerCommand>>,
         manager: &PluginManager,
         hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+        stats: Arc<MinerStats>,
     ) -> Vec<MinerHandler> {
         let mut vec = Vec::<MinerHandler>::new();
         let specs = manager.build().unwrap();
         for spec in specs {
+            let device_id = spec.id();
             let worker_hashes_tried = Arc::new(AtomicU64::new(0));
-            hashes_by_worker.lock().unwrap().insert(spec.id(), worker_hashes_tried.clone());
+            hashes_by_worker.lock().unwrap().insert(device_id.clone(), worker_hashes_tried.clone());
             vec.push(Self::launch_gpu_miner(
                 send_channel.clone(),
                 work_channel.clone(),
                 Arc::clone(&hashes_tried),
                 spec,
                 worker_hashes_tried,
+                Arc::clone(&stats),
+                device_id,
             ));
         }
         vec
@@ -250,6 +256,10 @@ impl MinerManager {
 
     pub fn record_block_rejected(&self) {
         self.stats.inc_rejected_blocks();
+    }
+
+    pub fn record_block_rejected_for_device(&self, device_id: &str) {
+        self.stats.inc_device_blocks_rejected(device_id);
     }
 
     pub fn record_claim_accepted(&self, outputs: u64, amount_sompi: u64) {
@@ -294,6 +304,8 @@ impl MinerManager {
         hashes_tried: Arc<AtomicU64>,
         spec: Box<dyn WorkerSpec>,
         worker_hashes_tried: Arc<AtomicU64>,
+        stats: Arc<MinerStats>,
+        device_id: String,
     ) -> MinerHandler {
         std::thread::spawn(move || {
             let mut box_ = spec.build();
@@ -378,10 +390,11 @@ impl MinerManager {
                             });
                             if let Some(block_seed) = built {
                                 match send_channel.blocking_send(block_seed.clone()) {
-                                    Ok(()) => block_seed.report_block(),
+                                    Ok(()) => block_seed.report_block(&gpu_work.id()),
                                     Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
                                 };
-                                if let BlockSeed::FullBlock(_) = block_seed {
+                                if let BlockSeed::FullBlock(_) = &block_seed {
+                                    stats.inc_device_blocks_found(&device_id);
                                     state = None;
                                 }
                             }
@@ -414,10 +427,11 @@ impl MinerManager {
                     if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::pom_activation_daa() {
                         if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
                             match send_channel.blocking_send(block_seed.clone()) {
-                                Ok(()) => block_seed.report_block(),
+                                Ok(()) => block_seed.report_block(&gpu_work.id()),
                                 Err(e) => error!("Failed submitting block: ({})", e.to_string()),
                             };
-                            if let BlockSeed::FullBlock(_) = block_seed {
+                            if let BlockSeed::FullBlock(_) = &block_seed {
+                                stats.inc_device_blocks_found(&device_id);
                                 state = None;
                             }
                             nonces[0] = 0;
@@ -488,6 +502,7 @@ impl MinerManager {
         send_channel: Sender<BlockSeed>,
         mut block_channel: watch::Receiver<Option<WorkerCommand>>,
         hashes_tried: Arc<AtomicU64>,
+        stats: Arc<MinerStats>,
     ) -> MinerHandler {
         let mut nonce = Wrapping(thread_rng().next_u64());
         let mut mask = Wrapping(0);
@@ -537,10 +552,11 @@ impl MinerManager {
                     };
                     if let Some(block_seed) = found {
                         match send_channel.blocking_send(block_seed.clone()) {
-                            Ok(()) => block_seed.report_block(),
+                            Ok(()) => block_seed.report_block("CPU"),
                             Err(e) => error!("Failed submitting block: ({})", e.to_string()),
                         };
-                        if let BlockSeed::FullBlock(_) = block_seed {
+                        if let BlockSeed::FullBlock(_) = &block_seed {
+                            stats.inc_device_blocks_found("CPU");
                             state = None;
                         }
                     }

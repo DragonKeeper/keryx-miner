@@ -674,6 +674,7 @@ impl KeryxdHandler {
                 }
                 Some(e) => {
                     miner.record_block_rejected();
+                    miner.record_block_rejected_for_device("CPU");
                     warn!("Failed submitting block: {:?}", e);
                 }
             },
