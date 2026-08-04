@@ -424,7 +424,9 @@ fn should_query_nvidia_smi(
                 || entry.power_draw_w.is_none()
                 || (!hiveos
                     && entry.memory_temp_c.is_none()
-                    && !memory_temp_supported.get(gpu_idx).copied().unwrap_or(false))
+                    // Re-query only while support is unknown or expected: a recorded `false`
+                    // (probed, no memory-temp sensor) must stop the per-tick nvidia-smi spawns.
+                    && memory_temp_supported.get(gpu_idx).copied().unwrap_or(true))
         })
 }
 
@@ -473,8 +475,8 @@ fn parse_nvtool_memtemp_output(output: &str) -> HashMap<u32, u32> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{normalize_memory_temp_c, normalize_power_draw_w, parse_nvtool_memtemp_output, prefer_nvml_f32_or_nvidia_smi, prefer_nvml_u32_or_nvidia_smi, should_query_nvidia_smi};
+mod telemetry_tests {
+    use super::{normalize_memory_temp_c, parse_nvtool_memtemp_output, prefer_nvml_f32_or_nvidia_smi, prefer_nvml_u32_or_nvidia_smi, should_query_nvidia_smi};
     use std::collections::HashMap;
 
     #[test]
