@@ -540,6 +540,10 @@ async fn run() -> Result<(), Error> {
     let mut opt: Opt = Opt::from_arg_matches(&matches)?;
     opt.process()?;
 
+    if opt.resident_tree {
+        std::env::set_var("KERYX_RESIDENT_TREE", "1");
+    }
+
     // Model storage root is configurable: explicit --models-dir wins, otherwise
     // --hiveos defaults to a stable shared HiveOS path.
     if let Some(dir) = opt.models_dir.as_ref() {
