@@ -749,6 +749,17 @@ fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> Result<We
     })
 }
 
+/// Available RAM in bytes from /proc/meminfo (Linux); None if unavailable.
+pub fn available_ram_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            return rest.split_whitespace().next()?.parse::<u64>().ok().map(|kb| kb * 1024);
+        }
+    }
+    None
+}
+
 impl WeightIndex {
     /// Build from a GGUF on disk (pread of each tensor's raw bytes). The bytes are the GGUF's
     /// exact on-disk quantized bytes — the same the miner serves in VRAM and the builder pinned
