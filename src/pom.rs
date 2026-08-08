@@ -605,12 +605,10 @@ enum ChunkSource {
     /// Test-only: production always uses `Gguf`, so it is compiled out of release builds.
     #[cfg(test)]
     Ram(Vec<u8>),
-    /// Chunks read on demand from the GGUF via `pread` — NO host copy (saves ~1x model size of
-    /// RAM, ~28 GB for the top tier). `table[j] = (canonical chunk index of tensor j's first chunk,
-    /// absolute file byte offset of that chunk)`, ascending by chunk index; `read_chunk`
-    /// binary-searches it. The leaves are hashed from the same on-disk quantized bytes
-    /// (`pread` at the same `tensor_data_offset + offset`), so reader and builder agree.
-    Gguf { file: File, table: Vec<(u64, u64)> },
+    /// Chunks read from the memory-mapped GGUF (OS page cache handles residency; no explicit host
+    /// copy). `table[j] = (canonical chunk index of tensor j's first chunk, absolute file byte
+    /// offset of that chunk)`, ascending by chunk index; `read_chunk` binary-searches it.
+    Gguf { mmap: memmap2::Mmap, table: Vec<(u64, u64)> },
 }
 
 /// One checkpoint level stored on disk in the sparse Merkle tree file.
@@ -736,11 +734,11 @@ fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> Result<We
     let mut r_t = [0u8; 32];
     read_exact_at(&tree_file, &mut r_t, root_cp.offset)?;
 
-    let gguf = File::open(gguf_path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&File::open(gguf_path)?)? };
     Ok(WeightIndex {
         n_chunks,
         r_t,
-        chunks: ChunkSource::Gguf { file: gguf, table },
+        chunks: ChunkSource::Gguf { mmap, table },
         tree_file,
         tree_path: tree_path.to_path_buf(),
         checkpoints,
@@ -864,12 +862,12 @@ impl WeightIndex {
         drop(writer);
         let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n_chunks)?;
 
-        let gguf = File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&File::open(path)?)? };
         let tree_file = File::open(&tree_path)?;
         Ok(WeightIndex {
             n_chunks,
             r_t,
-            chunks: ChunkSource::Gguf { file: gguf, table },
+            chunks: ChunkSource::Gguf { mmap, table },
             tree_file,
             tree_path,
             checkpoints,
@@ -892,10 +890,11 @@ impl WeightIndex {
                 let base = (off as usize) * 32;
                 arr.copy_from_slice(&data[base..base + 32]);
             }
-            ChunkSource::Gguf { file, table } => {
+            ChunkSource::Gguf { mmap, table } => {
                 let j = table.partition_point(|&(start, _)| start <= off) - 1;
                 let (start, file_off) = table[j];
-                read_exact_at(file, &mut arr, file_off + (off - start) * 32).expect("PoM gguf chunk read");
+                let b = (file_off + (off - start) * 32) as usize;
+                arr.copy_from_slice(&mmap[b..b + 32]);
             }
         }
         arr
@@ -1406,7 +1405,7 @@ mod tests {
             f.seek(SeekFrom::Start(pos)).unwrap();
         }
         f.flush().unwrap();
-        let file = File::open(&gguf_path).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&File::open(&gguf_path).unwrap()).unwrap() };
 
         // Build the sparse checkpoint tree over the canonical synth chunks, with the GGUF chunk source.
         let tree_path = std::env::temp_dir().join(format!("keryx-pom-fakegguf-tree-{uid}.bin"));
@@ -1436,7 +1435,7 @@ mod tests {
         let idx = WeightIndex {
             n_chunks: n,
             r_t,
-            chunks: ChunkSource::Gguf { file, table },
+            chunks: ChunkSource::Gguf { mmap, table },
             tree_file,
             tree_path,
             checkpoints,
