@@ -854,7 +854,13 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         if crate::pom::active_index_for_tier(tier).is_none() {
             info!("PoM: building host weight index for tier {} (gpu{}) - this can take a while...", tier, device_id);
             match crate::pom::WeightIndex::build_from_gguf(&gguf) {
-                Ok(idx) => {
+                Ok(mut idx) => {
+                    // Opt-in: hold the full Merkle tree in RAM (~2N nodes) for lookup-time proof
+                    // build. Needs the RAM budget; off by default.
+                    if std::env::var("KERYX_RESIDENT_TREE").is_ok_and(|v| v == "1") {
+                        info!("PoM: building resident tree for tier {} (RAM)...", tier);
+                        idx.build_dense();
+                    }
                     info!("PoM: tier {} host index ready — N={} chunks", tier, idx.n_chunks);
                     crate::pom::set_index(tier, idx);
                 }

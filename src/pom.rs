@@ -642,6 +642,9 @@ pub struct WeightIndex {
     checkpoints: Vec<StoredLevel>,
     /// Full tree depth: levels 0..total_levels-1 where total_levels-1 is the root.
     total_levels: u32,
+    /// Optional in-RAM dense tree (all levels). When present, `merkle_path` is a pure lookup
+    /// instead of the sparse recompute.
+    dense: Option<Vec<Vec<[u8; 32]>>>,
 }
 
 impl Drop for WeightIndex {
@@ -742,6 +745,7 @@ fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> Result<We
         tree_path: tree_path.to_path_buf(),
         checkpoints,
         total_levels,
+        dense: None,
     })
 }
 
@@ -859,6 +863,7 @@ impl WeightIndex {
             tree_path,
             checkpoints,
             total_levels,
+            dense: None,
         })
     }
 
@@ -933,10 +938,40 @@ impl WeightIndex {
         fold_levels(&nodes, rounds)
     }
 
+    /// Build the in-RAM dense tree; afterwards `merkle_path` is a pure lookup. Reads every chunk once.
+    pub fn build_dense(&mut self) {
+        if self.dense.is_some() {
+            return;
+        }
+        let mut levels: Vec<Vec<[u8; 32]>> = vec![(0..self.n_chunks).map(|i| blake(&self.read_chunk_bytes(i))).collect()];
+        while levels.last().unwrap().len() > 1 {
+            let cur = levels.last().unwrap();
+            let mut next = Vec::with_capacity(cur.len().div_ceil(2));
+            let mut i = 0;
+            while i < cur.len() {
+                let r = if i + 1 < cur.len() { cur[i + 1] } else { cur[i] };
+                next.push(hash_pair(&cur[i], &r));
+                i += 2;
+            }
+            levels.push(next);
+        }
+        self.dense = Some(levels);
+    }
+
     /// Inclusion path for chunk index `off`, reading stored siblings from the checkpoint file
     /// and computing unstored intermediate levels on-the-fly from the GGUF.
     /// Byte-identical to the full-tree `merkle_path`: an out-of-range sibling is the node itself.
     pub fn merkle_path(&self, off: u64) -> Vec<[u8; 32]> {
+        if let Some(dense) = &self.dense {
+            let mut path = Vec::with_capacity(dense.len().saturating_sub(1));
+            let mut idx = off as usize;
+            for level in &dense[..dense.len() - 1] {
+                let sib = idx ^ 1;
+                path.push(if sib < level.len() { level[sib] } else { level[idx] });
+                idx >>= 1;
+            }
+            return path;
+        }
         let total_levels = self.total_levels;
         let mut path = Vec::with_capacity(total_levels as usize);
         let mut idx: u64 = off;
@@ -1277,6 +1312,7 @@ mod tests {
             tree_path,
             checkpoints,
             total_levels,
+            dense: None,
         }
     }
 
@@ -1286,6 +1322,22 @@ mod tests {
     /// at one node). The dense reference is `merkle_root_mini` over ALL leaves at once (it reduces
     /// straight to the true root, un-batched), which is exactly what `pom-rt-builder` pins in
     /// `POM_TIERS`. Includes the report's known-broken sizes (2000, 4968, 12345, 100000).
+    #[test]
+    fn dense_merkle_path_matches_sparse() {
+        for n in [64u64, 65, 100, 1000, 2000, 4096, 4968, 12345, 65536, 100000, 131072] {
+            let mut idx = synth_index(n);
+            let step = (n as usize / 37).max(1);
+            let offs: Vec<u64> = (0..n).step_by(step).collect();
+            let sparse: Vec<Vec<[u8; 32]>> = offs.iter().map(|&o| idx.merkle_path(o)).collect();
+            idx.build_dense();
+            for (k, &o) in offs.iter().enumerate() {
+                assert_eq!(idx.merkle_path(o), sparse[k], "path mismatch n={n} off={o}");
+            }
+            let dense = idx.dense.as_ref().unwrap();
+            assert_eq!(dense.last().unwrap()[0], idx.r_t, "dense root != r_t, n={n}");
+        }
+    }
+
     #[test]
     fn sparse_build_root_matches_dense_root() {
         for n in [64u64, 65, 100, 1000, 2000, 4096, 4968, 12345, 65536, 100000, 131072] {
@@ -1378,6 +1430,7 @@ mod tests {
             tree_path,
             checkpoints,
             total_levels,
+            dense: None,
         };
 
         // Every chunk read by pread matches the canonical chunk, across all segments + padding.
