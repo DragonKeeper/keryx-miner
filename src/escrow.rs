@@ -489,6 +489,16 @@ impl EscrowWatcher {
         hex::encode(self.pubkey_bytes)
     }
 
+    /// The x-only public key of the escrow key.
+    pub fn pubkey_bytes(&self) -> [u8; 32] {
+        self.pubkey_bytes
+    }
+
+    /// The escrow secret, for opening private-inference envelopes sealed to this key.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.secret_key.secret_bytes()
+    }
+
     /// V2 responder identity for an AiResponse: schnorr signature with the escrow key over the
     /// domain-hashed v1 payload bytes — MUST match the node's `verified_responder`
     /// (blake2b-256("KeryxServiceResponderV1" || signed_bytes)).
@@ -1892,6 +1902,43 @@ mod tests {
         hasher.update(&bad);
         let bad_msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
         assert!(secp256k1::SECP256K1.verify_schnorr(&sig, &bad_msg, &pk).is_err());
+    }
+
+    /// With an inline private body the signed message grows to cover the extension, so a
+    /// relayer swapping the body under a signed head fails verification.
+    #[test]
+    fn responder_signature_covers_the_private_body() {
+        let dir = std::env::temp_dir().join(format!("keryx-escrow-body-test-{}", std::process::id()));
+        let privkey = "1111111111111111111111111111111111111111111111111111111111111111";
+        let w = EscrowWatcher::new(
+            privkey,
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            dir,
+        )
+        .unwrap();
+
+        let body = vec![0xABu8; 40];
+        let unsigned = keryx_inference::AiResponsePayload::new([9u8; 32], 123, [7u8; 34], 5).with_private_body(body.clone());
+        let signed_bytes = unsigned.signed_bytes();
+        assert_eq!(signed_bytes.len(), keryx_inference::AI_RESPONSE_PAYLOAD_LEN + keryx_inference::AI_RESPONSE_EXT_HEADER_LEN + 40);
+        let r = w.sign_responder(&signed_bytes);
+        let resp = keryx_inference::AiResponsePayload::new_v2([9u8; 32], 123, [7u8; 34], 5, r).with_private_body(body);
+        let parsed = keryx_inference::AiResponsePayload::deserialize(&resp.serialize()).unwrap();
+        assert_eq!(parsed.signed_bytes(), signed_bytes);
+
+        let verify = |msg_bytes: &[u8]| {
+            let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+            hasher.update(b"KeryxServiceResponderV1");
+            hasher.update(msg_bytes);
+            let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+            let pk = secp256k1::XOnlyPublicKey::from_slice(&r.escrow_pubkey).unwrap();
+            let sig = secp256k1::schnorr::Signature::from_slice(&r.signature).unwrap();
+            secp256k1::SECP256K1.verify_schnorr(&sig, &msg, &pk).is_ok()
+        };
+        assert!(verify(&signed_bytes));
+        let mut swapped = parsed.clone();
+        swapped.private_body = Some(vec![0xCDu8; 40]);
+        assert!(!verify(&swapped.signed_bytes()));
     }
 
     /// Both escrow scripts must match what the node's `ScriptBuilder::add_sequence` emits:
