@@ -449,7 +449,12 @@ impl StratumHandler {
                                 return miner.process_block(None).await;
                             }
                             if let Some(task_json) = job.task_json {
-                                if self.handle_ai_task(job.id.clone(), task_json, miner).await {
+                                // The task path publishes plaintext answers to IPFS; from the
+                                // private-inference gate on only the pool can build an answer.
+                                if job.daa_score >= keryx_miner::pom::private_inference_activation_daa() {
+                                    warn!("OPoI: pool still dispatches inference tasks; private inference needs a v3 pool (mining.ai_request) — task ignored");
+                                    *self.current_task_slot.lock().await = None;
+                                } else if self.handle_ai_task(job.id.clone(), task_json, miner).await {
                                     return Ok(());
                                 }
                             } else {
