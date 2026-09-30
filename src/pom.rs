@@ -1568,7 +1568,7 @@ pub fn reward_routing_activation_daa() -> u64 {
 /// before it the sealed body goes to IPFS and the response stays body-less. MUST equal the
 /// node's `private_inference_activation`. `u64::MAX` = never (dormant).
 pub fn private_inference_activation_daa() -> u64 {
-    gate(u64::MAX, u64::MAX)
+    gate(u64::MAX, 2_000)
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
