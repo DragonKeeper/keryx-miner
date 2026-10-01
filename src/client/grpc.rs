@@ -107,6 +107,10 @@ pub struct KeryxdHandler {
     /// Stable IDs already queued or in-flight — used for deduplication.
     ai_seen_prefixes: std::collections::HashSet<String>,
 
+    /// Stable IDs of requests this escrow key has already answered on-chain; such a request is
+    /// never served again (the node rejects the duplicate, the inference would be wasted).
+    ai_answered_by_me: std::collections::HashSet<String>,
+
     /// Maps stable_id → (txid, inference_reward_sompi) for confirmed AiRequest TXs.
     /// Used by poll_inference to register the escrow outpoint after a successful AiResponse.
     ai_request_txids: std::collections::HashMap<String, (String, u64)>,
@@ -303,6 +307,7 @@ impl KeryxdHandler {
             ai_request_queue: VecDeque::new(),
             validation_queue: VecDeque::new(),
             ai_seen_prefixes: std::collections::HashSet::new(),
+            ai_answered_by_me: std::collections::HashSet::new(),
             ai_request_txids: std::collections::HashMap::new(),
             ai_response_inflight: std::collections::HashMap::new(),
             backfill_cutoff_daa: None,
@@ -437,6 +442,18 @@ impl KeryxdHandler {
         // digest before. Decided from the daa of the block the request is observed in, so both
         // sides classify a request the same way across the activation.
         let txid_identity = block_daa >= keryx_miner::pom::reward_routing_activation_daa();
+        if let Some(mine) = self.escrow_watcher.as_ref().map(|w| w.pubkey_bytes()) {
+            for sid in Self::own_answered_request_ids(txs, &mine) {
+                if self.ai_answered_by_me.insert(sid.clone()) {
+                    log::debug!("OPoI: request id={} already answered by this miner on-chain", sid);
+                }
+                self.ai_request_queue.retain(|(queued, ..)| *queued != sid);
+            }
+            if self.ai_answered_by_me.len() > MAX_AI_SEEN_IDS {
+                self.ai_answered_by_me.clear();
+                self.ai_answered_by_me.shrink_to_fit();
+            }
+        }
         // Hard gate: if no models are ready, refuse to accept any AiRequest.
         // Prevents miners with missing/truncated model files from ever queuing inference work.
         let ready_ids = keryx_miner::slm::loaded_model_ids();
@@ -499,6 +516,10 @@ impl KeryxdHandler {
                     blake2b_simd::blake2b(&raw).as_bytes()[..32].try_into().unwrap()
                 };
                 let stable_id = hex::encode(&request_hash[..8]);
+                if self.ai_answered_by_me.contains(&stable_id) {
+                    log::debug!("OPoI: skipping AiRequest id={} — already answered by this miner", stable_id);
+                    continue;
+                }
                 if !self.ai_seen_prefixes.contains(&stable_id) {
                     info!("OPoI: queued AiRequest id={}", stable_id);
                     self.ai_seen_prefixes.insert(stable_id.clone());
@@ -526,6 +547,17 @@ impl KeryxdHandler {
                 }
             }
         }
+    }
+
+    /// Stable IDs of the requests answered in `txs` by the responder `mine`.
+    fn own_answered_request_ids(txs: &[crate::proto::RpcTransaction], mine: &[u8; 32]) -> Vec<String> {
+        txs.iter()
+            .filter(|tx| tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_RESPONSE_HEX)
+            .filter_map(|tx| hex::decode(&tx.payload).ok())
+            .filter_map(|raw| keryx_inference::AiResponsePayload::deserialize(&raw))
+            .filter(|resp| resp.responder.as_ref().is_some_and(|r| r.escrow_pubkey == *mine))
+            .map(|resp| hex::encode(&resp.request_hash[..8]))
+            .collect()
     }
 
     /// Opens a private request with the escrow key. `None` when the request is not for this
@@ -636,6 +668,11 @@ impl KeryxdHandler {
     fn try_start_inference(&mut self) {
         if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() || keryx_miner::slm::probe_in_flight() {
             return;
+        }
+        while self.ai_request_queue.front().is_some_and(|(sid, ..)| self.ai_answered_by_me.contains(sid)) {
+            if let Some((sid, ..)) = self.ai_request_queue.pop_front() {
+                info!("OPoI: request id={} already answered by this miner — skipped", sid);
+            }
         }
         if let Some((stable_id, request_hash, model_id, prompt, max_tokens, private)) = self.ai_request_queue.pop_front() {
             let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
@@ -1317,6 +1354,26 @@ impl Drop for KeryxdHandler {
 mod tests {
     use super::PrivateRequest;
     use keryx_inference::{escrow_pubkey_of, open_response, seal_request, AiRequestPayload};
+
+    /// Only the responses signed by this miner's escrow key mark a request as already answered.
+    #[test]
+    fn own_answered_request_ids_keeps_only_this_responder() {
+        use keryx_inference::{AiResponder, AiResponsePayload};
+        let mine = [0xAAu8; 32];
+        let other = [0xBBu8; 32];
+        let response = |request_hash: [u8; 32], key: [u8; 32]| crate::proto::RpcTransaction {
+            subnetwork_id: keryx_inference::SUBNETWORK_ID_AI_RESPONSE_HEX.to_string(),
+            payload: hex::encode(
+                AiResponsePayload::new_v2(request_hash, 10, [0x12u8; 34], 3, AiResponder { escrow_pubkey: key, signature: [0u8; 64] })
+                    .serialize(),
+            ),
+            ..Default::default()
+        };
+        let txs = vec![response([1u8; 32], mine), response([2u8; 32], other), response([3u8; 32], mine)];
+        let ids = super::KeryxdHandler::own_answered_request_ids(&txs, &mine);
+        assert_eq!(ids, vec![hex::encode(&[1u8; 8]), hex::encode(&[3u8; 8])]);
+        assert!(super::KeryxdHandler::own_answered_request_ids(&txs, &[0xCCu8; 32]).is_empty());
+    }
 
     /// A private request is opened for a named recipient, skipped for anyone else, and queued as
     /// unreadable when addressed to this key but tampered with.
