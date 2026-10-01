@@ -82,8 +82,20 @@ struct Engine {
     generate: GenFn,
     free: FreeFn,
     tensor_device: Option<TensorDeviceFn>,
+    last_error: Option<ErrorFn>,
     gguf: String,
     attempt: u64,
+}
+
+/// Why a generation produced no text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenError {
+    /// No engine hosts this GGUF on this GPU.
+    Unavailable,
+    /// The prompt does not fit the engine's context window.
+    PromptTooLong(String),
+    /// Any other native failure, with the engine's detail when it gave one.
+    Failed(String),
 }
 // The wrapper serializes generation internally; tensor info is read-only after load.
 unsafe impl Send for Engine {}
@@ -366,7 +378,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
                 return Err(failed("native_load", detail, true));
             }
         }
-        *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, gguf: gguf.to_string(), attempt });
+        *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, last_error, gguf: gguf.to_string(), attempt });
         log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference.");
         Ok(attempt)
     }
@@ -438,20 +450,24 @@ pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
     None
 }
 
-/// Generate OPoI text with the engine on `gpu`, which must host `gguf`. None on any failure.
-pub fn generate(gguf: &str, gpu: usize, prompt: &str, max_tokens: usize) -> Option<String> {
+/// Generate OPoI text with the engine on `gpu`, which must host `gguf`.
+pub fn generate(gguf: &str, gpu: usize, prompt: &str, max_tokens: usize) -> Result<String, GenError> {
     let slot = slot(gpu);
-    let g = slot.lock().ok()?;
-    let e = g.as_ref().filter(|e| e.gguf == gguf)?;
-    let cp = CString::new(prompt).ok()?;
+    let g = slot.lock().map_err(|_| GenError::Unavailable)?;
+    let e = g.as_ref().filter(|e| e.gguf == gguf).ok_or(GenError::Unavailable)?;
+    let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
     let mut buf = vec![0u8; 64 * 1024];
     let _native = native();
     let n = unsafe { (e.generate)(e.model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int) };
-    if n <= 0 {
-        return None;
+    if n < 0 {
+        let detail = e
+            .last_error
+            .map(|f| unsafe { CStr::from_ptr(f()) }.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        return Err(if n == -2 { GenError::PromptTooLong(detail) } else { GenError::Failed(detail) });
     }
     buf.truncate(n as usize);
-    String::from_utf8(buf).ok()
+    String::from_utf8(buf).map_err(|_| GenError::Failed("generated text is not UTF-8".to_string()))
 }
 
 #[cfg(test)]
@@ -502,9 +518,9 @@ mod tests {
         let first0 = ensure_loaded(&gpu0, 0).unwrap();
         assert!(active_for(&gpu1, 1));
         assert!(active_for(&gpu0, 0));
-        assert!(generate(&gpu1, 1, "Reply with only OK.", 16).is_some());
-        assert!(generate(&gpu0, 0, "Reply with only OK.", 16).is_some());
-        assert!(generate(&gpu1, 0, "Reply with only OK.", 16).is_none());
+        assert!(generate(&gpu1, 1, "Reply with only OK.", 16).is_ok());
+        assert!(generate(&gpu0, 0, "Reply with only OK.", 16).is_ok());
+        assert!(generate(&gpu1, 0, "Reply with only OK.", 16).is_err());
         assert_eq!(ensure_loaded(&gpu1, 1).unwrap(), first1);
         assert_eq!(ensure_loaded(&gpu0, 0).unwrap(), first0);
         unload(0);
@@ -520,7 +536,7 @@ mod tests {
 
         ensure_loaded(&model, 0).unwrap();
         assert!(active_for(&model, 0));
-        assert!(generate(&model, 0, "Reply with only OK.", 16).is_some());
+        assert!(generate(&model, 0, "Reply with only OK.", 16).is_ok());
         unload(0);
     }
 }

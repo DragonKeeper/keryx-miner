@@ -847,16 +847,29 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     }
 
     match crate::llama_engine::generate(&gguf, dev_id as usize, &templated, max_tokens) {
-        Some(text) if !text.trim().is_empty() => {
+        Ok(text) if !text.trim().is_empty() => {
             mark_model_available(model_id, "generation_success");
             Some(text)
         }
-        _ => {
-            log::warn!("SlmEngine '{}': llama generate failed or empty — response dropped", spec.name);
+        Ok(_) => {
+            log::warn!("SlmEngine '{}': llama generate returned an empty answer — response dropped", spec.name);
+            None
+        }
+        Err(crate::llama_engine::GenError::PromptTooLong(detail)) => {
+            log::warn!("SlmEngine '{}': prompt too long ({}) — answering with the fixed error text", spec.name, detail);
+            mark_model_available(model_id, "generation_success");
+            Some(PROMPT_TOO_LONG_ANSWER.to_string())
+        }
+        Err(e) => {
+            log::warn!("SlmEngine '{}': llama generate failed ({:?}) — response dropped", spec.name, e);
             None
         }
     }
 }
+
+/// Answer sent when a request's prompt does not fit the model's context window.
+pub const PROMPT_TOO_LONG_ANSWER: &str =
+    "This request could not be served: the prompt is longer than the model's context window. Send a shorter message or less conversation history.";
 
 #[cfg(test)]
 mod tests {

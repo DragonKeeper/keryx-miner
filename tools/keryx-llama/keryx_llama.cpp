@@ -197,6 +197,9 @@ KERYX_EXPORT int keryx_llama_tensor_device(KeryxLlama* h, size_t i) {
 #endif
 }
 
+// Returns the bytes written, or -1 (arguments / tokenizer), -2 (prompt longer than the context,
+// detail in keryx_llama_last_error), -3 (prompt decode failed). The prompt is fed in batches of
+// at most n_batch tokens; generation stops when the context is full.
 KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
     if (!h || !prompt || !out || cap < 2) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
@@ -204,14 +207,26 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
 
     std::vector<llama_token> toks(strlen(prompt) + 16);
     int n = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt), toks.data(), (int32_t)toks.size(), true, true);
-    if (n < 0) return -1;
+    if (n <= 0) return -1;
     toks.resize(n);
 
+    const int n_ctx = (int)llama_n_ctx(h->ctx);
+    const int n_batch = std::max(1, (int)llama_n_batch(h->ctx));
+    if (n > n_ctx - 16) {
+        keryx_set_error("prompt", std::to_string(n) + " prompt tokens do not fit the " + std::to_string(n_ctx) + "-token context");
+        return -2;
+    }
+
     llama_memory_clear(llama_get_memory(h->ctx), true);
-    llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
+    for (int i = 0; i < n; i += n_batch) {
+        llama_batch batch = llama_batch_get_one(toks.data() + i, std::min(n_batch, n - i));
+        if (llama_decode(h->ctx, batch) != 0) {
+            keryx_set_error("decode", "llama_decode failed while reading the prompt");
+            return -3;
+        }
+    }
     int written = 0;
     for (int i = 0; i < max_tokens; i++) {
-        if (llama_decode(h->ctx, batch) != 0) break;
         llama_token tok = llama_sampler_sample(h->smpl, h->ctx, -1);
         if (llama_vocab_is_eog(vocab, tok)) break;
         char piece[256];
@@ -220,7 +235,8 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
         if (written + pn >= cap - 1) break;
         memcpy(out + written, piece, pn);
         written += pn;
-        batch = llama_batch_get_one(&tok, 1);
+        llama_batch batch = llama_batch_get_one(&tok, 1);
+        if (llama_decode(h->ctx, batch) != 0) break;
     }
     out[written] = 0;
     return written;
