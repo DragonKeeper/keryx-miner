@@ -42,7 +42,7 @@ pub struct ModelSpec {
     /// Local directory name under `<exe_dir>/models/`.
     pub dir_name: &'static str,
     /// Minimum VRAM (MB) required to actually serve this model: weights +
-    /// KV cache + CUDA workspace. Used by the OPoI capability gate so `ai:cap`
+    /// KV cache + CUDA workspace. Used by the capability gate so `ai:cap`
     /// never announces a model the miner cannot load. 0 = never gated.
     pub min_vram_mb: u64,
 }

@@ -1,8 +1,8 @@
-/// Phase-3 OPoI: model file management + inference dispatch.
+/// Phase-3 Inference: model file management + inference dispatch.
 ///
 /// Generation runs in the in-process llama.cpp engine (`llama_engine`, `libkeryx-llama.so`
 /// next to the binary): llama.cpp owns the single resident VRAM copy of the model — the PoM
-/// walk gathers straight over its tensors — and serves the OPoI text. This module owns the
+/// walk gathers straight over its tensors — and serves the inference text. This module owns the
 /// served-lineup state (`ai:cap`), the model downloads, and the per-model chat templates.
 /// Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
@@ -267,7 +267,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     // interrupted flag write). Never re-download a model that already parses as complete.
     if gguf_ready && tok_ready {
         verify_gguf(spec, &gguf, &ok_flag)?;
-        log::info!("SlmEngine: reusing local model '{}' at {}", spec.name, dir.display());
+        log::info!("LlmEngine: reusing local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, gguf));
     }
 
@@ -432,12 +432,12 @@ pub fn probe_gpu_inference() -> GpuProbe {
 /// Returns Err if any model fails to download; mining must not start in that case.
 pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     for spec in specs {
-        log::debug!("SlmEngine: prefetching model '{}'…", spec.name);
+        log::debug!("LlmEngine: prefetching model '{}'…", spec.name);
         let result = ensure_gguf(spec).map(|_| ());
         match result {
-            Ok(()) => log::debug!("SlmEngine: '{}' files ready.", spec.name),
+            Ok(()) => log::debug!("LlmEngine: '{}' files ready.", spec.name),
             Err(e) => {
-                log::error!("SlmEngine: prefetch '{}' failed: {} — cannot start mining.", spec.name, e);
+                log::error!("LlmEngine: prefetch '{}' failed: {} — cannot start mining.", spec.name, e);
                 return Err(e);
             }
         }
@@ -516,16 +516,16 @@ pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
     let id = hex::encode(model_id);
     if retry {
         log::warn!(
-            "SlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked until it serves again, first probe in {}s",
+            "LlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked until it serves again, first probe in {}s",
             id, reason, PROBE_BACKOFF_INITIAL.as_secs()
         );
     } else if probeable(reason) {
         log::error!(
-            "SlmEngine: model {:.8} withdrawn from ai:cap ({}) after {} probe recoveries — mining on its tier stays parked; restart the miner or change its tier assignment",
+            "LlmEngine: model {:.8} withdrawn from ai:cap ({}) after {} probe recoveries — mining on its tier stays parked; restart the miner or change its tier assignment",
             id, reason, recoveries
         );
     } else {
-        log::warn!("SlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked", id, reason);
+        log::warn!("LlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked", id, reason);
     }
 }
 
@@ -535,7 +535,7 @@ pub fn mark_model_available(model_id: &[u8; 32], reason: &str) {
         note_recovery(model_id, PROBE_IN_FLIGHT.load(Ordering::Acquire));
     }
     if unavailable_models().write().unwrap().remove(model_id).is_some() {
-        log::info!("SlmEngine: model {:.8} back in ai:cap ({}) — mining on its tier resumes", hex::encode(model_id), reason);
+        log::info!("LlmEngine: model {:.8} back in ai:cap ({}) — mining on its tier resumes", hex::encode(model_id), reason);
     }
 }
 
@@ -559,7 +559,7 @@ fn schedule_next_probe(model_id: &[u8; 32]) {
     let delay = probe_backoff(w.attempts);
     w.next_probe = Some(Instant::now() + delay);
     log::warn!(
-        "SlmEngine: model {:.8} still cannot serve ({}) — probe {} failed, next probe in {}s",
+        "LlmEngine: model {:.8} still cannot serve ({}) — probe {} failed, next probe in {}s",
         hex::encode(model_id), w.reason, w.attempts, delay.as_secs()
     );
 }
@@ -588,7 +588,7 @@ pub fn probe_withdrawn_model(model_id: &[u8; 32]) -> bool {
     if PROBE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return false;
     }
-    log::info!("SlmEngine: probing withdrawn model {:.8}", hex::encode(model_id));
+    log::info!("LlmEngine: probing withdrawn model {:.8}", hex::encode(model_id));
     let served = load_and_run_inference(model_id, PROBE_PROMPT, PROBE_MAX_TOKENS).is_some();
     if !served {
         schedule_next_probe(model_id);
@@ -623,9 +623,9 @@ static PUBLISHING_BLOCKED: AtomicBool = AtomicBool::new(false);
 pub fn set_publishing_blocked(blocked: bool) {
     if PUBLISHING_BLOCKED.swap(blocked, Ordering::AcqRel) != blocked {
         if blocked {
-            log::warn!("SlmEngine: IPFS node unreachable from the public gateways — all models withdrawn from ai:cap");
+            log::warn!("LlmEngine: IPFS node unreachable from the public gateways — all models withdrawn from ai:cap");
         } else {
-            log::info!("SlmEngine: IPFS node reachable again — models back in ai:cap");
+            log::info!("LlmEngine: IPFS node reachable again — models back in ai:cap");
         }
     }
 }
@@ -765,11 +765,11 @@ fn discover_model_files(root: &Path, wanted: &[&'static ModelSpec]) -> HashMap<[
             let _ = std::fs::create_dir_all(root.join(spec.dir_name));
             match rename_no_replace(&path, &canonical) {
                 Ok(()) => {
-                    log::info!("SlmEngine: found '{}' at {} — moved to {}", spec.name, path.display(), canonical.display());
+                    log::info!("LlmEngine: found '{}' at {} — moved to {}", spec.name, path.display(), canonical.display());
                     found.insert(digest, canonical);
                 }
                 Err(e) => {
-                    log::info!("SlmEngine: found '{}' at {} — using it in place ({})", spec.name, path.display(), e);
+                    log::info!("LlmEngine: found '{}' at {} — using it in place ({})", spec.name, path.display(), e);
                     found.insert(digest, path);
                 }
             }
@@ -838,9 +838,9 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         // Not resident on its GPU yet (or displaced). Inference has priority: release the
         // device's miner to make room and load the model. The possession walk rebuilds at the
         // next `ensure_installed`.
-        log::info!("SlmEngine: loading the llama engine for '{}' (gpu{})", spec.name, dev_id);
+        log::info!("LlmEngine: loading the llama engine for '{}' (gpu{})", spec.name, dev_id);
         if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id) {
-            log::error!("SlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
+            log::error!("LlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
             mark_model_unavailable(model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
             return None;
         }
@@ -852,16 +852,16 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             Some(text)
         }
         Ok(_) => {
-            log::warn!("SlmEngine '{}': llama generate returned an empty answer — response dropped", spec.name);
+            log::warn!("LlmEngine '{}': llama generate returned an empty answer — response dropped", spec.name);
             None
         }
         Err(crate::llama_engine::GenError::PromptTooLong(detail)) => {
-            log::warn!("SlmEngine '{}': prompt too long ({}) — answering with the fixed error text", spec.name, detail);
+            log::warn!("LlmEngine '{}': prompt too long ({}) — answering with the fixed error text", spec.name, detail);
             mark_model_available(model_id, "generation_success");
             Some(PROMPT_TOO_LONG_ANSWER.to_string())
         }
         Err(e) => {
-            log::warn!("SlmEngine '{}': llama generate failed ({:?}) — response dropped", spec.name, e);
+            log::warn!("LlmEngine '{}': llama generate failed ({:?}) — response dropped", spec.name, e);
             None
         }
     }

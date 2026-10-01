@@ -128,7 +128,7 @@ pub struct KeryxdHandler {
     backfill_pending: std::collections::HashSet<String>,
     backfill_visited: std::collections::HashSet<String>,
 
-    /// In-flight SLM inference task: (request_raw_bytes, result_receiver).
+    /// In-flight LLM inference task: (request_raw_bytes, result_receiver).
     /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
     inference_rx: Option<([u8; 32], Option<PrivateRequest>, oneshot::Receiver<Option<String>>)>,
 
@@ -141,7 +141,7 @@ pub struct KeryxdHandler {
     /// When the result arrives, it is sent back via inference_result in the next GetBlockTemplateRequest.
     challenge_inference_rx: Option<(String, oneshot::Receiver<Option<String>>)>,
 
-    /// Shared flag with MinerManager — suppresses GPU stall warnings during OPoI inference.
+    /// Shared flag with MinerManager — suppresses GPU stall warnings during inference.
     opoi_challenge_active: Option<Arc<AtomicBool>>,
 
     /// Tracks pending submit-block requests so rejections can be attributed to the worker
@@ -265,7 +265,7 @@ impl KeryxdHandler {
                 match crate::escrow::EscrowWatcher::new(privkey, &miner_address, escrow_state_file.into()) {
                     Ok(watcher) => {
                         let pk = watcher.pubkey_hex();
-                        info!("OPoI escrow active: pubkey={}", pk);
+                        info!("Escrow active: pubkey={}", pk);
                         (Some(pk), Some(watcher))
                     }
                     Err(e) => {
@@ -287,10 +287,10 @@ impl KeryxdHandler {
 
         let mut client = RpcClient::connect(address).await?;
         // Outbound message channel to the node. ALL client->node messages share this:
-        // mining (submit_block, GetBlockTemplate) AND OPoI traffic (per-block GetBlock,
-        // escrow submit_transaction). With a capacity of 2 the OPoI traffic could fill the
+        // mining (submit_block, GetBlockTemplate) AND inference traffic (per-block GetBlock,
+        // escrow submit_transaction). With a capacity of 2 the inference traffic could fill the
         // buffer and block GetBlockTemplate, stalling template delivery → the GPU sits idle
-        // between blocks. A large buffer keeps the mining requests from queuing behind OPoI.
+        // between blocks. A large buffer keeps the mining requests from queuing behind inference traffic.
         let (send_channel, recv) = mpsc::channel(1024);
         send_channel.send(GetInfoRequestMessage {}.into()).await?;
         let stream = client.message_stream(ReceiverStream::new(recv)).await?.into_inner();
@@ -367,7 +367,7 @@ impl KeryxdHandler {
         // Append a per-request random nonce so that parallel blocks at the same blue_score
         // get distinct coinbase payloads → distinct tx_ids (avoids DAG coinbase collisions).
         let nonce_hex = format!("{:016x}", thread_rng().next_u64());
-        // OPoI Phase 2: run the deterministic fixed-point MLP (matches node validation).
+        // Inference: run the deterministic fixed-point MLP (matches node validation).
         let opoi_tag = keryx_miner::inference::compute_opoi_tag(&nonce_hex);
         // Embed escrow pubkey so the node routes 20% to the CSV-locked escrow output.
         let escrow_part = self.escrow_pubkey
@@ -382,7 +382,7 @@ impl KeryxdHandler {
             .unwrap_or_default();
         // Announce loaded model capabilities so the node can enforce model_id matching.
         let cap_part = {
-            let ids = keryx_miner::slm::loaded_model_ids();
+            let ids = keryx_miner::llm::loaded_model_ids();
             if ids.is_empty() {
                 String::new()
             } else {
@@ -400,7 +400,7 @@ impl KeryxdHandler {
                     let mut parts = challenge_str.splitn(2, ':');
                     let model_id_hex = parts.next().unwrap_or("");
                     let nonce_hex_c  = parts.next().unwrap_or("");
-                    info!("OPoI: sending challenge response model={:.8}", model_id_hex);
+                    info!("Inference: sending challenge response model={:.8}", model_id_hex);
                     if let Some(flag) = &self.opoi_challenge_active {
                         flag.store(false, Ordering::Relaxed);
                     }
@@ -408,7 +408,7 @@ impl KeryxdHandler {
                     format!("{}:{}:{}", model_id_hex, nonce_hex_c, text)
                 }
                 Ok(None) => {
-                    warn!("OPoI: challenge inference failed — sending empty result, node will re-challenge");
+                    warn!("Inference: challenge inference failed — sending empty result, node will re-challenge");
                     if let Some(flag) = &self.opoi_challenge_active {
                         flag.store(false, Ordering::Relaxed);
                     }
@@ -419,7 +419,7 @@ impl KeryxdHandler {
                     String::new()
                 }
                 Err(_) => {
-                    warn!("OPoI: challenge inference task dropped — sending empty result");
+                    warn!("Inference: challenge inference task dropped — sending empty result");
                     if let Some(flag) = &self.opoi_challenge_active {
                         flag.store(false, Ordering::Relaxed);
                     }
@@ -445,7 +445,7 @@ impl KeryxdHandler {
         if let Some(mine) = self.escrow_watcher.as_ref().map(|w| w.pubkey_bytes()) {
             for sid in Self::own_answered_request_ids(txs, &mine) {
                 if self.ai_answered_by_me.insert(sid.clone()) {
-                    log::debug!("OPoI: request id={} already answered by this miner on-chain", sid);
+                    log::debug!("Inference: request id={} already answered by this miner on-chain", sid);
                 }
                 self.ai_request_queue.retain(|(queued, ..)| *queued != sid);
             }
@@ -456,9 +456,9 @@ impl KeryxdHandler {
         }
         // Hard gate: if no models are ready, refuse to accept any AiRequest.
         // Prevents miners with missing/truncated model files from ever queuing inference work.
-        let ready_ids = keryx_miner::slm::loaded_model_ids();
+        let ready_ids = keryx_miner::llm::loaded_model_ids();
         if ready_ids.is_empty() {
-            log::warn!("OPoI: no models ready — skipping AiRequest scan (run miner with valid model files)");
+            log::warn!("Inference: no models ready — skipping AiRequest scan (run miner with valid model files)");
             return;
         }
         log::debug!(
@@ -495,7 +495,7 @@ impl KeryxdHandler {
 
             if let Some((raw, model_id, prompt, max_tokens, inference_reward, private)) = extracted {
                 if !ready_ids.contains(&model_id) {
-                    log::debug!("OPoI: skipping AiRequest — model not supported or files not ready");
+                    log::debug!("Inference: skipping AiRequest — model not supported or files not ready");
                     continue;
                 }
                 let txid_hex = tx
@@ -508,7 +508,7 @@ impl KeryxdHandler {
                     match txid_hex.as_deref().and_then(|h| hex::decode(h).ok()).and_then(|b| <[u8; 32]>::try_from(b).ok()) {
                         Some(id) => id,
                         None => {
-                            log::warn!("OPoI: cannot resolve the AiRequest transaction id — request skipped");
+                            log::warn!("Inference: cannot resolve the AiRequest transaction id — request skipped");
                             continue;
                         }
                     }
@@ -517,11 +517,11 @@ impl KeryxdHandler {
                 };
                 let stable_id = hex::encode(&request_hash[..8]);
                 if self.ai_answered_by_me.contains(&stable_id) {
-                    log::debug!("OPoI: skipping AiRequest id={} — already answered by this miner", stable_id);
+                    log::debug!("Inference: skipping AiRequest id={} — already answered by this miner", stable_id);
                     continue;
                 }
                 if !self.ai_seen_prefixes.contains(&stable_id) {
-                    info!("OPoI: queued AiRequest id={}", stable_id);
+                    info!("Inference: queued AiRequest id={}", stable_id);
                     self.ai_seen_prefixes.insert(stable_id.clone());
                     self.ai_request_queue.push_back((stable_id.clone(), request_hash, model_id, prompt, max_tokens, private));
                     while self.ai_request_queue.len() > MAX_AI_QUEUE_SIZE {
@@ -568,7 +568,7 @@ impl KeryxdHandler {
         escrow_secret: Option<&[u8; 32]>,
     ) -> Option<(String, Option<PrivateRequest>)> {
         let Some(secret) = escrow_secret else {
-            log::debug!("OPoI: skipping private AiRequest — no escrow key configured");
+            log::debug!("Inference: skipping private AiRequest — no escrow key configured");
             return None;
         };
         match keryx_inference::open_request(req, secret) {
@@ -577,11 +577,11 @@ impl KeryxdHandler {
                 Some((prompt, Some(PrivateRequest::Opened(opened.root_key))))
             }
             Err(keryx_inference::PrivateError::NotARecipient) => {
-                log::debug!("OPoI: skipping private AiRequest — this escrow key is not a recipient");
+                log::debug!("Inference: skipping private AiRequest — this escrow key is not a recipient");
                 None
             }
             Err(e) => {
-                warn!("OPoI: private AiRequest names this miner but cannot be opened ({}) — answering with an error body", e);
+                warn!("Inference: private AiRequest names this miner but cannot be opened ({}) — answering with an error body", e);
                 Some((String::new(), Some(PrivateRequest::Unreadable)))
             }
         }
@@ -653,9 +653,9 @@ impl KeryxdHandler {
         Some((model, prompt, max_tokens))
     }
 
-    /// Starts SLM inference for the next queued AiRequest, if no inference is
+    /// Starts LLM inference for the next queued AiRequest, if no inference is
     /// already in flight and a response slot is free.
-    /// Marks whether mining is paused by OPoI work (inference in flight, or model files not
+    /// Marks whether mining is paused by inference work (inference in flight, or model files not
     /// ready) rather than by the node. Set at every pause decision, so no exit path can leave it
     /// stale. Also suppresses the GPU stall warnings, which a deliberate pause would trip.
     fn set_opoi_pause(&self, paused: bool) {
@@ -666,12 +666,12 @@ impl KeryxdHandler {
     }
 
     fn try_start_inference(&mut self) {
-        if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() || keryx_miner::slm::probe_in_flight() {
+        if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() || keryx_miner::llm::probe_in_flight() {
             return;
         }
         while self.ai_request_queue.front().is_some_and(|(sid, ..)| self.ai_answered_by_me.contains(sid)) {
             if let Some((sid, ..)) = self.ai_request_queue.pop_front() {
-                info!("OPoI: request id={} already answered by this miner — skipped", sid);
+                info!("Inference: request id={} already answered by this miner — skipped", sid);
             }
         }
         if let Some((stable_id, request_hash, model_id, prompt, max_tokens, private)) = self.ai_request_queue.pop_front() {
@@ -683,15 +683,15 @@ impl KeryxdHandler {
                 return;
             }
             // Second guard: re-check readiness at execution time (files could have been deleted).
-            if !keryx_miner::slm::is_model_ready(&model_id) {
-                log::error!("OPoI: model became unavailable after queuing id={} — discarding request", stable_id);
+            if !keryx_miner::llm::is_model_ready(&model_id) {
+                log::error!("Inference: model became unavailable after queuing id={} — discarding request", stable_id);
                 return;
             }
-            info!("OPoI: spawning SLM inference (max_tokens={})", max_tokens);
+            info!("Inference: spawning LLM inference (max_tokens={})", max_tokens);
             tokio::task::spawn_blocking(move || {
-                let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens);
+                let result = keryx_miner::llm::load_and_run_inference(&model_id, &prompt, max_tokens);
                 if result.is_none() {
-                    log::warn!("OPoI: inference returned no result for id={} — AiResponse will be skipped", stable_id);
+                    log::warn!("Inference: inference returned no result for id={} — AiResponse will be skipped", stable_id);
                 }
                 let _ = tx_done.send(result);
             });
@@ -714,7 +714,7 @@ impl KeryxdHandler {
                 }
             }
         }
-        info!("OPoI: backfilling recent blocks for in-window AiRequests (cutoff daa {})", cutoff);
+        info!("Inference: backfilling recent blocks for in-window AiRequests (cutoff daa {})", cutoff);
     }
 
     /// Keeps up to AI_BACKFILL_INFLIGHT backfill block requests in flight.
@@ -748,7 +748,7 @@ impl KeryxdHandler {
             }
         }
         if self.backfill_queue.is_empty() && self.backfill_pending.is_empty() {
-            info!("OPoI: startup backfill complete ({} blocks scanned)", self.backfill_visited.len());
+            info!("Inference: startup backfill complete ({} blocks scanned)", self.backfill_visited.len());
             self.backfill_visited.clear();
             self.backfill_visited.shrink_to_fit();
         }
@@ -773,7 +773,7 @@ impl KeryxdHandler {
                 return true;
             }
             if *attempts >= AI_RESPONSE_MAX_ATTEMPTS {
-                warn!("OPoI: giving up on AiResponse {} after {} submit attempts", txid, attempts);
+                warn!("Inference: giving up on AiResponse {} after {} submit attempts", txid, attempts);
                 return false;
             }
             *attempts += 1;
@@ -804,7 +804,7 @@ impl KeryxdHandler {
                     false
                 }
                 Err(_) => {
-                    warn!("OPoI: publish task dropped — AiResponse skipped");
+                    warn!("Inference: publish task dropped — AiResponse skipped");
                     true
                 }
             };
@@ -819,11 +819,11 @@ impl KeryxdHandler {
         let Some(result) = result_opt else {
             // Inference returned None: model not ready or think block exhausted max_tokens.
             // Do NOT upload anything to IPFS — skip this AiResponse entirely.
-            info!("OPoI: inference produced no result — AiResponse skipped");
+            info!("Inference: inference produced no result — AiResponse skipped");
             return true;
         };
 
-        info!("OPoI: inference complete, request_hash={}", hex::encode(&request_hash[..8]));
+        info!("Inference: inference complete, request_hash={}", hex::encode(&request_hash[..8]));
 
         // A private answer is sealed to the requester; the plaintext is never published. From
         // the gate on it travels inline and the CID field carries its multihash; before the
@@ -834,7 +834,7 @@ impl KeryxdHandler {
                 let body = match p {
                     PrivateRequest::Opened(root_key) => {
                         let Some(pubkey) = self.escrow_watcher.as_ref().map(|w| w.pubkey_bytes()) else {
-                            warn!("OPoI: escrow key gone — private AiResponse skipped");
+                            warn!("Inference: escrow key gone — private AiResponse skipped");
                             return true;
                         };
                         keryx_inference::seal_response(&root_key, &request_hash, &pubkey, result.as_bytes())
@@ -856,25 +856,25 @@ impl KeryxdHandler {
             let cid = match crate::ipfs::upload_bytes_with_recovery(&publish, &ipfs_url) {
                 Ok(cid) => cid,
                 Err(e) => {
-                    warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e);
+                    warn!("Inference: IPFS upload failed: {} — AiResponse tx skipped", e);
                     let _ = tx_cid.send(None);
                     return;
                 }
             };
             let probe_cid = crate::ipfs::multihash_to_cid_v0(&cid);
             match crate::ipfs::confirm_response_retrievable(&probe_cid) {
-                Ok(gateway) => info!("OPoI: response CID {} served by {}", probe_cid, gateway),
+                Ok(gateway) => info!("Inference: response CID {} served by {}", probe_cid, gateway),
                 Err(e) => {
                     warn!(
-                        "OPoI: response CID {} unreadable from the public gateways ({}) — AiResponse skipped; re-checking this node's reachability (kubo port 4001)",
+                        "Inference: response CID {} unreadable from the public gateways ({}) — AiResponse skipped; re-checking this node's reachability (kubo port 4001)",
                         probe_cid, e
                     );
                     let _ = tx_cid.send(None);
                     match crate::ipfs::verify_public_reachability(&ipfs_url) {
-                        Ok(()) => keryx_miner::slm::set_publishing_blocked(false),
+                        Ok(()) => keryx_miner::llm::set_publishing_blocked(false),
                         Err(e) => {
                             warn!("{}", e);
-                            keryx_miner::slm::set_publishing_blocked(true);
+                            keryx_miner::llm::set_publishing_blocked(true);
                         }
                     }
                     return;
@@ -909,12 +909,12 @@ impl KeryxdHandler {
                 }
             }
             (None, true) => {
-                warn!("OPoI: no escrow key configured — submitting an unsigned (v1) response; it will NOT count for the service bond");
+                warn!("Inference: no escrow key configured — submitting an unsigned (v1) response; it will NOT count for the service bond");
                 keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length)
             }
             (_, false) => keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length),
         };
-        info!("OPoI: uploading response CID={}, challenge_window_end={}{}{}", resp.cid_v0(), challenge_window_end,
+        info!("Inference: uploading response CID={}, challenge_window_end={}{}{}", resp.cid_v0(), challenge_window_end,
             if resp.responder.is_some() { " (signed, V2)" } else { "" },
             if resp.private_body.is_some() { " (private body inline)" } else { "" });
 
@@ -933,7 +933,7 @@ impl KeryxdHandler {
             self.ai_response_inflight.insert(txid, (rpc_tx.clone(), 1, std::time::Instant::now()));
         }
         if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
-            warn!("OPoI: failed to send AiResponse tx: {}", e);
+            warn!("Inference: failed to send AiResponse tx: {}", e);
         }
 
         // Register inference escrow outpoint for auto-claim after the challenge window.
@@ -1087,19 +1087,19 @@ impl KeryxdHandler {
                         if model_id_bytes.len() == 32 {
                             let mut model_id = [0u8; 32];
                             model_id.copy_from_slice(&model_id_bytes);
-                            if keryx_miner::slm::is_model_ready(&model_id) {
+                            if keryx_miner::llm::is_model_ready(&model_id) {
                                 self.set_opoi_pause(true);
                                 miner.process_block(None).await?;
-                                info!("OPoI: challenge received model={:.8} nonce={:.8} — spawning inference", model_id_hex, nonce_hex);
+                                info!("Inference: challenge received model={:.8} nonce={:.8} — spawning inference", model_id_hex, nonce_hex);
                                 let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
                                 let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
                                 tokio::task::spawn_blocking(move || {
-                                    let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, 64);
+                                    let result = keryx_miner::llm::load_and_run_inference(&model_id, &prompt, 64);
                                     let _ = tx_done.send(result);
                                 });
                                 self.challenge_inference_rx = Some((challenge, rx_done));
                             } else {
-                                warn!("OPoI: challenge for unready model={:.8} — cannot respond", model_id_hex);
+                                warn!("Inference: challenge for unready model={:.8} — cannot respond", model_id_hex);
                             }
                         }
                     }
@@ -1109,15 +1109,15 @@ impl KeryxdHandler {
                     self.client_get_block_template().await?;
                     return Ok(());
                 }
-                // OPoI is mandatory: refuse to mine if no models are ready.
+                // Inference is mandatory: refuse to mine if no models are ready.
                 // Covers miners with missing/truncated model files that somehow passed prefetch.
-                if keryx_miner::slm::loaded_model_ids().is_empty() {
+                if keryx_miner::llm::loaded_model_ids().is_empty() {
                     // Throttle to one log per ~200 templates (~every 20s at 10 BPS) to avoid spam.
                     if self.last_known_daa % 200 == 0 {
-                        if keryx_miner::slm::publishing_blocked() {
-                            log::warn!("OPoI: IPFS node unreachable from the public gateways — mining suspended until it is reachable again (kubo port 4001)");
+                        if keryx_miner::llm::publishing_blocked() {
+                            log::warn!("Inference: IPFS node unreachable from the public gateways — mining suspended until it is reachable again (kubo port 4001)");
                         } else {
-                            log::warn!("OPoI: no models ready — mining suspended until model files are available");
+                            log::warn!("Inference: no models ready — mining suspended until model files are available");
                         }
                     }
                     self.set_opoi_pause(true);
@@ -1244,7 +1244,7 @@ impl KeryxdHandler {
                 }
             }
             Payload::SubmitTransactionResponse(res) => {
-                // Escrow claims and OPoI submissions share this stream. Match responses to
+                // Escrow claims and inference submissions share this stream. Match responses to
                 // in-flight claims by identity (txid, or the txid embedded in the rejection
                 // text) — attributing by position slashed valid escrow entries before.
                 use crate::escrow::SubmitResponseOutcome;
@@ -1270,21 +1270,21 @@ impl KeryxdHandler {
                         match (inflight_txid, err) {
                             (Some(txid), None) => {
                                 self.ai_response_inflight.remove(&txid);
-                                info!("OPoI: AiResponse accepted by the mempool");
+                                info!("Inference: AiResponse accepted by the mempool");
                             }
                             (Some(txid), Some(e)) if (e.contains(&txid) && e.contains("already")) || e.contains("same responder") => {
                                 self.ai_response_inflight.remove(&txid);
-                                info!("OPoI: AiResponse already known to the node — done");
+                                info!("Inference: AiResponse already known to the node — done");
                             }
                             (Some(txid), Some(e)) => {
                                 let attempts = self.ai_response_inflight.get(&txid).map(|(_, a, _)| *a).unwrap_or(1);
                                 if attempts <= 1 {
-                                    warn!("OPoI: AiResponse rejected: {} — retrying until accepted or expired", e);
+                                    warn!("Inference: AiResponse rejected: {} — retrying until accepted or expired", e);
                                 } else {
-                                    log::debug!("OPoI: AiResponse rejected (attempt {}): {}", attempts, e);
+                                    log::debug!("Inference: AiResponse rejected (attempt {}): {}", attempts, e);
                                 }
                             }
-                            (None, Some(e)) => log::debug!("OPoI: submit_transaction error: {}", e),
+                            (None, Some(e)) => log::debug!("Inference: submit_transaction error: {}", e),
                             (None, None) => {}
                         }
                     }

@@ -4,12 +4,12 @@
 //! produces it there. It is THE inference engine: llama.cpp owns the single resident VRAM copy
 //! of each served model on that model's inference GPU (one engine per GPU), the PoM walk
 //! gathers straight over its tensor pointers (zero-dup — byte-identity proven by
-//! tools/llama_zerodup_spike), and OPoI text generation
+//! tools/llama_zerodup_spike), and inference text generation
 //! runs in-process. Absent .so = no inference (responses are dropped); mining still works via
 //! the standalone raw-upload walk (`pom_gpu::load_raw`).
 //!
 //! Consensus safety: this module only changes WHO HOSTS the model bytes and WHO GENERATES the
-//! user-facing OPoI text. The walk kernel, the host possession index, proofs and `tag_fixed` are
+//! user-facing inference text. The walk kernel, the host possession index, proofs and `tag_fixed` are
 //! untouched; `ensure_installed_inner`'s N-guard cross-checks the gather against the host index.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
@@ -156,7 +156,7 @@ unsafe fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Option<T> {
 ///
 /// The engine is only ever dlopened lazily, on the first inference request. A deleted, renamed or
 /// stale library therefore leaves PoW/PoM fully working — the possession walk uploads the
-/// canonical GGUF itself and never needs this library — while every OPoI response is silently
+/// canonical GGUF itself and never needs this library — while every inference response is silently
 /// dropped hours into a session. Resolve the library up front, load it, and check the ABI and
 /// every symbol the engine calls. Returns the resolved path, or a human-readable reason.
 ///
@@ -379,7 +379,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             }
         }
         *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, last_error, gguf: gguf.to_string(), attempt });
-        log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference.");
+        log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves inference.");
         Ok(attempt)
     }
 }
@@ -450,7 +450,7 @@ pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
     None
 }
 
-/// Generate OPoI text with the engine on `gpu`, which must host `gguf`.
+/// Generate inference text with the engine on `gpu`, which must host `gguf`.
 pub fn generate(gguf: &str, gpu: usize, prompt: &str, max_tokens: usize) -> Result<String, GenError> {
     let slot = slot(gpu);
     let g = slot.lock().map_err(|_| GenError::Unavailable)?;

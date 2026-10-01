@@ -1,4 +1,4 @@
-// Automated OPoI escrow claim module.
+// Automated escrow claim module.
 //
 // After each block, scans for coinbase outputs matching this miner's escrow script.
 // When the CSV window (36 000 blocks) expires, builds a Schnorr-signed claim TX and
@@ -259,7 +259,7 @@ const MAX_IN_FLIGHT_CLAIMS: usize = 4;
 
 /// Result of matching a SubmitTransactionResponse against the in-flight claim TXs.
 pub enum SubmitResponseOutcome {
-    /// The response belongs to other traffic (OPoI submissions) — not a claim of ours.
+    /// The response belongs to other traffic (inference submissions) — not a claim of ours.
     NotOurs,
     /// A claim was matched (rejected/retried); no outputs were finalized.
     Handled,
@@ -889,7 +889,7 @@ impl EscrowWatcher {
     /// error responses carry an empty transaction_id (the node's error path returns a
     /// default message), so the rejection text, which embeds the offending txid, is
     /// matched against in-flight claim txids instead. Returns `NotOurs` for responses
-    /// that belong to other traffic (OPoI submissions), so the caller can log those
+    /// that belong to other traffic (inference submissions), so the caller can log those
     /// itself, and `Accepted` with the claimed totals so the caller can feed stats.
     pub fn on_submit_response(&mut self, response_txid: &str, error: Option<&str>) -> SubmitResponseOutcome {
         let matched_txid = if self.in_flight.contains_key(response_txid) {
@@ -1355,7 +1355,7 @@ pub fn save_state_atomic(path: &Path, state: &EscrowState) -> Result<(), String>
     Ok(())
 }
 
-/// Load the OPoI escrow private key from `path`. Fails if the file does not exist.
+/// Load the escrow private key from `path`. Fails if the file does not exist.
 /// Used by --recover-escrow where generating a new key would silently query with the wrong pubkey.
 pub fn load_key(path: &str) -> Result<String, String> {
     let p = std::path::Path::new(path);
@@ -1378,7 +1378,7 @@ pub fn load_key(path: &str) -> Result<String, String> {
     Ok(privkey)
 }
 
-/// Load the OPoI escrow private key from `path`, generating a new one if absent.
+/// Load the escrow private key from `path`, generating a new one if absent.
 /// The file contains exactly 64 lowercase hex characters (32-byte Schnorr private key).
 pub fn load_or_generate_key(path: &str) -> Result<String, String> {
     use rand::RngCore;
@@ -1419,9 +1419,9 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
         Err(e) => return Err(format!("Failed to install escrow key file '{}': {}", path, e)),
     }
 
-    info!("OPoI escrow keypair generated — saved to '{}'", path);
+    info!("Escrow keypair generated — saved to '{}'", path);
     info!("  Escrow pubkey : {}", pubkey_hex);
-    info!("  Keep '{}' safe — needed to claim your OPoI escrow rewards.", path);
+    info!("  Keep '{}' safe — needed to claim your escrow rewards.", path);
     Ok(privkey_hex)
 }
 
