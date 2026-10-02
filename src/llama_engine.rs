@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type ErrorFn = unsafe extern "C" fn() -> *const c_char;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
+type ContextInfoFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
@@ -85,6 +86,8 @@ struct Engine {
     last_error: Option<ErrorFn>,
     gguf: String,
     attempt: u64,
+    /// Context window the engine allocated, in tokens.
+    n_ctx: c_int,
 }
 
 /// Why a generation produced no text.
@@ -353,33 +356,41 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             Err(_) => return Err(failed("path", "GGUF path contains a NUL byte".to_string(), false)),
         };
         log::info!("llama engine: loading {} on GPU {} via {} (in-process, zero-dup)…", gguf, gpu, so.display());
-        let configured_ctx = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok());
-        let n_ctx: c_int = configured_ctx.unwrap_or(4096);
-        let mut model = load(cg.as_ptr(), gpu as c_int, n_ctx);
-        if model.is_null() {
-            let mut detail = last_error.map_or_else(
+        let (floor, cap) = crate::models::spec_for_gguf(gguf).map_or((4096, 4096), |m| (m.ctx_floor as c_int, m.ctx_cap as c_int));
+        let configured_ctx: Option<c_int> = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok());
+        let ladder = configured_ctx.map_or_else(|| context_ladder(cap, floor), |c| vec![c]);
+        let mut model = std::ptr::null_mut();
+        let mut n_ctx: c_int = 0;
+        let mut detail = String::new();
+        for &candidate in &ladder {
+            model = load(cg.as_ptr(), gpu as c_int, candidate);
+            if !model.is_null() {
+                n_ctx = candidate;
+                break;
+            }
+            detail = last_error.map_or_else(
                 || "model load failed (VRAM? arch?)".to_string(),
                 |f| {
                     let msg = CStr::from_ptr(f()).to_string_lossy().into_owned();
                     if msg.is_empty() { "model load failed (VRAM? arch?)".to_string() } else { msg }
                 },
             );
-            if context_retry_size(n_ctx, configured_ctx.is_some(), &detail).is_some() {
-                log::warn!("llama engine: 4096-token context did not fit; retrying with 1024 tokens");
-                model = load(cg.as_ptr(), gpu as c_int, 1024);
-                if model.is_null() {
-                    detail = last_error.map_or_else(
-                        || "model load failed (VRAM? arch?)".to_string(),
-                        |f| CStr::from_ptr(f()).to_string_lossy().into_owned(),
-                    );
-                }
+            if !context_allocation_failed(&detail) {
+                break;
             }
-            if model.is_null() {
-                return Err(failed("native_load", detail, true));
-            }
+            log::warn!("llama engine: {}-token context did not fit ({})", candidate, detail);
         }
-        *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, last_error, gguf: gguf.to_string(), attempt });
-        log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves inference.");
+        if model.is_null() {
+            return Err(failed("native_load", detail, true));
+        }
+        if n_ctx < floor {
+            log::warn!("llama engine: context {} tokens is below the {}-token floor clients assume for this model", n_ctx, floor);
+        }
+        let context_info = sym::<ContextInfoFn>(lib, "keryx_llama_context_info")
+            .map(|f| CStr::from_ptr(f(model)).to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("n_ctx={}", n_ctx));
+        *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, last_error, gguf: gguf.to_string(), attempt, n_ctx });
+        log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves inference ({}).", context_info);
         Ok(attempt)
     }
 }
@@ -492,20 +503,12 @@ mod tests {
     }
 
     #[test]
-    fn retries_default_context_only_after_context_allocation_failure() {
-        let context_oom = "context: llama_init_from_model failed [vram: 0 MiB free / 16302 MiB total]";
-        assert_eq!(context_retry_size(4096, false, context_oom), Some(1024));
-        assert_eq!(context_retry_size(4096, true, context_oom), None);
-        assert_eq!(context_retry_size(1024, false, context_oom), None);
-        assert_eq!(context_retry_size(4096, false, "model: unsupported architecture"), None);
-        assert_eq!(
-            context_retry_size(
-                4096,
-                false,
-                "context: llama_init_from_model failed [vram: unavailable (cudaMemGetInfo failed: CUDA_ERROR_INVALID_CONTEXT)]",
-            ),
-            None,
-        );
+    fn context_ladder_runs_from_the_cap_down_to_the_floor() {
+        assert_eq!(context_ladder(131_072, 32_768), vec![131_072, 65_536, 32_768]);
+        assert_eq!(context_ladder(32_768, 32_768), vec![32_768]);
+        assert_eq!(context_ladder(4_096, 8_192), vec![8_192]);
+        assert!(context_allocation_failed("context: llama_init_from_model failed [vram: 0 MiB free / 16302 MiB total]"));
+        assert!(!context_allocation_failed("model: unsupported architecture"));
     }
 
     #[test]
@@ -541,10 +544,24 @@ mod tests {
     }
 }
 
-fn context_retry_size(n_ctx: c_int, explicitly_configured: bool, detail: &str) -> Option<c_int> {
-    (!explicitly_configured
-        && n_ctx > 1024
-        && detail.contains("context: llama_init_from_model failed")
-        && detail.contains(" MiB free / "))
-    .then_some(1024)
+/// Context sizes to try, largest first: the cap, then halves of it down to the floor.
+fn context_ladder(cap: c_int, floor: c_int) -> Vec<c_int> {
+    let mut out = Vec::new();
+    let mut n = cap.max(floor);
+    while n > floor {
+        out.push(n);
+        n /= 2;
+    }
+    out.push(floor);
+    out
+}
+
+/// The load failed while allocating the context, not while loading the weights.
+fn context_allocation_failed(detail: &str) -> bool {
+    detail.contains("context: llama_init_from_model failed")
+}
+
+/// Context window (tokens) of the engine resident on `gpu`, if any.
+pub fn context_tokens(gpu: usize) -> Option<u32> {
+    slot(gpu).lock().ok().and_then(|g| g.as_ref().map(|e| e.n_ctx as u32))
 }

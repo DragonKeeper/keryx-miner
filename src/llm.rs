@@ -927,6 +927,8 @@ mod tests {
             weight_cids: &["unused"],
             dir_name,
             min_vram_mb: 0,
+            ctx_floor: 4_096,
+            ctx_cap: 4_096,
         }
     }
 

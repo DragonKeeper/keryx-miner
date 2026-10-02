@@ -45,6 +45,11 @@ pub struct ModelSpec {
     /// KV cache + CUDA workspace. Used by the capability gate so `ai:cap`
     /// never announces a model the miner cannot load. 0 = never gated.
     pub min_vram_mb: u64,
+    /// Smallest context window (tokens) the engine must hold to serve the model: the budget
+    /// clients assume. A card that cannot allocate it does not declare the model.
+    pub ctx_floor: u32,
+    /// Largest context window worth allocating when the VRAM allows it.
+    pub ctx_cap: u32,
 }
 
 // ── H6 lineup ───────────────────────────────────────────────────
@@ -70,6 +75,8 @@ pub const QWEN3_5_9B_ABLITERATED: ModelSpec = ModelSpec {
     dir_name: "Qwen3.5-9B-abliterated",
     // ~6.5 GB Q5_K_M weights + ~1.3 GB KV/workspace → 8 GB card.
     min_vram_mb: 8_000,
+    ctx_floor: 8_192,
+    ctx_cap: 32_768,
 };
 
 pub const GLM_4_9B_0414: ModelSpec = ModelSpec {
@@ -87,6 +94,8 @@ pub const GLM_4_9B_0414: ModelSpec = ModelSpec {
     dir_name: "GLM-4-9B-0414",
     // ~8.3 GB Q6_K weights + ~1.5 GB KV/workspace → 12 GB card (3060 12GB / 3080 12GB).
     min_vram_mb: 12_000,
+    ctx_floor: 32_768,
+    ctx_cap: 32_768,
 };
 
 pub const QWEN3_6_27B: ModelSpec = ModelSpec {
@@ -104,6 +113,8 @@ pub const QWEN3_6_27B: ModelSpec = ModelSpec {
     dir_name: "Qwen3.6-27B",
     // ~16.5 GB Q4_K_M weights + ~2.5 GB KV/workspace → 24 GB card (3090/4090/5090).
     min_vram_mb: 24_000,
+    ctx_floor: 32_768,
+    ctx_cap: 65_536,
 };
 
 pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
@@ -122,6 +133,8 @@ pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
     // ~29.7 GB Q4_K_M weights (MoE, 3B active) + KV/workspace → needs a 32 GB card (5090),
     // so the top tier stays 5090-class.
     min_vram_mb: 30_000,
+    ctx_floor: 32_768,
+    ctx_cap: 131_072,
 };
 
 /// Tier-2 model — gemma-4-12B-it-abliterated Q6_K (huihui-ai abliteration, mradermacher
@@ -140,6 +153,8 @@ pub const GEMMA_4_12B_ABLITERATED: ModelSpec = ModelSpec {
     dir_name: "Gemma-4-12B-abliterated",
     // ~9.8 GB Q6_K weights + ~2 GB KV/workspace → 16 GB card (fills the 12→24 GB gap).
     min_vram_mb: 16_000,
+    ctx_floor: 32_768,
+    ctx_cap: 131_072,
 };
 
 /// Whether `model_id` is one of the Proof-of-Model tier models. DAA-independent — used at startup
@@ -271,6 +286,12 @@ pub const REGISTRY: &[&ModelSpec] = &[
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
     REGISTRY.iter().copied().find(|m| m.name == name)
+}
+
+/// The lineup model a GGUF path belongs to, by its `models/<dir_name>/` component.
+pub fn spec_for_gguf(path: &str) -> Option<&'static ModelSpec> {
+    let normalized = path.replace('\\', "/");
+    REGISTRY.iter().copied().find(|m| normalized.contains(&format!("/{}/", m.dir_name)))
 }
 
 pub fn available_names() -> Vec<&'static str> {

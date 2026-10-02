@@ -72,6 +72,7 @@ struct KeryxLlama {
     llama_sampler* smpl  = nullptr;
     std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
     std::mutex gen_lock;
+    std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
 };
 
 // llama.cpp/ggml emit a large INFO-level dump on every model load (full tensor list, per-layer
@@ -117,9 +118,24 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
-    cp.n_batch = std::min(cp.n_batch, cp.n_ctx);
-    cp.n_ubatch = std::min(cp.n_ubatch, std::max(1u, cp.n_ctx / 4));
+    // The logical batch bounds one decode call; the physical one bounds the compute buffers,
+    // which grow with it and not with the context.
+    cp.n_batch = std::min(2048u, cp.n_ctx);
+    cp.n_ubatch = std::min(512u, cp.n_batch);
+    // 8-bit KV cache with flash attention: half the per-token VRAM of f16. Falls back to the
+    // default cache for an architecture the fast path cannot serve.
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.type_k = GGML_TYPE_Q8_0;
+    cp.type_v = GGML_TYPE_Q8_0;
+    const char* kv = "q8_0";
     llama_context* ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        cp.type_k = GGML_TYPE_F16;
+        cp.type_v = GGML_TYPE_F16;
+        kv = "f16";
+        ctx = llama_init_from_model(model, cp);
+    }
     if (!ctx) {
         keryx_set_error("context", "llama_init_from_model failed");
         llama_model_free(model);
@@ -148,12 +164,18 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
 
     auto* h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl;
+    h->ctx_info = "n_ctx=" + std::to_string(llama_n_ctx(ctx)) + " kv=" + kv +
+                  " flash_attn=" + llama_flash_attn_type_name(cp.flash_attn_type) +
+                  " n_batch=" + std::to_string(llama_n_batch(ctx)) + " n_ubatch=" + std::to_string(llama_n_ubatch(ctx));
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
     return h;
 }
 
 KERYX_EXPORT size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
+
+// Context parameters the engine ended up with, for the miner log.
+KERYX_EXPORT const char* keryx_llama_context_info(KeryxLlama* h) { return h ? h->ctx_info.c_str() : ""; }
 
 // Tensor i in CANONICAL order. *is_device = the data pointer is CUDA device memory (walkable
 // in-place); 0 = host memory (the caller uploads its own device copy for the walk).
