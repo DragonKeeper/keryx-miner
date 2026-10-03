@@ -572,10 +572,13 @@ impl KeryxdHandler {
             return None;
         };
         match keryx_inference::open_request(req, secret) {
-            Ok(opened) => {
-                let prompt = String::from_utf8_lossy(&opened.prompt).into_owned();
-                Some((prompt, Some(PrivateRequest::Opened(opened.root_key))))
-            }
+            Ok(opened) => match decode_private_prompt(&opened.prompt) {
+                Some(prompt) => Some((prompt, Some(PrivateRequest::Opened(opened.root_key)))),
+                None => {
+                    warn!("Inference: private AiRequest opened but its compressed prompt is invalid — answering with an error body");
+                    Some((String::new(), Some(PrivateRequest::Unreadable)))
+                }
+            },
             Err(keryx_inference::PrivateError::NotARecipient) => {
                 log::debug!("Inference: skipping private AiRequest — this escrow key is not a recipient");
                 None
@@ -1350,6 +1353,25 @@ impl Drop for KeryxdHandler {
     }
 }
 
+/// Leading bytes of a private prompt compressed with raw DEFLATE.
+const COMPRESSED_PROMPT_MAGIC: [u8; 4] = [0x00, b'K', b'Z', 0x01];
+const MAX_DECOMPRESSED_PROMPT_LEN: u64 = 1 << 20;
+
+/// Plaintext of an opened private prompt: inflated when it carries the compression magic.
+/// `None` for a compressed prompt that is corrupt or inflates past the cap.
+fn decode_private_prompt(bytes: &[u8]) -> Option<String> {
+    use std::io::Read;
+    let Some(deflated) = bytes.strip_prefix(&COMPRESSED_PROMPT_MAGIC[..]) else {
+        return Some(String::from_utf8_lossy(bytes).into_owned());
+    };
+    let mut inflated = Vec::new();
+    flate2::read::DeflateDecoder::new(deflated).take(MAX_DECOMPRESSED_PROMPT_LEN + 1).read_to_end(&mut inflated).ok()?;
+    if inflated.len() as u64 > MAX_DECOMPRESSED_PROMPT_LEN {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&inflated).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::PrivateRequest;
@@ -1414,6 +1436,31 @@ mod tests {
         assert!(open_response(&[0u8; 32], &request_hash, &pubkey, &body).is_err());
         let cid = crate::ipfs::sha256_multihash(&body);
         assert_eq!(&cid[..2], &[0x12, 0x20]);
+    }
+
+    #[test]
+    fn private_prompt_inflates_when_marked() {
+        use super::{decode_private_prompt, COMPRESSED_PROMPT_MAGIC, MAX_DECOMPRESSED_PROMPT_LEN};
+        use std::io::Write;
+        let deflate = |data: &[u8]| {
+            let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+            enc.write_all(data).unwrap();
+            let mut out = COMPRESSED_PROMPT_MAGIC.to_vec();
+            out.extend(enc.finish().unwrap());
+            out
+        };
+
+        assert_eq!(decode_private_prompt("Bonjour, ça va ?".as_bytes()).as_deref(), Some("Bonjour, ça va ?"));
+        let text = "Entrée 41 — le code est ORCHIDÉE-7319. ".repeat(500);
+        let packed = deflate(text.as_bytes());
+        assert!(packed.len() < text.len() / 10);
+        assert_eq!(decode_private_prompt(&packed).as_deref(), Some(text.as_str()));
+
+        let mut corrupt = COMPRESSED_PROMPT_MAGIC.to_vec();
+        corrupt.extend([0xFF; 32]);
+        assert_eq!(decode_private_prompt(&corrupt), None);
+        let bomb = deflate(&vec![b'a'; MAX_DECOMPRESSED_PROMPT_LEN as usize + 1]);
+        assert_eq!(decode_private_prompt(&bomb), None);
     }
 
     /// Round-trip against a live node. Ignored by default — run with
