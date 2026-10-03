@@ -20,6 +20,11 @@ use crate::stats::MinerStats;
 const MAX_LOG_LINES: usize = 2000;
 const REDRAW_RATE: Duration = Duration::from_millis(300);
 const MIN_LOG_ROWS: u16 = 5;
+// DEC private mode 2026: terminals that support it (kitty, foot, WezTerm, iTerm2,
+// Windows Terminal, tmux, recent xterm) defer rendering until the end marker, so a
+// frame appears atomically instead of tearing while it is being painted.
+const SYNC_UPDATE_BEGIN: &str = "\x1b[?2026h";
+const SYNC_UPDATE_END: &str = "\x1b[?2026l";
 #[cfg(feature = "block-celebration")]
 const BLOCK_CELEBRATION_DURATION: Duration = Duration::from_millis(2500);
 #[cfg(feature = "block-celebration")]
@@ -368,6 +373,10 @@ pub fn spawn_ui(
         let mut block_celebration_sound_enabled = block_celebration;
         #[cfg(feature = "block-celebration")]
         let mut block_sound = None;
+        // Reusable frame buffer. Rendering into this and writing it out in a single
+        // write avoids the many mid-frame flushes of line-buffered stdout, which
+        // painted partial frames and made the TUI visibly flash (worst over SSH).
+        let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
         while !stop_clone.load(Ordering::Acquire) {
             if handle_input(
@@ -459,7 +468,12 @@ pub fn spawn_ui(
             let periodic_refresh_due = block_coin_frame.is_none() && last_drawn_at.elapsed() >= Duration::from_secs(1);
             let full_redraw = should_clear || animation_ended || periodic_refresh_due || last_draw_key != Some(draw_key);
             if full_redraw {
-                draw_frame(&mut out, current_size, &snapshot, &ui_state, should_clear, block_coin_frame);
+                frame_buf.clear();
+                let _ = queue!(&mut frame_buf, Print(SYNC_UPDATE_BEGIN));
+                draw_frame(&mut frame_buf, current_size, &snapshot, &ui_state, should_clear, block_coin_frame);
+                let _ = queue!(&mut frame_buf, Print(SYNC_UPDATE_END));
+                let _ = out.write_all(&frame_buf);
+                let _ = out.flush();
                 last_draw_key = Some(draw_key);
                 last_drawn_at = Instant::now();
                 #[cfg(feature = "block-celebration")]
@@ -470,7 +484,11 @@ pub fn spawn_ui(
             #[cfg(feature = "block-celebration")]
             if !full_redraw && block_coin_frame != last_block_coin_frame {
                 if let Some(frame) = block_coin_frame {
-                    draw_block_celebration(&mut out, current_size.0, current_size.1, frame, snapshot.accepted_blocks);
+                    frame_buf.clear();
+                    let _ = queue!(&mut frame_buf, Print(SYNC_UPDATE_BEGIN));
+                    draw_block_celebration(&mut frame_buf, current_size.0, current_size.1, frame, snapshot.accepted_blocks);
+                    let _ = queue!(&mut frame_buf, Print(SYNC_UPDATE_END));
+                    let _ = out.write_all(&frame_buf);
                     let _ = out.flush();
                 }
                 last_block_coin_frame = block_coin_frame;
@@ -520,7 +538,7 @@ fn metric_row(label: &str, value: String, value_color: Color) -> PanelRow {
 }
 
 fn draw_frame(
-    out: &mut std::io::Stdout,
+    out: &mut impl Write,
     size: (u16, u16),
     snapshot: &crate::stats::MinerStatsSnapshot,
     ui_state: &UiState,
@@ -1050,7 +1068,6 @@ fn draw_frame(
     }
 
     let _ = queue!(out, ResetColor, SetAttribute(Attribute::Reset));
-    let _ = out.flush();
 }
 
 #[cfg(feature = "block-celebration")]
@@ -1068,7 +1085,7 @@ fn block_animation_frame(elapsed: Duration) -> Option<usize> {
 }
 
 #[cfg(feature = "block-celebration")]
-fn draw_block_celebration(out: &mut std::io::Stdout, w: u16, h: u16, frame: usize, accepted_blocks: u64) {
+fn draw_block_celebration(out: &mut impl Write, w: u16, h: u16, frame: usize, accepted_blocks: u64) {
     let title = format!("KRX BLOCK ACCEPTED  #{}", accepted_blocks);
     let art_width = BLOCK_COIN_WIDTH;
     let art_height = BLOCK_COIN_HEIGHT / 2;
@@ -1151,7 +1168,7 @@ fn ansi_level(value: u8) -> u8 {
 }
 
 fn draw_colored_line(
-    out: &mut std::io::Stdout,
+    out: &mut impl Write,
     y: u16,
     text: &str,
     fg: Color,
@@ -1171,7 +1188,7 @@ fn draw_colored_line(
 }
 
 fn draw_colored_cell(
-    out: &mut std::io::Stdout,
+    out: &mut impl Write,
     x: u16,
     y: u16,
     width: usize,
@@ -1194,7 +1211,7 @@ fn draw_colored_cell(
 }
 
 fn draw_colored_segments_cell(
-    out: &mut std::io::Stdout,
+    out: &mut impl Write,
     x: u16,
     y: u16,
     width: usize,
