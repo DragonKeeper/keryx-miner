@@ -347,7 +347,7 @@ extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
 ///   Qwen3.5-9B-abliterated  →  ~6.5 GB  (requires ≥8 GB card)
 ///   GLM-4-9B                →  ~8.3 GB  (requires ≥12 GB card)
 ///   Gemma-4-12B-abliterated →  ~9.8 GB  (requires ≥16 GB card)
-///   Qwen3.6-27B             → ~16.5 GB  (requires ≥24 GB card)
+///   Qwen3.6/3.8-27B         → ~16.5 GB  (requires ≥24 GB card)
 ///   Kimi-Linear-48B         → ~29.7 GB  (requires ≥32 GB card)
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
@@ -385,7 +385,7 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     let (model_label, min_vram_mb): (&str, u64) = if needs_very_high {
         ("Kimi-Linear-48B (--very-high)", 30_000)
     } else if needs_high {
-        ("Qwen3.6-27B (--high)", 20_000)
+        ("Qwen3-27B (--high)", 20_000)
     } else {
         ("Gemma-4-12B-abliterated (default)", 15_000)
     };
@@ -393,7 +393,7 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     if vram_mb < min_vram_mb {
         log::warn!(
             "⚠  {} needs ≥{} GB VRAM but only {} GB on this GPU — GPU inference for this tier \
-             will OOM. Use a smaller tier (--high Qwen3.6-27B / --light GLM-4-9B / --very-light \
+             will OOM. Use a smaller tier (--high Qwen3-27B / --light GLM-4-9B / --very-light \
              Qwen3.5-9B) or let the per-GPU assignment downgrade it.",
             model_label,
             min_vram_mb / 1024,
@@ -1090,7 +1090,7 @@ async fn run() -> Result<(), Error> {
     //   --very-light → Qwen3.5-9B-abliterated
     //   --light      → GLM-4-9B
     //   (no flag)    → Gemma-4-12B-abliterated   [default]
-    //   --high       → Qwen3.6-27B
+    //   --high       → Qwen3.6-27B, Qwen3.8-27B from H14
     //   --very-high  → Kimi-Linear-48B
 
     // Per-card tier overrides (--force-model, CUDA-driver order). Parsed once here — the power
@@ -1116,7 +1116,7 @@ async fn run() -> Result<(), Error> {
         info!("--very-high mode: top tier — mines Kimi-Linear-48B under PoM.");
         keryx_miner::models::Tier::VeryHigh
     } else if opt.high {
-        info!("--high mode: high tier — mines Qwen3.6-27B under PoM.");
+        info!("--high mode: high tier — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::High).dir_name);
         keryx_miner::models::Tier::High
     } else if opt.light {
         info!("--light mode: light tier — mines GLM-4-9B under PoM.");
