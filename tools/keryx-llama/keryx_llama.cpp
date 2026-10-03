@@ -240,6 +240,8 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
     }
 
     llama_memory_clear(llama_get_memory(h->ctx), true);
+    // Penalty history must not carry over from earlier requests.
+    llama_sampler_reset(h->smpl);
     for (int i = 0; i < n; i += n_batch) {
         llama_batch batch = llama_batch_get_one(toks.data() + i, std::min(n_batch, n - i));
         if (llama_decode(h->ctx, batch) != 0) {
