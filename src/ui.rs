@@ -647,7 +647,7 @@ fn draw_frame(
             format!("{}  ", if snapshot.synced { "Synced" } else { "Not Synced" }),
             if snapshot.synced { palette().ok } else { palette().warn },
         ),
-        ("| OPoI ".to_string(), palette().muted),
+        ("| AI ".to_string(), palette().muted),
         (
             format!("{}  ", opoi_pause_value),
             if snapshot.opoi_challenge_active {

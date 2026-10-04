@@ -30,26 +30,28 @@ fn normalize_api_url(api_url: &str) -> String {
     }
 }
 
-/// Upload `text` to the IPFS node at `api_url` and return the raw 34-byte multihash.
+/// Upload `data` to the IPFS node at `api_url` and return the raw 34-byte multihash.
 /// The multihash format is: [0x12, 0x20, <32-byte sha2-256 digest>].
-pub fn upload(text: &str, api_url: &str) -> anyhow::Result<[u8; 34]> {
-    upload_with_pin(text, api_url, true)
+pub fn upload_bytes(data: &[u8], api_url: &str) -> anyhow::Result<[u8; 34]> {
+    upload_with_pin(data, api_url, true)
 }
 
-fn upload_with_pin(text: &str, api_url: &str, pin: bool) -> anyhow::Result<[u8; 34]> {
+fn upload_with_pin(data: &[u8], api_url: &str, pin: bool) -> anyhow::Result<[u8; 34]> {
     let api_url = normalize_api_url(api_url);
     let url = format!("{}/api/v0/add?pin={}&quieter=true", api_url.trim_end_matches('/'), pin);
     let boundary = "keryxboundary1234567890";
-    let body = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"result.txt\"\r\nContent-Type: text/plain\r\n\r\n{text}\r\n--{boundary}--\r\n",
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"result.txt\"\r\nContent-Type: application/octet-stream\r\n\r\n",
         boundary = boundary,
-        text = text,
-    );
+    )
+    .into_bytes();
+    body.extend_from_slice(data);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n", boundary = boundary).as_bytes());
     let content_type = format!("multipart/form-data; boundary={}", boundary);
     let response = ureq::post(&url)
         .set("Content-Type", &content_type)
         .timeout(Duration::from_secs(30))
-        .send_bytes(body.as_bytes())
+        .send_bytes(&body)
         .map_err(|e| anyhow::anyhow!("IPFS upload failed: {}", e))?;
     let body = response.into_string().map_err(|e| anyhow::anyhow!("IPFS response read error: {}", e))?;
     let json: serde_json::Value =
@@ -144,6 +146,16 @@ pub enum GatewayProbe {
     Undetermined(String),
 }
 
+/// The sha2-256 multihash of `data`: `[0x12, 0x20, digest]`.
+pub fn sha256_multihash(data: &[u8]) -> [u8; 34] {
+    use sha2::Digest;
+    let mut out = [0u8; 34];
+    out[0] = 0x12;
+    out[1] = 0x20;
+    out[2..].copy_from_slice(&sha2::Sha256::digest(data));
+    out
+}
+
 /// Encode a raw 34-byte multihash as a base58btc CIDv0 string.
 pub fn multihash_to_cid_v0(multihash: &[u8; 34]) -> String {
     base58btc_encode(multihash)
@@ -204,7 +216,7 @@ pub fn verify_public_reachability(api_url: &str) -> anyhow::Result<()> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let probe = format!("keryx-miner reachability probe {} {}", unix_now, rand::random::<u64>());
-    let cid = multihash_to_cid_v0(&upload_with_pin(&probe, api_url, false)?);
+    let cid = multihash_to_cid_v0(&upload_with_pin(probe.as_bytes(), api_url, false)?);
     log::info!("IPFS reachability check: asking {} for probe {}", PROJECT_GATEWAY, cid);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(REACHABILITY_WINDOW_SECS);
@@ -286,7 +298,12 @@ fn probe_running(api_url: &str, timeout: Duration) -> bool {
 /// retry exactly once. Remote endpoints are never auto-managed: their failures propagate
 /// unchanged.
 pub fn upload_with_recovery(data: &str, api_url: &str) -> anyhow::Result<[u8; 34]> {
-    match upload(data, api_url) {
+    upload_bytes_with_recovery(data.as_bytes(), api_url)
+}
+
+/// [`upload_with_recovery`] for an opaque body.
+pub fn upload_bytes_with_recovery(data: &[u8], api_url: &str) -> anyhow::Result<[u8; 34]> {
+    match upload_bytes(data, api_url) {
         Ok(cid) => Ok(cid),
         Err(first_err) => match recovery_action(api_url) {
             RecoveryAction::FailImmediately => Err(first_err),
@@ -295,7 +312,7 @@ pub fn upload_with_recovery(data: &str, api_url: &str) -> anyhow::Result<[u8; 34
                 if let Err(restore_err) = ensure_daemon(api_url) {
                     return Err(recovery_failed_error(first_err, restore_err));
                 }
-                upload(data, api_url).map_err(|e| retry_failed_error(first_err, e))
+                upload_bytes(data, api_url).map_err(|e| retry_failed_error(first_err, e))
             }
         },
     }

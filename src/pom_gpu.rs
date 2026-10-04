@@ -1148,7 +1148,7 @@ fn wait_for_sole_owner<T>(item: &Arc<T>, timeout: std::time::Duration) -> bool {
 /// device is paused during inference anyway.
 ///
 /// Scoped to a single device on purpose: only the device colocated with inference (the llama
-/// engine's GPU — see `slm::load_and_run_inference`) ever shares VRAM with the inference engine
+/// engine's GPU — see `llm::load_and_run_inference`) ever shares VRAM with the inference engine
 /// via `load_llama`'s zero-dup gather, or otherwise needs to make room for an inference model
 /// swap. Other devices in a multi-GPU rig run fully standalone `PomGpuMiner`s
 /// (`PomGpuMiner::load_raw`) that never touch the inference engine's VRAM. A previous version of
@@ -1178,7 +1178,7 @@ pub fn is_installed(device_id: u32) -> bool {
     miners().lock().map(|g| g.contains_key(&device_id)).unwrap_or(false)
 }
 
-/// Raised before an OPoI inference is spawned, lowered once no inference is in flight. While
+/// Raised before an inference is spawned, lowered once no inference is in flight. While
 /// raised, no PoM operation may start or reload a model — including a worker that acquired the
 /// lifecycle lock before the pause.
 static INFERENCE_PAUSED: AtomicBool = AtomicBool::new(false);
@@ -1304,7 +1304,7 @@ pub fn advance_mining_tier_if_due(daa: u64) {
             continue;
         }
         swapped = true;
-        let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+        let gguf = crate::llm::gguf_path_for(spec).to_string_lossy().into_owned();
         info!("PoM[gpu{}]: era crossing at DAA {} — mining model → {}.", dev, daa, spec.name);
         set_mining_tier(dev, spec.model_id, gguf.clone());
         // Free the retired model's possession index (indices are keyed by MODEL, so the new
@@ -1334,7 +1334,7 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         }
         if !union.is_empty() {
             // Leaked to satisfy the &'static lineup API — at most once per era crossing.
-            crate::slm::init_supported(Box::leak(union.into_boxed_slice()));
+            crate::llm::init_supported(Box::leak(union.into_boxed_slice()));
         }
     }
 }
@@ -1472,7 +1472,7 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     if inference_paused() {
         return false;
     }
-    if mining_model_id(device_id).is_some_and(|m| crate::slm::model_is_unavailable(&m)) {
+    if mining_model_id(device_id).is_some_and(|m| crate::llm::model_is_unavailable(&m)) {
         park(device_id);
         return false;
     }
@@ -1576,14 +1576,14 @@ fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> boo
     let Some(failed_tier) = crate::models::pom_tier_index(failed_model, daa) else {
         return false;
     };
-    let pick = crate::slm::served_pom_specs()
+    let pick = crate::llm::served_pom_specs()
         .into_iter()
         .filter_map(|s| crate::models::pom_tier_index(&s.model_id, daa).map(|t| (t, s)))
         .filter(|(t, s)| *t < failed_tier && !is_oom_banlisted(device_id, &s.model_id))
         .max_by_key(|(t, _)| *t);
     match pick {
         Some((tier, spec)) => {
-            let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+            let gguf = crate::llm::gguf_path_for(spec).to_string_lossy().into_owned();
             info!("PoM[gpu{}]: OOM on tier {} — downgrading to tier {} ({}).", device_id, failed_tier, tier, spec.name);
             set_mining_tier(device_id, spec.model_id, gguf);
             true
@@ -1707,13 +1707,13 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         // Only this GPU can serve the model: no engine here means no inference anywhere.
         use_llama = match crate::llama_engine::ensure_loaded(&gguf, device_id as usize) {
             Ok(_) => {
-                crate::slm::mark_model_available(&model_id, "llama_engine_loaded");
+                crate::llm::mark_model_available(&model_id, "llama_engine_loaded");
                 true
             }
             Err(e) => {
                 warn!("PoM[gpu{}]: llama engine unavailable — {}", device_id, e);
                 let reason = if e.is_oom() { "llama_engine_oom" } else { "llama_engine_load_failed" };
-                crate::slm::mark_model_unavailable(&model_id, reason);
+                crate::llm::mark_model_unavailable(&model_id, reason);
                 false
             }
         };
@@ -1735,7 +1735,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             );
             crate::llama_engine::unload(device_id as usize);
             use_llama = false;
-            crate::slm::mark_model_unavailable(&model_id, "llama_wrong_device");
+            crate::llm::mark_model_unavailable(&model_id, "llama_wrong_device");
         }
     }
     if use_llama {
@@ -1746,7 +1746,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             );
             crate::llama_engine::unload(device_id as usize);
             use_llama = false;
-            crate::slm::mark_model_unavailable(&model_id, "llama_layout_incompatible");
+            crate::llm::mark_model_unavailable(&model_id, "llama_layout_incompatible");
         }
     }
     let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
