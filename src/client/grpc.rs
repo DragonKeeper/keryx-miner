@@ -1071,6 +1071,7 @@ impl KeryxdHandler {
                 {
                     if daa > self.last_known_daa {
                         self.last_known_daa = daa;
+                        keryx_miner::llm::note_chain_daa(daa);
                     }
                 }
                 // Handle node-issued inference challenge: spawn an inference task if a new

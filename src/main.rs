@@ -978,6 +978,7 @@ async fn run() -> Result<(), Error> {
         {
             Ok(Some(daa)) => {
                 info!("Node at DAA {}.", daa);
+                keryx_miner::llm::note_chain_daa(daa);
                 Some(daa)
             }
             _ => {
@@ -1268,7 +1269,7 @@ async fn run() -> Result<(), Error> {
     // spinning reconnect attempts, and the miner never advertises/serves inference it cannot
     // publish. `ensure_daemon` returns only when the API is reachable (waiting up to 60
     // seconds, failing immediately if the child exits).
-    if !pool_mode {
+    if !pool_mode && !keryx_miner::llm::inline_answers() {
         let ipfs_url = opt.ipfs_url.clone();
         tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url))
             .await
@@ -1276,7 +1277,7 @@ async fn run() -> Result<(), Error> {
     }
 
     // Solo only: the pool owns the IPFS node in stratum mode.
-    if !pool_mode {
+    if !pool_mode && !keryx_miner::llm::inline_answers() {
         let ipfs_url = opt.ipfs_url.clone();
         let startup = tokio::task::spawn_blocking(move || crate::ipfs::verify_public_reachability(&ipfs_url))
             .await
@@ -1301,7 +1302,7 @@ async fn run() -> Result<(), Error> {
                 let waiting_since = std::time::Instant::now();
                 loop {
                     tokio::time::sleep(TICK).await;
-                    if shutdown.load(Ordering::Acquire) {
+                    if shutdown.load(Ordering::Acquire) || keryx_miner::llm::inline_answers() {
                         return;
                     }
                     let pause = if keryx_miner::llm::publishing_blocked() {

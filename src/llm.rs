@@ -631,7 +631,23 @@ pub fn set_publishing_blocked(blocked: bool) {
 }
 
 pub fn publishing_blocked() -> bool {
-    PUBLISHING_BLOCKED.load(Ordering::Acquire)
+    PUBLISHING_BLOCKED.load(Ordering::Acquire) && !inline_answers()
+}
+
+/// Raised once the chain reaches the private-inference gate: answers travel inline and this
+/// miner no longer publishes anything to IPFS.
+static INLINE_ANSWERS: AtomicBool = AtomicBool::new(false);
+
+/// Record a chain DAA score seen from the node.
+pub fn note_chain_daa(daa: u64) {
+    if daa >= crate::pom::private_inference_activation_daa() && !INLINE_ANSWERS.swap(true, Ordering::AcqRel) {
+        log::info!("LlmEngine: private-inference gate reached — answers travel inline, IPFS no longer required");
+    }
+}
+
+/// True once answers travel inline (chain at or past the private-inference gate).
+pub fn inline_answers() -> bool {
+    INLINE_ANSWERS.load(Ordering::Acquire)
 }
 
 /// GGUFs whose UnixFS digest was checked against the pinned `model_id` in this process.
