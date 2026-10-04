@@ -1503,11 +1503,15 @@ fn wrap_segments(segments: &[(String, Color)], width: usize, indent: usize) -> V
                     let mut rest = word.as_str();
                     while !rest.is_empty() {
                         let avail = row_width.saturating_sub(row_len);
-                        if avail == 0 {
-                            start_row(&mut rows, &mut row_width, &mut row_len);
-                            continue;
+                        let mut piece = trim_to_width(rest, avail);
+                        if piece.is_empty() {
+                            if row_len > 0 {
+                                start_row(&mut rows, &mut row_width, &mut row_len);
+                                continue;
+                            }
+                            // Narrower than one char: take it anyway, the cell clips it.
+                            piece = rest.chars().next().expect("rest is not empty").to_string();
                         }
-                        let piece = trim_to_width(rest, avail);
                         let taken = piece.len();
                         row_len += taken;
                         rows.last_mut().expect("row exists").push((piece, *color));
@@ -1663,3 +1667,16 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    #[test]
+    fn wrap_segments_terminates_on_panes_narrower_than_a_char() {
+        for width in 0..8 {
+            let rows = wrap_segments(&[("ab — Strike: —".to_string(), Color::Reset)], width, 2);
+            assert!(!rows.is_empty());
+        }
+        assert_eq!(wrap_segments(&[("Strike: —".to_string(), Color::Reset)], 40, 2).len(), 1);
+    }
+}
