@@ -1276,66 +1276,6 @@ async fn run() -> Result<(), Error> {
             .map_err(|e| format!("IPFS startup task failed: {}", e))??;
     }
 
-    // Solo only: the pool owns the IPFS node in stratum mode.
-    if !pool_mode && !keryx_miner::llm::inline_answers() {
-        let ipfs_url = opt.ipfs_url.clone();
-        let startup = tokio::task::spawn_blocking(move || crate::ipfs::verify_public_reachability(&ipfs_url))
-            .await
-            .map_err(|e| format!("IPFS reachability task failed: {}", e))?;
-        let mut failures: u32 = 0;
-        if let Err(e) = startup {
-            warn!("{}", e);
-            keryx_miner::llm::set_publishing_blocked(true);
-            failures = 1;
-            warn!(
-                "IPFS reachability: will re-check in {}s; the miner keeps running with mining suspended",
-                crate::ipfs::reachability_backoff(failures).as_secs()
-            );
-        }
-
-        let ipfs_url = opt.ipfs_url.clone();
-        let shutdown = Arc::clone(&shutdown_requested);
-        tokio::spawn(async move {
-            const TICK: std::time::Duration = std::time::Duration::from_secs(30);
-            loop {
-                // Re-evaluated every tick: a failed response check can block publishing mid-wait.
-                let waiting_since = std::time::Instant::now();
-                loop {
-                    tokio::time::sleep(TICK).await;
-                    if shutdown.load(Ordering::Acquire) || keryx_miner::llm::inline_answers() {
-                        return;
-                    }
-                    let pause = if keryx_miner::llm::publishing_blocked() {
-                        crate::ipfs::reachability_backoff(failures.max(1))
-                    } else {
-                        crate::ipfs::reachability_recheck_interval()
-                    };
-                    if waiting_since.elapsed() >= pause {
-                        break;
-                    }
-                }
-                let url = ipfs_url.clone();
-                let verdict = tokio::task::spawn_blocking(move || crate::ipfs::verify_public_reachability(&url)).await;
-                match verdict {
-                    Ok(Ok(())) => {
-                        failures = 0;
-                        keryx_miner::llm::set_publishing_blocked(false);
-                    }
-                    Ok(Err(e)) => {
-                        failures = failures.saturating_add(1);
-                        warn!("{}", e);
-                        keryx_miner::llm::set_publishing_blocked(true);
-                        warn!(
-                            "IPFS reachability: will re-check in {}s",
-                            crate::ipfs::reachability_backoff(failures).as_secs()
-                        );
-                    }
-                    Err(e) => warn!("IPFS reachability recheck task failed: {}", e),
-                }
-            }
-        });
-    }
-
     {
         let shutdown = Arc::clone(&shutdown_requested);
         tokio::spawn(async move {

@@ -864,25 +864,7 @@ impl KeryxdHandler {
                     return;
                 }
             };
-            let probe_cid = crate::ipfs::multihash_to_cid_v0(&cid);
-            match crate::ipfs::confirm_response_retrievable(&probe_cid) {
-                Ok(gateway) => info!("Inference: response CID {} served by {}", probe_cid, gateway),
-                Err(e) => {
-                    warn!(
-                        "Inference: response CID {} unreadable from the public gateways ({}) — AiResponse skipped; re-checking this node's reachability (kubo port 4001)",
-                        probe_cid, e
-                    );
-                    let _ = tx_cid.send(None);
-                    match crate::ipfs::verify_public_reachability(&ipfs_url) {
-                        Ok(()) => keryx_miner::llm::set_publishing_blocked(false),
-                        Err(e) => {
-                            warn!("{}", e);
-                            keryx_miner::llm::set_publishing_blocked(true);
-                        }
-                    }
-                    return;
-                }
-            }
+            info!("Inference: response published as CID {}", crate::ipfs::multihash_to_cid_v0(&cid));
             let _ = tx_cid.send(Some(cid));
         });
         self.publish_rx = Some(PendingPublish { request_hash, result, rx: rx_cid });

@@ -105,36 +105,12 @@ fn base58btc_decode(input: &str) -> Option<Vec<u8>> {
 pub const PROJECT_GATEWAY: &str = "https://keryx-labs.com";
 /// Independent gateway consulted only when the project gateway gives no verdict.
 const FALLBACK_GATEWAY: &str = "https://ipfs.io";
-/// Total time the startup reachability check keeps retrying.
-const REACHABILITY_WINDOW_SECS: u64 = 120;
-/// Per-request timeout of a startup reachability probe.
-const REACHABILITY_PROBE_TIMEOUT_SECS: u64 = 20;
-/// Pause between two startup reachability rounds.
+/// Pause between two gateway probe rounds.
 const REACHABILITY_RETRY_PAUSE_SECS: u64 = 5;
 /// Per-request timeout of a response confirmation probe.
 const RESPONSE_PROBE_TIMEOUT_SECS: u64 = 20;
 /// Total time a response is retried on the gateways before it is dropped.
 const RESPONSE_CONFIRM_WINDOW_SECS: u64 = 60;
-/// Interval between two background reachability checks while the miner runs.
-const REACHABILITY_RECHECK_SECS: u64 = 3_600;
-
-/// First pause before re-checking a node that failed the reachability check.
-const REACHABILITY_BACKOFF_BASE_SECS: u64 = 30;
-/// Longest pause between two re-checks of a node that keeps failing.
-const REACHABILITY_BACKOFF_CAP_SECS: u64 = 600;
-
-/// How often a running miner re-runs `verify_public_reachability`.
-pub fn reachability_recheck_interval() -> Duration {
-    Duration::from_secs(REACHABILITY_RECHECK_SECS)
-}
-
-/// Pause before the next re-check after `failures` consecutive failed checks: doubles from the
-/// base up to the cap.
-pub fn reachability_backoff(failures: u32) -> Duration {
-    let shift = failures.saturating_sub(1).min(16);
-    Duration::from_secs(REACHABILITY_BACKOFF_BASE_SECS.saturating_mul(1u64 << shift).min(REACHABILITY_BACKOFF_CAP_SECS))
-}
-
 /// Outcome of asking a public gateway for a CID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayProbe {
@@ -206,53 +182,6 @@ pub fn probe_gateway(gateway: &str, cid: &str, timeout: Duration) -> GatewayProb
         Err(ureq::Error::Status(status, _)) => classify_gateway_status(status),
         Err(e) => GatewayProbe::Undetermined(e.to_string()),
     }
-}
-
-/// Refuse to run on a kubo the public gateways cannot fetch from: a probe file is added locally
-/// and requested through the project gateway (then the fallback) until the window expires.
-pub fn verify_public_reachability(api_url: &str) -> anyhow::Result<()> {
-    let unix_now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let probe = format!("keryx-miner reachability probe {} {}", unix_now, rand::random::<u64>());
-    let cid = multihash_to_cid_v0(&upload_with_pin(probe.as_bytes(), api_url, false)?);
-    log::info!("IPFS reachability check: asking {} for probe {}", PROJECT_GATEWAY, cid);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(REACHABILITY_WINDOW_SECS);
-    let mut last = String::from("no probe sent");
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        for gateway in [PROJECT_GATEWAY, FALLBACK_GATEWAY] {
-            let timeout = remaining_budget(deadline, std::time::Instant::now())
-                .min(Duration::from_secs(REACHABILITY_PROBE_TIMEOUT_SECS));
-            if timeout.is_zero() {
-                break;
-            }
-            match probe_gateway(gateway, &cid, timeout) {
-                GatewayProbe::Reachable => {
-                    log::info!("IPFS reachability check passed via {} (attempt {})", gateway, attempt);
-                    return Ok(());
-                }
-                GatewayProbe::NotFound(status) => last = format!("{} answered HTTP {}", gateway, status),
-                GatewayProbe::Undetermined(e) => last = format!("{}: {}", gateway, e),
-            }
-        }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-        std::thread::sleep(remaining_budget(deadline, now).min(Duration::from_secs(REACHABILITY_RETRY_PAUSE_SECS)));
-    }
-    Err(anyhow::anyhow!(
-        "IPFS node at {} is not reachable from the public gateways after {}s (last: {}).\n\
-         Inference results published from this node could not be read by anyone, so mining is suspended until it is.\n\
-         Fix: expose kubo's swarm port (TCP/UDP 4001) or enable a relay, then check that `ipfs id` lists a public address.",
-        api_url,
-        REACHABILITY_WINDOW_SECS,
-        last
-    ))
 }
 
 /// Make a public gateway fetch a freshly uploaded response, retrying until the window expires.
@@ -786,13 +715,6 @@ fn extract_ipfs_binary(archive: &std::path::Path, dest_dir: &std::path::Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reachability_backoff_doubles_up_to_the_cap() {
-        let secs: Vec<u64> = (0..=8).map(|f| reachability_backoff(f).as_secs()).collect();
-        assert_eq!(secs, vec![30, 30, 60, 120, 240, 480, 600, 600, 600]);
-        assert_eq!(reachability_backoff(u32::MAX).as_secs(), 600);
-    }
 
     #[test]
     fn multihash_round_trips_through_base58_cid_v0() {
