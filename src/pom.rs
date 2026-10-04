@@ -1566,9 +1566,9 @@ pub fn reward_routing_activation_daa() -> u64 {
 
 /// Private-inference gate. At/after this score an AiResponse carries its sealed answer inline;
 /// before it the sealed body goes to IPFS and the response stays body-less. MUST equal the
-/// node's `private_inference_activation`. `u64::MAX` = never (dormant).
+/// node's `private_inference_activation`.
 pub fn private_inference_activation_daa() -> u64 {
-    gate(u64::MAX, 2_000)
+    gate(121_985_000, 2_000)
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
