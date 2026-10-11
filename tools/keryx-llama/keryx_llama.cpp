@@ -32,6 +32,12 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#if defined(_WIN32)
+#include <process.h>
+#define getpid _getpid
+#else
+#include <unistd.h>
+#endif
 
 // Windows DLLs export nothing by default — mark the ABI surface explicitly so the miner's
 // GetProcAddress finds it. No-op on ELF/Mach-O (default visibility already exports).
@@ -67,10 +73,270 @@ static void keryx_set_error(const char* stage, const std::string& detail) {
     keryx_last_error = std::string(stage) + ": " + detail + keryx_cuda_diagnostics();
 }
 
+// Opt-in debug trace (KERYX_TRACE_DIR).
+struct KeryxTrace {
+    std::vector<std::string> match;
+    std::vector<std::string> nodes;
+    FILE* f = nullptr;
+    uint64_t max_bytes = 0, written = 0, seq = 0, skipped = 0, decode = 0;
+    int64_t pos0 = 0;
+    std::vector<uint8_t> buf;
+    const ggml_tensor* q8_dst = nullptr;
+    int q8_layout = -1;
+    std::vector<uint8_t> q8;
+    std::vector<uint8_t> q8_ids;
+};
+
+static void keryx_trace_put(KeryxTrace* tr, const void* p, size_t n) {
+    fwrite(p, 1, n, tr->f);
+    tr->written += n;
+}
+
+static std::vector<std::string> keryx_split(const char* s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (const char* p = s; *p; ++p) {
+        if (*p == ',') { if (!cur.empty()) out.push_back(cur); cur.clear(); } else cur += *p;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+static bool keryx_trace_wants(const KeryxTrace* tr, const ggml_tensor* t) {
+    if ((t->op != GGML_OP_MUL_MAT && t->op != GGML_OP_MUL_MAT_ID) || !t->src[0] || !t->src[1] || t->type != GGML_TYPE_F32
+        || t->src[1]->type != GGML_TYPE_F32) return false;
+    for (const auto& m : tr->match) if (std::strstr(t->src[0]->name, m.c_str())) return true;
+    return false;
+}
+
+static bool keryx_trace_wants_node(const KeryxTrace* tr, const ggml_tensor* t) {
+    if (t->type != GGML_TYPE_F32 || t->op == GGML_OP_MUL_MAT) return false;
+    for (const auto& n : tr->nodes) if (n == t->name) return true;
+    return false;
+}
+
+static void keryx_trace_node(KeryxTrace* tr, const ggml_tensor* t) {
+    const int64_t ne0 = t->ne[0], ne1 = t->ne[1];
+    const size_t nb = ggml_nbytes(t);
+    const size_t name_len = std::strlen(t->name);
+    if (t->ne[2] != 1 || t->ne[3] != 1 || !ggml_is_contiguous(t) || tr->written + nb + 64 + name_len > tr->max_bytes) {
+        tr->skipped++;
+        return;
+    }
+    const uint8_t kind = 4;
+    const uint32_t nl = (uint32_t)name_len;
+    keryx_trace_put(tr, &kind, 1);
+    keryx_trace_put(tr, &tr->decode, 8);
+    keryx_trace_put(tr, &tr->pos0, 8);
+    keryx_trace_put(tr, &nl, 4);
+    keryx_trace_put(tr, t->name, name_len);
+    keryx_trace_put(tr, &ne0, 8);
+    keryx_trace_put(tr, &ne1, 8);
+    tr->buf.resize(nb);
+    ggml_backend_tensor_get(t, tr->buf.data(), 0, nb);
+    keryx_trace_put(tr, tr->buf.data(), nb);
+}
+
+static void keryx_trace_q8_flush(KeryxTrace* tr, const ggml_tensor* t) {
+    if (tr->q8_dst == t && !tr->q8.empty()) {
+        const uint8_t k3 = 3;
+        const int32_t layout = tr->q8_layout;
+        const uint64_t nb = tr->q8.size();
+        keryx_trace_put(tr, &k3, 1);
+        keryx_trace_put(tr, &tr->seq, 8);
+        keryx_trace_put(tr, &layout, 4);
+        keryx_trace_put(tr, &nb, 8);
+        keryx_trace_put(tr, tr->q8.data(), tr->q8.size());
+        if (!tr->q8_ids.empty()) {
+            const uint8_t k5 = 5;
+            const uint64_t ni = tr->q8_ids.size();
+            keryx_trace_put(tr, &k5, 1);
+            keryx_trace_put(tr, &tr->seq, 8);
+            keryx_trace_put(tr, &ni, 8);
+            keryx_trace_put(tr, tr->q8_ids.data(), tr->q8_ids.size());
+        }
+    }
+    tr->q8_dst = nullptr;
+    tr->q8.clear();
+    tr->q8_ids.clear();
+}
+
+static bool keryx_trace_mmid(KeryxTrace* tr, const ggml_tensor* t) {
+    const ggml_tensor* w = t->src[0];
+    const ggml_tensor* x = t->src[1];
+    const ggml_tensor* ids = t->src[2];
+    const int64_t K = w->ne[0], M = w->ne[1], n_exp = w->ne[2];
+    const int64_t ne11 = x->ne[1], ne12 = x->ne[2], n_used = ids ? ids->ne[0] : 0;
+    const size_t xb = ggml_nbytes(x), yb = ggml_nbytes(t);
+    const size_t name_len = std::strlen(w->name);
+    const size_t ib = sizeof(int32_t) * (size_t)(n_used * ne12);
+    const size_t need = 1 + 8 * 3 + 4 + name_len + 4 + 8 * 6 + xb + ib + yb;
+    if (!ids || ids->type != GGML_TYPE_I32 || x->ne[0] != K || x->ne[3] != 1 || t->ne[0] != M
+        || t->ne[1] != n_used || t->ne[2] != ne12 || !ggml_is_contiguous(x) || !ggml_is_contiguous(t)
+        || tr->written + need > tr->max_bytes) {
+        tr->skipped++;
+        tr->q8_dst = nullptr;
+        tr->q8.clear();
+        tr->q8_ids.clear();
+        return true;
+    }
+    const uint8_t kind = 6;
+    const uint32_t nl = (uint32_t)name_len;
+    const int32_t wtype = (int32_t)w->type;
+    keryx_trace_put(tr, &kind, 1);
+    keryx_trace_put(tr, &tr->seq, 8);
+    keryx_trace_put(tr, &tr->decode, 8);
+    keryx_trace_put(tr, &tr->pos0, 8);
+    keryx_trace_put(tr, &nl, 4);
+    keryx_trace_put(tr, w->name, name_len);
+    keryx_trace_put(tr, &wtype, 4);
+    const int64_t dims[6] = { K, M, n_exp, ne11, ne12, n_used };
+    keryx_trace_put(tr, dims, sizeof dims);
+    tr->buf.resize(std::max(std::max(xb, yb), ggml_nbytes(ids)));
+    ggml_backend_tensor_get(x, tr->buf.data(), 0, xb);
+    keryx_trace_put(tr, tr->buf.data(), xb);
+    ggml_backend_tensor_get(ids, tr->buf.data(), 0, ggml_nbytes(ids));
+    std::vector<int32_t> flat((size_t)(n_used * ne12));
+    for (int64_t i1 = 0; i1 < ne12; ++i1) {
+        for (int64_t i0 = 0; i0 < n_used; ++i0) {
+            std::memcpy(&flat[(size_t)(i1 * n_used + i0)], tr->buf.data() + i1 * ids->nb[1] + i0 * ids->nb[0], sizeof(int32_t));
+        }
+    }
+    keryx_trace_put(tr, flat.data(), ib);
+    ggml_backend_tensor_get(t, tr->buf.data(), 0, yb);
+    keryx_trace_put(tr, tr->buf.data(), yb);
+    keryx_trace_q8_flush(tr, t);
+    tr->seq++;
+    return true;
+}
+
+static bool keryx_trace_cb(ggml_tensor* t, bool ask, void* ud) {
+    auto* tr = static_cast<KeryxTrace*>(ud);
+    if (ask) return keryx_trace_wants(tr, t) || keryx_trace_wants_node(tr, t);
+    if (keryx_trace_wants_node(tr, t)) {
+        keryx_trace_node(tr, t);
+        return true;
+    }
+    if (!keryx_trace_wants(tr, t)) return true;
+    if (t->op == GGML_OP_MUL_MAT_ID) return keryx_trace_mmid(tr, t);
+    const ggml_tensor* w = t->src[0];
+    const ggml_tensor* x = t->src[1];
+    const int64_t K = w->ne[0], M = w->ne[1], N = x->ne[1];
+    const size_t xb = ggml_nbytes(x), yb = ggml_nbytes(t);
+    const size_t name_len = std::strlen(w->name);
+    const size_t need = 1 + 8 * 3 + 4 + name_len + 4 + 8 * 3 + xb + yb;
+    if (x->ne[0] != K || x->ne[2] != 1 || x->ne[3] != 1 || t->ne[0] != M || t->ne[1] != N
+        || !ggml_is_contiguous(x) || !ggml_is_contiguous(t) || tr->written + need > tr->max_bytes) {
+        tr->skipped++;
+        return true;
+    }
+    const uint8_t kind = 1;
+    const uint32_t nl = (uint32_t)name_len;
+    const int32_t wtype = (int32_t)w->type;
+    keryx_trace_put(tr, &kind, 1);
+    keryx_trace_put(tr, &tr->seq, 8);
+    keryx_trace_put(tr, &tr->decode, 8);
+    keryx_trace_put(tr, &tr->pos0, 8);
+    keryx_trace_put(tr, &nl, 4);
+    keryx_trace_put(tr, w->name, name_len);
+    keryx_trace_put(tr, &wtype, 4);
+    keryx_trace_put(tr, &K, 8);
+    keryx_trace_put(tr, &M, 8);
+    keryx_trace_put(tr, &N, 8);
+    tr->buf.resize(std::max(xb, yb));
+    ggml_backend_tensor_get(x, tr->buf.data(), 0, xb);
+    keryx_trace_put(tr, tr->buf.data(), xb);
+    ggml_backend_tensor_get(t, tr->buf.data(), 0, yb);
+    keryx_trace_put(tr, tr->buf.data(), yb);
+    keryx_trace_q8_flush(tr, t);
+    tr->seq++;
+    return true;
+}
+
+#ifdef KERYX_BENCH_Q8_TAP
+typedef void (*ggml_cuda_q8_tap_t)(const ggml_tensor*, const void*, size_t, int, cudaStream_t);
+extern "C" ggml_cuda_q8_tap_t ggml_cuda_q8_tap;
+static KeryxTrace* keryx_q8_trace = nullptr;
+
+static void keryx_q8_tap(const ggml_tensor* dst, const void* dev, size_t nbytes, int layout, cudaStream_t stream) {
+    KeryxTrace* tr = keryx_q8_trace;
+    if (!tr || !keryx_trace_wants(tr, dst)) return;
+    std::vector<uint8_t>& out = layout == 100 ? tr->q8_ids : tr->q8;
+    out.resize(nbytes);
+    cudaStreamSynchronize(stream);
+    cudaMemcpy(out.data(), dev, nbytes, cudaMemcpyDeviceToHost);
+    tr->q8_dst = dst;
+    if (layout != 100) tr->q8_layout = layout;
+}
+#endif
+
+static void keryx_trace_batch(KeryxTrace* tr, const llama_token* toks, int n, int64_t pos0) {
+    if (!tr) return;
+    tr->decode++;
+    tr->pos0 = pos0;
+    const uint8_t kind = 2;
+    const int64_t nn = n;
+    keryx_trace_put(tr, &kind, 1);
+    keryx_trace_put(tr, &tr->decode, 8);
+    keryx_trace_put(tr, &pos0, 8);
+    keryx_trace_put(tr, &nn, 8);
+    keryx_trace_put(tr, toks, sizeof(llama_token) * (size_t)n);
+    fflush(tr->f);
+}
+
+static KeryxTrace* keryx_trace_open(int gpu) {
+    const char* dir = getenv("KERYX_TRACE_DIR");
+    if (!dir || !*dir) return nullptr;
+    const std::string base = std::string(dir) + "/trace-" + std::to_string((long)getpid()) + "-gpu" + std::to_string(gpu);
+    FILE* f = fopen((base + ".bin").c_str(), "wb");
+    if (!f) return nullptr;
+    auto* tr = new KeryxTrace();
+    tr->f = f;
+    const char* m = getenv("KERYX_TRACE_MATCH");
+    tr->match = keryx_split((m && *m) ? m : ".ffn_down.");
+    const char* nd = getenv("KERYX_TRACE_NODES");
+    if (nd && *nd) tr->nodes = keryx_split(nd);
+    const char* mb = getenv("KERYX_TRACE_MAX_MB");
+    tr->max_bytes = (uint64_t)((mb && *mb) ? std::strtoull(mb, nullptr, 10) : 1024) << 20;
+    keryx_trace_put(tr, "KXTRACE1", 8);
+    return tr;
+}
+
+static void keryx_trace_meta(int gpu, const char* gguf_path, const std::string& ctx_info, const KeryxTrace* tr) {
+    const std::string base = std::string(getenv("KERYX_TRACE_DIR")) + "/trace-" + std::to_string((long)getpid()) + "-gpu" + std::to_string(gpu);
+    FILE* f = fopen((base + ".meta").c_str(), "w");
+    if (!f) return;
+    std::string match, nodes;
+    for (const auto& s : tr->match) match += (match.empty() ? "" : ",") + s;
+    for (const auto& s : tr->nodes) nodes += (nodes.empty() ? "" : ",") + s;
+    fprintf(f, "gguf=%s\nmatch=%s\nnodes=%s\n%s\n", gguf_path, match.c_str(), nodes.c_str(), ctx_info.c_str());
+#ifndef __APPLE__
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, gpu) == cudaSuccess) {
+        fprintf(f, "device=%s\nsm=%d%d\n", prop.name, prop.major, prop.minor);
+    }
+#endif
+    fclose(f);
+}
+
+static void keryx_trace_close(KeryxTrace* tr) {
+    if (!tr) return;
+#ifdef KERYX_BENCH_Q8_TAP
+    if (keryx_q8_trace == tr) {
+        ggml_cuda_q8_tap = nullptr;
+        keryx_q8_trace = nullptr;
+    }
+#endif
+    if (tr->f) fclose(tr->f);
+    if (tr->skipped) fprintf(stderr, "keryx trace: %llu matmul(s) skipped\n", (unsigned long long)tr->skipped);
+    delete tr;
+}
+
 struct KeryxLlama {
     llama_model*   model = nullptr;
     llama_context* ctx   = nullptr;
     llama_sampler* smpl  = nullptr;
+    KeryxTrace*    trace = nullptr;
     std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
     std::mutex gen_lock;
     std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
@@ -153,6 +419,15 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     cp.type_k = GGML_TYPE_Q8_0;
     cp.type_v = GGML_TYPE_Q8_0;
     const char* kv = "q8_0";
+    KeryxTrace* trace = keryx_trace_open(gpu);
+    if (trace) {
+        cp.cb_eval = keryx_trace_cb;
+        cp.cb_eval_user_data = trace;
+#ifdef KERYX_BENCH_Q8_TAP
+        keryx_q8_trace = trace;
+        ggml_cuda_q8_tap = keryx_q8_tap;
+#endif
+    }
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
@@ -163,6 +438,7 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     }
     if (!ctx) {
         keryx_set_error("context", "llama_init_from_model failed");
+        keryx_trace_close(trace);
         llama_model_free(model);
         return nullptr;
     }
@@ -188,10 +464,11 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
 
     auto* h = new KeryxLlama();
-    h->model = model; h->ctx = ctx; h->smpl = smpl;
+    h->model = model; h->ctx = ctx; h->smpl = smpl; h->trace = trace;
     h->ctx_info = "n_ctx=" + std::to_string(llama_n_ctx(ctx)) + " kv=" + kv +
                   " flash_attn=" + llama_flash_attn_type_name(cp.flash_attn_type) +
                   " n_batch=" + std::to_string(llama_n_batch(ctx)) + " n_ubatch=" + std::to_string(llama_n_ubatch(ctx));
+    if (trace) keryx_trace_meta(gpu, gguf_path, h->ctx_info, trace);
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
     return h;
@@ -269,6 +546,7 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
     llama_sampler_reset(h->smpl);
     for (int i = 0; i < n; i += n_batch) {
         llama_batch batch = llama_batch_get_one(toks.data() + i, std::min(n_batch, n - i));
+        keryx_trace_batch(h->trace, toks.data() + i, std::min(n_batch, n - i), i);
         if (llama_decode(h->ctx, batch) != 0) {
             keryx_set_error("decode", "llama_decode failed while reading the prompt");
             return -3;
@@ -285,6 +563,7 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
         memcpy(out + written, piece, pn);
         written += pn;
         llama_batch batch = llama_batch_get_one(&tok, 1);
+        keryx_trace_batch(h->trace, &tok, 1, n + i);
         if (llama_decode(h->ctx, batch) != 0) break;
     }
     out[written] = 0;
@@ -345,6 +624,7 @@ KERYX_EXPORT void keryx_llama_free(KeryxLlama* h) {
     if (h->smpl) llama_sampler_free(h->smpl);
     if (h->ctx) llama_free(h->ctx);
     if (h->model) llama_model_free(h->model);
+    keryx_trace_close(h->trace);
     delete h;
 }
 
