@@ -116,22 +116,25 @@ static bool keryx_trace_wants_node(const KeryxTrace* tr, const ggml_tensor* t) {
 }
 
 static void keryx_trace_node(KeryxTrace* tr, const ggml_tensor* t) {
-    const int64_t ne0 = t->ne[0], ne1 = t->ne[1];
     const size_t nb = ggml_nbytes(t);
     const size_t name_len = std::strlen(t->name);
-    if (t->ne[2] != 1 || t->ne[3] != 1 || !ggml_is_contiguous(t) || tr->written + nb + 64 + name_len > tr->max_bytes) {
+    const char* op = ggml_op_name(t->op);
+    const size_t op_len = std::strlen(op);
+    if (!ggml_is_contiguous(t) || tr->written + nb + 96 + name_len + op_len > tr->max_bytes) {
         tr->skipped++;
         return;
     }
-    const uint8_t kind = 4;
+    const uint8_t kind = 7;
     const uint32_t nl = (uint32_t)name_len;
+    const uint32_t ol = (uint32_t)op_len;
     keryx_trace_put(tr, &kind, 1);
     keryx_trace_put(tr, &tr->decode, 8);
     keryx_trace_put(tr, &tr->pos0, 8);
     keryx_trace_put(tr, &nl, 4);
     keryx_trace_put(tr, t->name, name_len);
-    keryx_trace_put(tr, &ne0, 8);
-    keryx_trace_put(tr, &ne1, 8);
+    keryx_trace_put(tr, &ol, 4);
+    keryx_trace_put(tr, op, op_len);
+    keryx_trace_put(tr, t->ne, 4 * sizeof(int64_t));
     tr->buf.resize(nb);
     ggml_backend_tensor_get(t, tr->buf.data(), 0, nb);
     keryx_trace_put(tr, tr->buf.data(), nb);
