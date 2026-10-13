@@ -475,4 +475,56 @@ mod tests {
             assert!(n_ok > 0);
         }
     }
+
+    /// Traced generation, replay and opening on the resident model, verified as the node would.
+    #[test]
+    #[ignore = "requires one CUDA GPU, libkeryx-llama, and KERYX_TEST_MODEL_GPU0 (a tier GGUF)"]
+    fn traced_generation_replays_and_verifies() {
+        use crate::llama_engine;
+        let gguf = std::env::var("KERYX_TEST_MODEL_GPU0").expect("set KERYX_TEST_MODEL_GPU0");
+        let spec = crate::models::spec_for_gguf(&gguf).expect("registry model");
+        let tier = crate::models::pom_tier_index(&spec.model_id, u64::MAX).expect("tiered model");
+        let m = TierManifest::for_tier(tier).expect("audited tier");
+        let index = WeightIndex::build_from_gguf(&gguf, spec.model_id).unwrap();
+
+        llama_engine::ensure_loaded(&gguf, 0).unwrap();
+        let nl = llama_engine::trace_configure(&gguf, 0, TierManifest::raw_for_tier(tier).unwrap()).unwrap();
+        assert_eq!(nl, m.n_leaves());
+        let prompt = "Explain in two sentences why the sky is blue.";
+        let t0 = std::time::Instant::now();
+        let g = llama_engine::generate_traced(&gguf, 0, prompt, 24).unwrap();
+        eprintln!("generated {} tokens ({} prompt) in {:.2?}: {:?}", g.tokens.len(), g.n_prompt, t0.elapsed(), g.text);
+        assert_eq!(g.n_pos as usize, g.tokens.len());
+        assert_eq!(g.leaves.len(), g.tokens.len() * nl);
+        let rec = TraceRecord::new(&m, g.n_prompt, g.ubatch.clone(), g.leaves.clone()).expect("complete trace");
+        let c = rec.commitment();
+        assert_eq!((c.n_prompt, c.n_pos, c.stage), (g.n_prompt, g.n_pos, STAGE_1A));
+
+        let tier_ctx = TierCtx { r_t: index.r_t, n_chunks: index.n_chunks, m_t: m.m_t, n_entries: m.entries.len() as u64, n_products: m.n_products as u64 };
+        let resp = ResponseCtx { trace_root: rec.trace_root, n_prompt: rec.n_prompt, n_pos: rec.n_pos };
+        let mut n_ok = 0;
+        for counter in 0..8u64 {
+            let seed = *blake3::hash(&counter.to_le_bytes()).as_bytes();
+            for i in 0..POINTS {
+                let p = draw_point(&m, rec.n_prompt, rec.n_pos, &seed, i).unwrap();
+                let t0 = std::time::Instant::now();
+                let (x, y) = llama_engine::replay(&gguf, 0, &g.tokens, g.n_prompt, p.t as u32, p.leaf_x(), p.leaf_y()).unwrap();
+                let replay = t0.elapsed();
+                assert_eq!(*blake3::hash(&x).as_bytes(), rec.leaf(p.t, p.leaf_x()), "seed {counter} point {i}: X leaf");
+                assert_eq!(*blake3::hash(&y).as_bytes(), rec.leaf(p.t, p.leaf_y()), "seed {counter} point {i}: Y leaf");
+                let point = build_point(&m, &rec, &p, x, &y, &index).unwrap();
+                let body = opening_body([3u8; 32], vec![point]).unwrap();
+                let decoded = Opening::decode(&body).unwrap();
+                let report = verify_point(&tier_ctx, &resp, &seed, i, &decoded.points[0]).unwrap_or_else(|e| panic!("seed {counter} point {i}: {e:?}"));
+                assert_eq!((report.t, report.rank, report.row), (p.t, p.rank, p.row));
+                eprintln!(
+                    "seed {counter} point {i}: t {} rank {} row {} replay {:.2?} body {} B |y-y_hat| {:.2e} tol {:.2e}",
+                    p.t, p.rank, p.row, replay, body.len(), (report.y - report.y_hat).abs(), report.tol
+                );
+                n_ok += 1;
+            }
+        }
+        llama_engine::unload(0);
+        assert_eq!(n_ok, 8 * POINTS);
+    }
 }
