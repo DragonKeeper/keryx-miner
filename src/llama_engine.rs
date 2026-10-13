@@ -28,8 +28,30 @@ type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
 type ProbeDeviceFn = unsafe extern "C" fn(c_int) -> c_int;
+type GenTracedFn =
+    unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int, *mut i32, c_int, *mut c_int, *mut c_int) -> c_int;
+type TraceConfigureFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int;
+type TraceLeafCountFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+type TraceReadFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32, usize, *mut u32) -> c_int;
+type ReplayFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const i32,
+    c_int,
+    c_int,
+    u32,
+    u32,
+    u32,
+    *mut u8,
+    usize,
+    *mut u8,
+    usize,
+    *mut u32,
+    *mut u32,
+) -> c_int;
 
-const ABI: c_int = 3;
+const ABI: c_int = 4;
+/// Largest captured leaf the engine hands back.
+const CAPTURE_CAP: usize = 4 << 20;
 
 /// Why a load attempt failed. `stage` says how far it got; the detail carries the engine's own
 /// message, including the VRAM figures when CUDA reported them.
@@ -81,6 +103,11 @@ struct Engine {
     count: CountFn,
     info: InfoFn,
     generate: GenFn,
+    generate_traced: GenTracedFn,
+    trace_configure: TraceConfigureFn,
+    trace_leaf_count: TraceLeafCountFn,
+    trace_read: TraceReadFn,
+    replay: ReplayFn,
     free: FreeFn,
     tensor_device: Option<TensorDeviceFn>,
     last_error: Option<ErrorFn>,
@@ -88,6 +115,21 @@ struct Engine {
     attempt: u64,
     /// Context window the engine allocated, in tokens.
     n_ctx: c_int,
+    /// Leaves per traced position, 0 until the trace is configured.
+    trace_leaves: usize,
+}
+
+/// A traced response: its text and everything needed to commit to and replay it.
+#[derive(Debug, Clone, Default)]
+pub struct TracedGeneration {
+    pub text: String,
+    /// Every token fed to the model: the prompt, then each decoded token.
+    pub tokens: Vec<i32>,
+    pub n_prompt: u32,
+    /// Traced positions (`tokens.len()` when the trace kept up).
+    pub n_pos: u32,
+    pub ubatch: Vec<u32>,
+    pub leaves: Vec<[u8; 32]>,
 }
 
 /// Why a generation produced no text.
@@ -349,6 +391,15 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
         if got != ABI {
             return Err(failed("abi", format!("{} has ABI {}, this miner expects {}", so.display(), got, ABI), false));
         }
+        let (Some(generate_traced), Some(trace_configure), Some(trace_leaf_count), Some(trace_read), Some(replay)) = (
+            sym::<GenTracedFn>(lib, "keryx_llama_generate_traced"),
+            sym::<TraceConfigureFn>(lib, "keryx_llama_trace_configure"),
+            sym::<TraceLeafCountFn>(lib, "keryx_llama_trace_leaf_count"),
+            sym::<TraceReadFn>(lib, "keryx_llama_trace_read"),
+            sym::<ReplayFn>(lib, "keryx_llama_replay"),
+        ) else {
+            return Err(failed("symbols", format!("{} is missing trace symbols", so.display()), false));
+        };
         let last_error = sym::<ErrorFn>(lib, "keryx_llama_last_error");
         let tensor_device = sym::<TensorDeviceFn>(lib, "keryx_llama_tensor_device");
         let cg = match CString::new(gguf) {
@@ -389,7 +440,24 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
         let context_info = sym::<ContextInfoFn>(lib, "keryx_llama_context_info")
             .map(|f| CStr::from_ptr(f(model)).to_string_lossy().into_owned())
             .unwrap_or_else(|| format!("n_ctx={}", n_ctx));
-        *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, last_error, gguf: gguf.to_string(), attempt, n_ctx });
+        *g = Some(Engine {
+            model,
+            count,
+            info,
+            generate: gen,
+            generate_traced,
+            trace_configure,
+            trace_leaf_count,
+            trace_read,
+            replay,
+            free,
+            tensor_device,
+            last_error,
+            gguf: gguf.to_string(),
+            attempt,
+            n_ctx,
+            trace_leaves: 0,
+        });
         log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves inference ({}).", context_info);
         Ok(attempt)
     }
@@ -479,6 +547,121 @@ pub fn generate(gguf: &str, gpu: usize, prompt: &str, max_tokens: usize) -> Resu
     }
     buf.truncate(n as usize);
     String::from_utf8(buf).map_err(|_| GenError::Failed("generated text is not UTF-8".to_string()))
+}
+
+fn engine_error(e: &Engine, fallback: &str) -> String {
+    e.last_error
+        .map(|f| unsafe { CStr::from_ptr(f()) }.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Enables the canonical trace on the engine hosting `gguf` on `gpu`; returns the leaves per position.
+pub fn trace_configure(gguf: &str, gpu: usize, manifest: &[u8]) -> Result<usize, String> {
+    let slot = slot(gpu);
+    let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf).ok_or_else(|| "no engine hosts this model".to_string())?;
+    let _native = native();
+    let rc = unsafe { (e.trace_configure)(e.model, manifest.as_ptr() as *const c_void, manifest.len(), 0) };
+    if rc != 0 {
+        return Err(engine_error(e, &format!("trace configuration failed ({rc})")));
+    }
+    let nl = unsafe { (e.trace_leaf_count)(e.model) };
+    if nl <= 0 {
+        return Err("trace configured without leaves".to_string());
+    }
+    e.trace_leaves = nl as usize;
+    Ok(e.trace_leaves)
+}
+
+/// Whether the engine hosting `gguf` on `gpu` traces its responses.
+pub fn traced_for(gguf: &str, gpu: usize) -> bool {
+    slot(gpu).lock().map_or(false, |g| g.as_ref().is_some_and(|e| e.gguf == gguf && e.trace_leaves > 0))
+}
+
+/// Generate with the trace on: the text, the fed tokens and the leaves of every position.
+pub fn generate_traced(gguf: &str, gpu: usize, prompt: &str, max_tokens: usize) -> Result<TracedGeneration, GenError> {
+    let slot = slot(gpu);
+    let g = slot.lock().map_err(|_| GenError::Unavailable)?;
+    let e = g.as_ref().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or(GenError::Unavailable)?;
+    let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut tokens = vec![0i32; e.n_ctx.max(1) as usize];
+    let (mut n_prompt, mut n_fed): (c_int, c_int) = (0, 0);
+    let _native = native();
+    let n = unsafe {
+        (e.generate_traced)(
+            e.model,
+            cp.as_ptr(),
+            max_tokens as c_int,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len() as c_int,
+            tokens.as_mut_ptr(),
+            tokens.len() as c_int,
+            &mut n_prompt,
+            &mut n_fed,
+        )
+    };
+    if n < 0 {
+        let detail = engine_error(e, "");
+        return Err(if n == -2 { GenError::PromptTooLong(detail) } else { GenError::Failed(detail) });
+    }
+    buf.truncate(n as usize);
+    let text = String::from_utf8(buf).map_err(|_| GenError::Failed("generated text is not UTF-8".to_string()))?;
+    tokens.truncate(n_fed.max(0) as usize);
+    let mut n_pos: u32 = 0;
+    let mut leaves = vec![[0u8; 32]; tokens.len() * e.trace_leaves];
+    let mut ubatch = vec![0u32; tokens.len()];
+    let rc = unsafe {
+        (e.trace_read)(
+            e.model,
+            leaves.as_mut_ptr() as *mut u8,
+            leaves.len() * 32,
+            ubatch.as_mut_ptr(),
+            ubatch.len(),
+            &mut n_pos,
+        )
+    };
+    if rc != 0 {
+        return Err(GenError::Failed(format!("trace read failed ({rc}), {n_pos} positions traced for {} fed", tokens.len())));
+    }
+    leaves.truncate(n_pos as usize * e.trace_leaves);
+    ubatch.truncate(n_pos as usize);
+    Ok(TracedGeneration { text, tokens, n_prompt: n_prompt.max(0) as u32, n_pos, ubatch, leaves })
+}
+
+/// Replays a traced response up to `pos` and returns the bytes of leaves `leaf_x` and `leaf_y` there.
+pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, leaf_x: u32, leaf_y: u32) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let slot = slot(gpu);
+    let g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_ref().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    let mut x = vec![0u8; CAPTURE_CAP];
+    let mut y = vec![0u8; CAPTURE_CAP];
+    let (mut x_len, mut y_len): (u32, u32) = (0, 0);
+    let _native = native();
+    let rc = unsafe {
+        (e.replay)(
+            e.model,
+            tokens.as_ptr(),
+            tokens.len() as c_int,
+            n_prompt as c_int,
+            pos,
+            leaf_x,
+            leaf_y,
+            x.as_mut_ptr(),
+            x.len(),
+            y.as_mut_ptr(),
+            y.len(),
+            &mut x_len,
+            &mut y_len,
+        )
+    };
+    if rc != 0 {
+        return Err(engine_error(e, &format!("replay failed ({rc})")));
+    }
+    x.truncate(x_len as usize);
+    y.truncate(y_len as usize);
+    Ok((x, y))
 }
 
 #[cfg(test)]

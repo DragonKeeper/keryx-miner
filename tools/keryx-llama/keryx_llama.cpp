@@ -256,20 +256,16 @@ static bool keryx_trace_cb(ggml_tensor* t, bool ask, void* ud) {
     return true;
 }
 
-#ifdef KERYX_BENCH_Q8_TAP
-typedef void (*ggml_cuda_q8_tap_t)(const ggml_tensor*, const void*, size_t, int, cudaStream_t);
-extern "C" ggml_cuda_q8_tap_t ggml_cuda_q8_tap;
-static KeryxTrace* keryx_q8_trace = nullptr;
-
-static void keryx_q8_tap(const ggml_tensor* dst, const void* dev, size_t nbytes, int layout, cudaStream_t stream) {
-    KeryxTrace* tr = keryx_q8_trace;
-    if (!tr || !keryx_trace_wants(tr, dst)) return;
-    std::vector<uint8_t>& out = layout == 100 ? tr->q8_ids : tr->q8;
-    out.resize(nbytes);
-    cudaStreamSynchronize(stream);
-    cudaMemcpy(out.data(), dev, nbytes, cudaMemcpyDeviceToHost);
-    tr->q8_dst = dst;
-    if (layout != 100) tr->q8_layout = layout;
+#ifndef __APPLE__
+// Canonical trace leaves (ggml-cuda/q8canon.cu, applied by tools/keryx-llama/patches).
+extern "C" {
+int  ggml_cuda_q8c_configure(int device, const void* manifest, size_t manifest_len, uint32_t max_pos);
+void ggml_cuda_q8c_release(int device);
+int  ggml_cuda_q8c_leaf_count(int device);
+int  ggml_cuda_q8c_begin_response(int device);
+int  ggml_cuda_q8c_arm_capture(int device, uint32_t pos, uint32_t leaf_x, uint32_t leaf_y);
+int  ggml_cuda_q8c_read(int device, uint8_t* leaves, size_t leaves_cap, uint32_t* ubatch, size_t ubatch_cap, uint32_t* n_pos);
+int  ggml_cuda_q8c_read_capture(int device, uint8_t* x, size_t x_cap, uint8_t* y, size_t y_cap, uint32_t* x_len, uint32_t* y_len);
 }
 #endif
 
@@ -340,6 +336,8 @@ struct KeryxLlama {
     llama_context* ctx   = nullptr;
     llama_sampler* smpl  = nullptr;
     KeryxTrace*    trace = nullptr;
+    int            gpu   = 0;
+    bool           traced = false;
     std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
     std::mutex gen_lock;
     std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
@@ -378,10 +376,34 @@ static bool keryx_needs_glm4_rope_fix(const char* gguf_path) {
     return fix;
 }
 
+// Feeds the prompt in n_batch chunks: the replay must split it the same way.
+static int keryx_feed_prompt(KeryxLlama* h, const llama_token* toks, int n) {
+    const int n_batch = std::max(1, (int)llama_n_batch(h->ctx));
+    for (int i = 0; i < n; i += n_batch) {
+        llama_batch batch = llama_batch_get_one(const_cast<llama_token*>(toks) + i, std::min(n_batch, n - i));
+        keryx_trace_batch(h->trace, toks + i, std::min(n_batch, n - i), i);
+        if (llama_decode(h->ctx, batch) != 0) {
+            keryx_set_error("decode", "llama_decode failed while reading the prompt");
+            return -3;
+        }
+    }
+    return 0;
+}
+
+// Starts a fresh trace for the next response when tracing is configured. Returns 0 on success.
+static int keryx_trace_reset(KeryxLlama* h) {
+#ifdef __APPLE__
+    (void)h;
+    return 0;
+#else
+    return h->traced ? ggml_cuda_q8c_begin_response(h->gpu) : 0;
+#endif
+}
+
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 3; }
+KERYX_EXPORT int keryx_llama_abi() { return 4; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -467,7 +489,7 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
 
     auto* h = new KeryxLlama();
-    h->model = model; h->ctx = ctx; h->smpl = smpl; h->trace = trace;
+    h->model = model; h->ctx = ctx; h->smpl = smpl; h->trace = trace; h->gpu = gpu;
     h->ctx_info = "n_ctx=" + std::to_string(llama_n_ctx(ctx)) + " kv=" + kv +
                   " flash_attn=" + llama_flash_attn_type_name(cp.flash_attn_type) +
                   " n_batch=" + std::to_string(llama_n_batch(ctx)) + " n_ubatch=" + std::to_string(llama_n_ubatch(ctx));
@@ -538,7 +560,6 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
     toks.resize(n);
 
     const int n_ctx = (int)llama_n_ctx(h->ctx);
-    const int n_batch = std::max(1, (int)llama_n_batch(h->ctx));
     if (n > n_ctx - 16) {
         keryx_set_error("prompt", std::to_string(n) + " prompt tokens do not fit the " + std::to_string(n_ctx) + "-token context");
         return -2;
@@ -547,14 +568,8 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
     llama_memory_clear(llama_get_memory(h->ctx), true);
     // Penalty history must not carry over from earlier requests.
     llama_sampler_reset(h->smpl);
-    for (int i = 0; i < n; i += n_batch) {
-        llama_batch batch = llama_batch_get_one(toks.data() + i, std::min(n_batch, n - i));
-        keryx_trace_batch(h->trace, toks.data() + i, std::min(n_batch, n - i), i);
-        if (llama_decode(h->ctx, batch) != 0) {
-            keryx_set_error("decode", "llama_decode failed while reading the prompt");
-            return -3;
-        }
-    }
+    keryx_trace_reset(h);
+    if (keryx_feed_prompt(h, toks.data(), n) != 0) return -3;
     int written = 0;
     for (int i = 0; i < max_tokens; i++) {
         llama_token tok = llama_sampler_sample(h->smpl, h->ctx, -1);
@@ -571,6 +586,135 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
     }
     out[written] = 0;
     return written;
+}
+
+// Like keryx_llama_generate, and records every token fed to the model (prompt, then each decoded
+// token) in `tokens`: that sequence replays the response. Generation stops when `tokens` is full.
+KERYX_EXPORT int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap,
+                                             int32_t* tokens, int tokens_cap, int* n_prompt_out, int* n_fed_out) {
+    if (!h || !prompt || !out || cap < 2 || !tokens || tokens_cap < 1 || !n_prompt_out || !n_fed_out) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    const llama_vocab* vocab = llama_model_get_vocab(h->model);
+
+    std::vector<llama_token> toks(strlen(prompt) + 16);
+    int n = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt), toks.data(), (int32_t)toks.size(), true, true);
+    if (n <= 0) return -1;
+    toks.resize(n);
+
+    const int n_ctx = (int)llama_n_ctx(h->ctx);
+    if (n > n_ctx - 16) {
+        keryx_set_error("prompt", std::to_string(n) + " prompt tokens do not fit the " + std::to_string(n_ctx) + "-token context");
+        return -2;
+    }
+    if (n > tokens_cap) {
+        keryx_set_error("prompt", "token buffer too small for the prompt");
+        return -1;
+    }
+
+    llama_memory_clear(llama_get_memory(h->ctx), true);
+    llama_sampler_reset(h->smpl);
+    if (keryx_trace_reset(h) != 0) {
+        keryx_set_error("trace", "the trace could not be reset");
+        return -5;
+    }
+    memcpy(tokens, toks.data(), (size_t)n * sizeof(int32_t));
+    int fed = n;
+    if (keryx_feed_prompt(h, toks.data(), n) != 0) return -3;
+    int written = 0;
+    for (int i = 0; i < max_tokens; i++) {
+        llama_token tok = llama_sampler_sample(h->smpl, h->ctx, -1);
+        if (llama_vocab_is_eog(vocab, tok)) break;
+        char piece[256];
+        int pn = llama_token_to_piece(vocab, tok, piece, sizeof(piece), 0, true);
+        if (pn < 0) break;
+        if (written + pn >= cap - 1) break;
+        memcpy(out + written, piece, pn);
+        written += pn;
+        if (fed >= tokens_cap) break;
+        tokens[fed++] = tok;
+        llama_batch batch = llama_batch_get_one(&tok, 1);
+        keryx_trace_batch(h->trace, &tok, 1, fed - 1);
+        if (llama_decode(h->ctx, batch) != 0) break;
+    }
+    out[written] = 0;
+    *n_prompt_out = n;
+    *n_fed_out = fed;
+    return written;
+}
+
+// Enables the canonical trace on the engine's GPU for the model described by `manifest`
+// (`max_pos` positions per response; the context size when 0). Returns 0 on success.
+KERYX_EXPORT int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest, size_t manifest_len, int max_pos) {
+#ifdef __APPLE__
+    (void)h; (void)manifest; (void)manifest_len; (void)max_pos;
+    return -1;
+#else
+    if (!h || !manifest) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    const uint32_t mp = max_pos > 0 ? (uint32_t)max_pos : (uint32_t)llama_n_ctx(h->ctx);
+    const int rc = ggml_cuda_q8c_configure(h->gpu, manifest, manifest_len, mp);
+    h->traced = rc == 0;
+    if (rc != 0) keryx_set_error("trace", "trace configuration failed (" + std::to_string(rc) + ")");
+    return rc;
+#endif
+}
+
+// Leaves per traced position, or -1 when the trace is not configured.
+KERYX_EXPORT int keryx_llama_trace_leaf_count(KeryxLlama* h) {
+#ifdef __APPLE__
+    (void)h;
+    return -1;
+#else
+    return h && h->traced ? ggml_cuda_q8c_leaf_count(h->gpu) : -1;
+#endif
+}
+
+// Leaves (n_pos × leaf_count × 32 bytes) and ubatch sizes of the last traced run. Returns 0 on
+// success; `n_pos` is set even when the buffers are null, to size them.
+KERYX_EXPORT int keryx_llama_trace_read(KeryxLlama* h, uint8_t* leaves, size_t leaves_cap, uint32_t* ubatch,
+                                        size_t ubatch_cap, uint32_t* n_pos) {
+#ifdef __APPLE__
+    (void)h; (void)leaves; (void)leaves_cap; (void)ubatch; (void)ubatch_cap; (void)n_pos;
+    return -1;
+#else
+    if (!h || !h->traced) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    return ggml_cuda_q8c_read(h->gpu, leaves, leaves_cap, ubatch, ubatch_cap, n_pos);
+#endif
+}
+
+// Replays the fed token sequence of a traced response up to position `pos` with the same batching
+// and copies the bytes of leaves `leaf_x` and `leaf_y` at that position. Returns 0 on success,
+// -1 (arguments), -2 (context), -3 (decode), -5 (trace), -6 (buffers), -7 (nothing captured).
+KERYX_EXPORT int keryx_llama_replay(KeryxLlama* h, const int32_t* tokens, int n_tokens, int n_prompt, uint32_t pos,
+                                    uint32_t leaf_x, uint32_t leaf_y, uint8_t* x, size_t x_cap, uint8_t* y, size_t y_cap,
+                                    uint32_t* x_len, uint32_t* y_len) {
+#ifdef __APPLE__
+    (void)h; (void)tokens; (void)n_tokens; (void)n_prompt; (void)pos; (void)leaf_x; (void)leaf_y;
+    (void)x; (void)x_cap; (void)y; (void)y_cap; (void)x_len; (void)y_len;
+    return -1;
+#else
+    if (!h || !h->traced || !tokens || n_prompt <= 0 || n_tokens < n_prompt || pos >= (uint32_t)n_tokens ||
+        !x || !y || !x_len || !y_len) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    if (n_tokens > (int)llama_n_ctx(h->ctx)) return -2;
+    llama_memory_clear(llama_get_memory(h->ctx), true);
+    llama_sampler_reset(h->smpl);
+    if (ggml_cuda_q8c_begin_response(h->gpu) != 0 || ggml_cuda_q8c_arm_capture(h->gpu, pos, leaf_x, leaf_y) != 0) return -5;
+    const int n_batch = std::max(1, (int)llama_n_batch(h->ctx));
+    llama_token* toks = const_cast<llama_token*>(tokens);
+    // The prompt is fed in the same n_batch chunks as the original run, up to the chunk holding `pos`.
+    const int prompt_end = pos < (uint32_t)n_prompt ? std::min(n_prompt, ((int)pos / n_batch + 1) * n_batch) : n_prompt;
+    for (int i = 0; i < prompt_end; i += n_batch) {
+        llama_batch batch = llama_batch_get_one(toks + i, std::min(n_batch, prompt_end - i));
+        if (llama_decode(h->ctx, batch) != 0) return -3;
+    }
+    for (int i = n_prompt; pos >= (uint32_t)n_prompt && i <= (int)pos; i++) {
+        llama_batch batch = llama_batch_get_one(toks + i, 1);
+        if (llama_decode(h->ctx, batch) != 0) return -3;
+    }
+    return ggml_cuda_q8c_read_capture(h->gpu, x, x_cap, y, y_cap, x_len, y_len);
+#endif
 }
 
 // Runs one tiny graph on `gpu` so a library without kernels for that device fails here rather
@@ -623,6 +767,9 @@ KERYX_EXPORT int keryx_llama_probe_device(int gpu) {
 }
 
 KERYX_EXPORT void keryx_llama_free(KeryxLlama* h) {
+#ifndef __APPLE__
+    if (h && h->traced) ggml_cuda_q8c_release(h->gpu);
+#endif
     if (!h) return;
     if (h->smpl) llama_sampler_free(h->smpl);
     if (h->ctx) llama_free(h->ctx);
