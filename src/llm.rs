@@ -837,17 +837,26 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
 /// commitment separately. A failed load/generation returns None (the response is dropped, never
 /// submitted): a miner must not be rewarded for garbage.
 pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
-    let _serving = ServingGuard::new();
-    let specs = *SUPPORTED_SPECS.read().unwrap();
-    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    run_inference(model_id, prompt, max_tokens, None).map(|g| g.text)
+}
 
-    // llama.cpp gets the raw tokens of whatever string we pass — apply the model's chat
-    // template here (template-strict models emit EOG immediately on a bare prompt).
-    let templated = format_prompt_by_name(spec.name, prompt);
+/// A generated answer and, when the tier is audited, the trace an opening needs.
+pub struct Generated {
+    pub text: String,
+    pub trace: Option<crate::trace::ResponseTrace>,
+}
+
+/// `load_and_run_inference` with the canonical trace of `tier` captured.
+pub fn load_and_run_traced_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, tier: u8) -> Option<Generated> {
+    run_inference(model_id, prompt, max_tokens, Some(tier))
+}
+
+/// The engine hosting `spec`, resident on its mining GPU: `(gguf path, device)`.
+fn resident_engine(spec: &ModelSpec) -> Option<(String, u32)> {
     // Route inference to the device that MINES this model (per-GPU tier assignment): only that
     // GPU pauses PoW and the walk shares the resident weights (zero-dup). Falls back to device 0
     // (single-GPU / unassigned model).
-    let dev_id = crate::pom_gpu::device_for_model(model_id).unwrap_or(0);
+    let dev_id = crate::pom_gpu::device_for_model(&spec.model_id).unwrap_or(0);
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
 
     if !crate::llama_engine::active_for(&gguf, dev_id as usize) {
@@ -857,15 +866,57 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         log::info!("LlmEngine: loading the llama engine for '{}' (gpu{})", spec.name, dev_id);
         if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id) {
             log::error!("LlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
-            mark_model_unavailable(model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
+            mark_model_unavailable(&spec.model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
             return None;
         }
     }
+    Some((gguf, dev_id))
+}
 
-    match crate::llama_engine::generate(&gguf, dev_id as usize, &templated, max_tokens) {
-        Ok(text) if !text.trim().is_empty() => {
+/// Arms the canonical trace of `tier` on the engine hosting `spec`; `false` when the tier is not
+/// audited or the engine cannot trace.
+fn arm_trace(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8) -> bool {
+    let Some(manifest) = crate::trace::TierManifest::raw_for_tier(tier) else { return false };
+    if crate::llama_engine::traced_for(gguf, dev_id as usize) {
+        return true;
+    }
+    match crate::llama_engine::trace_configure(gguf, dev_id as usize, manifest) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("LlmEngine '{}': trace unavailable ({}) — answering untraced", spec.name, e);
+            false
+        }
+    }
+}
+
+fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced_tier: Option<u8>) -> Option<Generated> {
+    let _serving = ServingGuard::new();
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+
+    // llama.cpp gets the raw tokens of whatever string we pass — apply the model's chat
+    // template here (template-strict models emit EOG immediately on a bare prompt).
+    let templated = format_prompt_by_name(spec.name, prompt);
+    let (gguf, dev_id) = resident_engine(spec)?;
+    let traced = traced_tier.is_some_and(|tier| arm_trace(spec, &gguf, dev_id, tier));
+
+    let outcome = if traced {
+        let m = crate::trace::TierManifest::for_tier(traced_tier.unwrap())?;
+        crate::llama_engine::generate_traced(&gguf, dev_id as usize, &templated, max_tokens).map(|g| {
+            let record = crate::trace::TraceRecord::new(&m, g.n_prompt, g.ubatch, g.leaves);
+            if record.is_none() {
+                log::warn!("LlmEngine '{}': incomplete trace — answering without a commitment", spec.name);
+            }
+            (g.text, record.map(|record| crate::trace::ResponseTrace { record, tokens: g.tokens }))
+        })
+    } else {
+        crate::llama_engine::generate(&gguf, dev_id as usize, &templated, max_tokens).map(|text| (text, None))
+    };
+
+    match outcome {
+        Ok((text, trace)) if !text.trim().is_empty() => {
             mark_model_available(model_id, "generation_success");
-            Some(text)
+            Some(Generated { text, trace })
         }
         Ok(_) => {
             log::warn!("LlmEngine '{}': llama generate returned an empty answer — response dropped", spec.name);
@@ -874,13 +925,55 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         Err(crate::llama_engine::GenError::PromptTooLong(detail)) => {
             log::warn!("LlmEngine '{}': prompt too long ({}) — answering with the fixed error text", spec.name, detail);
             mark_model_available(model_id, "generation_success");
-            Some(PROMPT_TOO_LONG_ANSWER.to_string())
+            Some(Generated { text: PROMPT_TOO_LONG_ANSWER.to_string(), trace: None })
         }
         Err(e) => {
             log::warn!("LlmEngine '{}': llama generate failed ({:?}) — response dropped", spec.name, e);
             None
         }
     }
+}
+
+/// Builds the opening body of an audited response on the GPU that served it: replays the
+/// response to each drawn position and proves the captured bytes against the possession index.
+pub fn open_trace(model_id: &[u8; 32], tier: u8, trace: &crate::trace::ResponseTrace, seed: &[u8; 32], response_txid: [u8; 32]) -> Option<Vec<u8>> {
+    use crate::trace::{build_point, draw_point, opening_body, TierManifest, POINTS};
+    let _serving = ServingGuard::new();
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let m = TierManifest::for_tier(tier)?;
+    let (gguf, dev_id) = resident_engine(spec)?;
+    if !arm_trace(spec, &gguf, dev_id, tier) {
+        return None;
+    }
+    let index = match crate::pom::active_index_for_model(model_id) {
+        Some(index) => index,
+        None => match crate::pom::WeightIndex::build_from_gguf(&gguf, *model_id) {
+            Ok(index) => std::sync::Arc::new(index),
+            Err(e) => {
+                log::warn!("LlmEngine '{}': no possession index for the opening ({})", spec.name, e);
+                return None;
+            }
+        },
+    };
+    let rec = &trace.record;
+    let mut points = Vec::with_capacity(POINTS as usize);
+    for i in 0..POINTS {
+        let p = draw_point(&m, rec.n_prompt, rec.n_pos, seed, i)?;
+        let (x, y) = match crate::llama_engine::replay(&gguf, dev_id as usize, &trace.tokens, rec.n_prompt, p.t as u32, p.leaf_x(), p.leaf_y()) {
+            Ok(xy) => xy,
+            Err(e) => {
+                log::warn!("LlmEngine '{}': replay failed at position {} ({})", spec.name, p.t, e);
+                return None;
+            }
+        };
+        if *blake3::hash(&x).as_bytes() != rec.leaf(p.t, p.leaf_x()) || *blake3::hash(&y).as_bytes() != rec.leaf(p.t, p.leaf_y()) {
+            log::error!("LlmEngine '{}': replay of position {} does not reproduce the committed trace", spec.name, p.t);
+            return None;
+        }
+        points.push(build_point(&m, rec, &p, x, &y, &index)?);
+    }
+    opening_body(response_txid, points)
 }
 
 /// Answer sent when a request's prompt does not fit the model's context window.

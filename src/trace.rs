@@ -152,6 +152,25 @@ pub fn audited(seed: &Hash) -> bool {
     draw::audited(seed)
 }
 
+/// What the miner keeps of a traced response to open it later.
+pub struct ResponseTrace {
+    pub record: TraceRecord,
+    /// Prompt then generated tokens, as fed to the engine.
+    pub tokens: Vec<i32>,
+}
+
+/// Opening window after the seed block, in DAA. MUST equal the node's `service_window_daa_at`.
+pub fn opening_window_daa(tier: u8, max_tokens: u32) -> u64 {
+    const BASE_DAA: u64 = 3_000;
+    const MAX_TOKENS_CAP: u32 = 4_096;
+    let per_token_daa: u64 = match tier {
+        0..=2 => 2,
+        3 => 3,
+        _ => 4,
+    };
+    BASE_DAA + max_tokens.min(MAX_TOKENS_CAP) as u64 * per_token_daa
+}
+
 /// One drawn point: the manifest entry, the gate of its pair, the position and the output row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointSpec {
