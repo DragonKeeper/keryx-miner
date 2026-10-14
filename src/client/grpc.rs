@@ -188,7 +188,7 @@ pub struct KeryxdHandler {
     /// Queue of AiRequests waiting for inference.
     /// Each entry: (stable_id_hex16, request_hash, model_id, prompt, max_tokens, private state).
     /// Fed by both BlockAdded scans and block template scans.
-    ai_request_queue: VecDeque<(String, [u8; 32], [u8; 32], String, usize, Option<PrivateRequest>)>,
+    ai_request_queue: VecDeque<(String, [u8; 32], [u8; 32], String, u32, usize, Option<PrivateRequest>)>,
 
     /// Block hashes queued for boot-time escrow-state validation, drained in slices of
     /// VALIDATION_WINDOW so thousands of GetBlock requests never saturate the HTTP/2
@@ -579,32 +579,33 @@ impl KeryxdHandler {
         );
         let escrow_secret = self.escrow_watcher.as_ref().map(|w| w.secret_bytes());
         for tx in txs {
-            // (raw, model_id, prompt, max_tokens, inference_reward, private state)
-            let extracted: Option<(Vec<u8>, [u8; 32], String, usize, u64, Option<PrivateRequest>)> =
+            // (raw, model_id, prompt, plaintext prompt length, max_tokens, inference_reward, private state)
+            let extracted: Option<(Vec<u8>, [u8; 32], String, u32, usize, u64, Option<PrivateRequest>)> =
                 if tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_REQUEST_HEX {
                     // Binary AiRequestPayload (dedicated AI subnetwork).
                     hex::decode(&tx.payload).ok().and_then(|raw| {
                         let req = keryx_inference::AiRequestPayload::deserialize(&raw)?;
-                        let (prompt, private) = if req.is_private() {
+                        let (prompt, prompt_len, private) = if req.is_private() {
                             Self::open_private_request(&req, escrow_secret.as_ref())?
                         } else {
-                            (String::from_utf8_lossy(&req.prompt).into_owned(), None)
+                            (String::from_utf8_lossy(&req.prompt).into_owned(), req.prompt.len() as u32, None)
                         };
-                        Some((raw, req.model_id, prompt, req.max_tokens as usize, req.inference_reward, private))
+                        Some((raw, req.model_id, prompt, prompt_len, req.max_tokens as usize, req.inference_reward, private))
                     })
                 } else if !tx.inputs.is_empty() {
                     // KRX:AI:1: JSON format — model routed by "m" field, skipped if not loaded.
                     hex::decode(&tx.payload).ok().and_then(|raw| {
                         Self::parse_krx_ai_payload(&raw).and_then(|(model_name, prompt, max_tokens)| {
                             let model_id = keryx_miner::models::find(&model_name)?.model_id;
-                            Some((raw, model_id, prompt, max_tokens, 0u64, None))
+                            let prompt_len = prompt.len() as u32;
+                            Some((raw, model_id, prompt, prompt_len, max_tokens, 0u64, None))
                         })
                     })
                 } else {
                     None // coinbase — skip
                 };
 
-            if let Some((raw, model_id, prompt, max_tokens, inference_reward, private)) = extracted {
+            if let Some((raw, model_id, prompt, prompt_len, max_tokens, inference_reward, private)) = extracted {
                 if !ready_ids.contains(&model_id) {
                     log::debug!("Inference: skipping AiRequest — model not supported or files not ready");
                     continue;
@@ -634,14 +635,14 @@ impl KeryxdHandler {
                 if !self.ai_seen_prefixes.contains(&stable_id) {
                     info!("Inference: queued AiRequest id={}", stable_id);
                     self.ai_seen_prefixes.insert(stable_id.clone());
-                    self.ai_request_queue.push_back((stable_id.clone(), request_hash, model_id, prompt, max_tokens, private));
+                    self.ai_request_queue.push_back((stable_id.clone(), request_hash, model_id, prompt, prompt_len, max_tokens, private));
                     while self.ai_request_queue.len() > MAX_AI_QUEUE_SIZE {
                         self.ai_request_queue.pop_front();
                     }
                     while self.ai_seen_prefixes.len() > MAX_AI_SEEN_IDS {
                         self.ai_seen_prefixes.clear();
                         self.ai_seen_prefixes.shrink_to_fit();
-                        for (sid, _, _, _, _, _) in &self.ai_request_queue {
+                        for (sid, ..) in &self.ai_request_queue {
                             self.ai_seen_prefixes.insert(sid.clone());
                         }
                     }
@@ -677,17 +678,17 @@ impl KeryxdHandler {
     fn open_private_request(
         req: &keryx_inference::AiRequestPayload,
         escrow_secret: Option<&[u8; 32]>,
-    ) -> Option<(String, Option<PrivateRequest>)> {
+    ) -> Option<(String, u32, Option<PrivateRequest>)> {
         let Some(secret) = escrow_secret else {
             log::debug!("Inference: skipping private AiRequest — no escrow key configured");
             return None;
         };
         match keryx_inference::open_request(req, secret) {
             Ok(opened) => match decode_private_prompt(&opened.prompt) {
-                Some(prompt) => Some((prompt, Some(PrivateRequest::Opened(opened.root_key)))),
+                Some(prompt) => Some((prompt, opened.prompt.len() as u32, Some(PrivateRequest::Opened(opened.root_key)))),
                 None => {
                     warn!("Inference: private AiRequest opened but its compressed prompt is invalid — answering with an error body");
-                    Some((String::new(), Some(PrivateRequest::Unreadable)))
+                    Some((String::new(), 0, Some(PrivateRequest::Unreadable)))
                 }
             },
             Err(keryx_inference::PrivateError::NotARecipient) => {
@@ -696,7 +697,7 @@ impl KeryxdHandler {
             }
             Err(e) => {
                 warn!("Inference: private AiRequest names this miner but cannot be opened ({}) — answering with an error body", e);
-                Some((String::new(), Some(PrivateRequest::Unreadable)))
+                Some((String::new(), 0, Some(PrivateRequest::Unreadable)))
             }
         }
     }
@@ -793,7 +794,7 @@ impl KeryxdHandler {
                 info!("Inference: request id={} already answered by this miner — skipped", sid);
             }
         }
-        if let Some((stable_id, request_hash, model_id, prompt, max_tokens, private)) = self.ai_request_queue.pop_front() {
+        if let Some((stable_id, request_hash, model_id, prompt, prompt_len, max_tokens, private)) = self.ai_request_queue.pop_front() {
             let (tx_done, rx_done) = oneshot::channel::<Option<keryx_miner::llm::Generated>>();
             let traced = self.last_known_daa >= keryx_miner::pom::verifiable_inference_activation_daa();
             let tier = traced.then(|| keryx_miner::models::pom_tier_index(&model_id, self.last_known_daa)).flatten();
@@ -812,7 +813,7 @@ impl KeryxdHandler {
             info!("Inference: spawning LLM inference (max_tokens={}{})", max_tokens, if tier.is_some() { ", traced" } else { "" });
             tokio::task::spawn_blocking(move || {
                 let result = match tier {
-                    Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier),
+                    Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len),
                     None => keryx_miner::llm::load_and_run_inference(&model_id, &prompt, max_tokens)
                         .map(|text| keryx_miner::llm::Generated { text, trace: None }),
                 };
@@ -1791,8 +1792,9 @@ mod tests {
 
         assert!(super::KeryxdHandler::open_private_request(&req, None).is_none());
         assert!(super::KeryxdHandler::open_private_request(&req, Some(&other)).is_none());
-        let (prompt, private) = super::KeryxdHandler::open_private_request(&req, Some(&mine)).unwrap();
+        let (prompt, prompt_len, private) = super::KeryxdHandler::open_private_request(&req, Some(&mine)).unwrap();
         assert_eq!(prompt, "sealed prompt");
+        assert_eq!(prompt_len, 13);
         assert!(matches!(private, Some(PrivateRequest::Opened(_))));
 
         // A flipped ciphertext byte still names this key: answered, with the error body.
@@ -1800,7 +1802,7 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
         let tampered = AiRequestPayload::deserialize(&tampered).unwrap();
-        let (prompt, private) = super::KeryxdHandler::open_private_request(&tampered, Some(&mine)).unwrap();
+        let (prompt, _, private) = super::KeryxdHandler::open_private_request(&tampered, Some(&mine)).unwrap();
         assert!(prompt.is_empty());
         assert!(matches!(private, Some(PrivateRequest::Unreadable)));
     }
@@ -1811,7 +1813,7 @@ mod tests {
         let mine = [0x11u8; 32];
         let pubkey = escrow_pubkey_of(&mine).unwrap();
         let (req, secret) = seal_request([5u8; 32], 64, 1_000, 2_000, b"q", &[pubkey]).unwrap();
-        let (_, private) = super::KeryxdHandler::open_private_request(&req, Some(&mine)).unwrap();
+        let (_, _, private) = super::KeryxdHandler::open_private_request(&req, Some(&mine)).unwrap();
         let Some(PrivateRequest::Opened(root_key)) = private else { panic!("not opened") };
         let request_hash = [9u8; 32];
         let body = keryx_inference::seal_response(&root_key, &request_hash, &pubkey, b"answer");

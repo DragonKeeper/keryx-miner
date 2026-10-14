@@ -511,7 +511,7 @@ mod tests {
         assert_eq!(nl, m.n_leaves());
         let prompt = "Explain in two sentences why the sky is blue.";
         let t0 = std::time::Instant::now();
-        let g = llama_engine::generate_traced(&gguf, 0, prompt, 24).unwrap();
+        let g = llama_engine::generate_traced(&gguf, 0, prompt, 24, 0, 0).unwrap();
         eprintln!("generated {} tokens ({} prompt) in {:.2?}: {:?}", g.tokens.len(), g.n_prompt, t0.elapsed(), g.text);
         assert_eq!(g.n_pos as usize, g.tokens.len());
         assert_eq!(g.leaves.len(), g.tokens.len() * nl);
@@ -543,6 +543,12 @@ mod tests {
                 n_ok += 1;
             }
         }
+        // Shape padding: the prompt grows to the floor and the answer gets its generated positions.
+        let g = llama_engine::generate_traced(&gguf, 0, prompt, 8, 64, 1).unwrap();
+        assert_eq!(g.n_prompt, 64);
+        assert!(g.n_pos - g.n_prompt >= g.text.len().min(8) as u32, "{} generated for {} B", g.n_pos - g.n_prompt, g.text.len());
+        assert_eq!(g.n_pos as usize, g.tokens.len());
+        assert!(TraceRecord::new(&m, g.n_prompt, g.ubatch.clone(), g.leaves.clone()).is_some());
         llama_engine::unload(0);
         assert_eq!(n_ok, 8 * POINTS);
     }

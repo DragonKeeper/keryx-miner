@@ -28,8 +28,19 @@ type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
 type ProbeDeviceFn = unsafe extern "C" fn(c_int) -> c_int;
-type GenTracedFn =
-    unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int, *mut i32, c_int, *mut c_int, *mut c_int) -> c_int;
+type GenTracedFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    c_int,
+    *mut c_char,
+    c_int,
+    *mut i32,
+    c_int,
+    *mut c_int,
+    *mut c_int,
+    c_int,
+    c_int,
+) -> c_int;
 type TraceConfigureFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int;
 type TraceLeafCountFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type TraceReadFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32, usize, *mut u32) -> c_int;
@@ -49,7 +60,7 @@ type ReplayFn = unsafe extern "C" fn(
     *mut u32,
 ) -> c_int;
 
-const ABI: c_int = 4;
+const ABI: c_int = 5;
 /// Largest captured leaf the engine hands back.
 const CAPTURE_CAP: usize = 4 << 20;
 
@@ -580,7 +591,16 @@ pub fn traced_for(gguf: &str, gpu: usize) -> bool {
 }
 
 /// Generate with the trace on: the text, the fed tokens and the leaves of every position.
-pub fn generate_traced(gguf: &str, gpu: usize, prompt: &str, max_tokens: usize) -> Result<TracedGeneration, GenError> {
+/// Traced generation; the prompt is padded to `min_prompt` positions and the answer to
+/// `answer bytes / answer_bytes_per_position` generated positions (0 = no answer padding).
+pub fn generate_traced(
+    gguf: &str,
+    gpu: usize,
+    prompt: &str,
+    max_tokens: usize,
+    min_prompt: u32,
+    answer_bytes_per_position: u32,
+) -> Result<TracedGeneration, GenError> {
     let slot = slot(gpu);
     let g = slot.lock().map_err(|_| GenError::Unavailable)?;
     let e = g.as_ref().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or(GenError::Unavailable)?;
@@ -600,6 +620,8 @@ pub fn generate_traced(gguf: &str, gpu: usize, prompt: &str, max_tokens: usize) 
             tokens.len() as c_int,
             &mut n_prompt,
             &mut n_fed,
+            min_prompt.min(c_int::MAX as u32) as c_int,
+            answer_bytes_per_position.min(c_int::MAX as u32) as c_int,
         )
     };
     if n < 0 {

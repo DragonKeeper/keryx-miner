@@ -847,8 +847,22 @@ pub struct Generated {
 }
 
 /// `load_and_run_inference` with the canonical trace of `tier` captured.
-pub fn load_and_run_traced_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, tier: u8) -> Option<Generated> {
-    run_inference(model_id, prompt, max_tokens, Some(tier))
+/// Traced inference for an audited tier; `prompt_len` is the request's plaintext prompt length.
+pub fn load_and_run_traced_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, tier: u8, prompt_len: u32) -> Option<Generated> {
+    run_inference(model_id, prompt, max_tokens, Some((tier, prompt_len)))
+}
+
+/// Cuts `text` to the longest answer the request's token budget allows, on a char boundary.
+fn truncate_answer(mut text: String, max_tokens: usize) -> String {
+    let cap = keryx_verifiable_inference::shape::max_answer_len(max_tokens.min(u32::MAX as usize) as u32).min(usize::MAX as u64) as usize;
+    if text.len() > cap {
+        let mut end = cap;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 /// The engine hosting `spec`, resident on its mining GPU: `(gguf path, device)`.
@@ -889,7 +903,7 @@ fn arm_trace(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8) -> bool {
     }
 }
 
-fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced_tier: Option<u8>) -> Option<Generated> {
+fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: Option<(u8, u32)>) -> Option<Generated> {
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
@@ -898,11 +912,13 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced_ti
     // template here (template-strict models emit EOG immediately on a bare prompt).
     let templated = format_prompt_by_name(spec.name, prompt);
     let (gguf, dev_id) = resident_engine(spec)?;
-    let traced = traced_tier.is_some_and(|tier| arm_trace(spec, &gguf, dev_id, tier));
+    let traced = traced.filter(|(tier, _)| arm_trace(spec, &gguf, dev_id, *tier));
 
-    let outcome = if traced {
-        let m = crate::trace::TierManifest::for_tier(traced_tier.unwrap())?;
-        crate::llama_engine::generate_traced(&gguf, dev_id as usize, &templated, max_tokens).map(|g| {
+    let outcome = if let Some((tier, prompt_len)) = traced {
+        let m = crate::trace::TierManifest::for_tier(tier)?;
+        let min_prompt = keryx_verifiable_inference::shape::min_prompt_positions(prompt_len);
+        let per_position = keryx_verifiable_inference::shape::ANSWER_BYTES_PER_POSITION;
+        crate::llama_engine::generate_traced(&gguf, dev_id as usize, &templated, max_tokens, min_prompt, per_position).map(|g| {
             let record = crate::trace::TraceRecord::new(&m, g.n_prompt, g.ubatch, g.leaves);
             if record.is_none() {
                 log::warn!("LlmEngine '{}': incomplete trace — answering without a commitment", spec.name);
@@ -916,7 +932,7 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced_ti
     match outcome {
         Ok((text, trace)) if !text.trim().is_empty() => {
             mark_model_available(model_id, "generation_success");
-            Some(Generated { text, trace })
+            Some(Generated { text: truncate_answer(text, max_tokens), trace })
         }
         Ok(_) => {
             log::warn!("LlmEngine '{}': llama generate returned an empty answer — response dropped", spec.name);

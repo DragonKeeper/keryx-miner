@@ -390,6 +390,13 @@ static int keryx_feed_prompt(KeryxLlama* h, const llama_token* toks, int n) {
     return 0;
 }
 
+// Token fed as padding: a newline, else the end-of-sequence token.
+static llama_token keryx_pad_token(const llama_vocab* vocab) {
+    llama_token t[4];
+    const int k = llama_tokenize(vocab, "\n", 1, t, 4, false, false);
+    return k >= 1 ? t[0] : llama_vocab_eos(vocab);
+}
+
 // Starts a fresh trace for the next response when tracing is configured. Returns 0 on success.
 static int keryx_trace_reset(KeryxLlama* h) {
 #ifdef __APPLE__
@@ -403,7 +410,7 @@ static int keryx_trace_reset(KeryxLlama* h) {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 4; }
+KERYX_EXPORT int keryx_llama_abi() { return 5; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -590,8 +597,11 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
 
 // Like keryx_llama_generate, and records every token fed to the model (prompt, then each decoded
 // token) in `tokens`: that sequence replays the response. Generation stops when `tokens` is full.
+// The prompt is padded to `min_prompt` tokens, and padding positions are decoded after the answer
+// until `answer bytes / answer_bytes_per_position` (at most `max_tokens`) have been generated.
 KERYX_EXPORT int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap,
-                                             int32_t* tokens, int tokens_cap, int* n_prompt_out, int* n_fed_out) {
+                                             int32_t* tokens, int tokens_cap, int* n_prompt_out, int* n_fed_out,
+                                             int min_prompt, int answer_bytes_per_position) {
     if (!h || !prompt || !out || cap < 2 || !tokens || tokens_cap < 1 || !n_prompt_out || !n_fed_out) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
@@ -600,6 +610,11 @@ KERYX_EXPORT int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, 
     int n = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt), toks.data(), (int32_t)toks.size(), true, true);
     if (n <= 0) return -1;
     toks.resize(n);
+    const llama_token pad = keryx_pad_token(vocab);
+    if (min_prompt > n) {
+        toks.resize((size_t)min_prompt, pad);
+        n = min_prompt;
+    }
 
     const int n_ctx = (int)llama_n_ctx(h->ctx);
     if (n > n_ctx - 16) {
@@ -635,6 +650,16 @@ KERYX_EXPORT int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, 
         llama_batch batch = llama_batch_get_one(&tok, 1);
         keryx_trace_batch(h->trace, &tok, 1, fed - 1);
         if (llama_decode(h->ctx, batch) != 0) break;
+    }
+    if (answer_bytes_per_position > 0) {
+        const int need = std::min(written / answer_bytes_per_position, max_tokens);
+        while (fed - n < need && fed < tokens_cap && fed < n_ctx - 1) {
+            llama_token tok = pad;
+            tokens[fed++] = tok;
+            llama_batch batch = llama_batch_get_one(&tok, 1);
+            keryx_trace_batch(h->trace, &tok, 1, fed - 1);
+            if (llama_decode(h->ctx, batch) != 0) break;
+        }
     }
     out[written] = 0;
     *n_prompt_out = n;
