@@ -1596,6 +1596,12 @@ pub fn verifiable_inference_activation_daa() -> u64 {
     gate(u64::MAX, 200_000)
 }
 
+/// Node `trace_prefix_activation`: responses accepted from this DAA are opened against the
+/// prefix-bound manifests, with the request-bound prefix point.
+pub fn trace_prefix_activation_daa() -> u64 {
+    gate(u64::MAX, u64::MAX)
+}
+
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
 /// A tier POSITION shifts across eras (a lineup insertion renumbers the models below it) while
 /// the model's index bytes are identical — keying by position would strand a built index at a

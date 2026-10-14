@@ -5,7 +5,8 @@ use keryx_inference::TraceCommitment;
 use keryx_verifiable_inference::draw;
 use keryx_verifiable_inference::manifest::{self, Entry};
 use keryx_verifiable_inference::merkle::{b3_chunk_cv, b3_path, b3_root, rt_range_proof, Hash, B3_CHUNK};
-use keryx_verifiable_inference::opening::{self, ChunkRange, EntryOpening, Opening, Point};
+use keryx_verifiable_inference::opening::{self, ChunkRange, EntryOpening, Opening, Point, PrefixPoint};
+use keryx_verifiable_inference::prefix::{self, PrefixCtx};
 
 use crate::pom::WeightIndex;
 
@@ -26,6 +27,126 @@ const MANIFESTS: [Option<&[u8]>; 5] = [
     Some(include_bytes!("../assets/trace-manifests/tier3.bin")),
     None,
 ];
+
+/// Prefix contexts of the audited tiers, in tier order. MUST equal the node's `TRACE_PREFIXES`.
+const PREFIXES: [Option<PrefixCtx>; 5] = [
+    Some(PrefixCtx {
+        table: [
+            188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+            204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+            220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+            79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+            222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+            254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+            108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+            124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+            140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+            172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+        ],
+        offset: 6,
+        embd_entry: 249,
+        norm_entry: 250,
+        eps: 9.999999974752427e-07,
+        embd_scale: 1.0,
+    }),
+    Some(PrefixCtx {
+        table: [
+            188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+            204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+            220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+            79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+            222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+            254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+            108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+            124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+            140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+            172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+        ],
+        offset: 7,
+        embd_entry: 361,
+        norm_entry: 362,
+        eps: 9.999999747378752e-06,
+        embd_scale: 1.0,
+    }),
+    Some(PrefixCtx {
+        table: [
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 107, 249, 250, 251, 252, 253,
+            254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269,
+            270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285,
+            286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301,
+            302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317,
+            318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333,
+            334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347, 348, 349,
+            350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361, 362, 363, 364, 365,
+            366, 367, 368, 369, 370, 371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381,
+            382, 383, 384, 385, 386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397,
+            398, 399, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413,
+            414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 429,
+            430, 431, 432, 433, 434, 435, 436, 437, 438, 439, 440, 441, 442, 443, 444, 445,
+            446, 447, 448, 449, 450, 451, 452, 453, 454, 455, 456, 457, 458, 459, 460, 461,
+            462, 463, 464, 465, 466, 467, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477,
+            478, 479, 480, 481, 482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492, 493,
+        ],
+        offset: 7,
+        embd_entry: 329,
+        norm_entry: 330,
+        eps: 9.999999974752427e-07,
+        embd_scale: 61.967735290527344,
+    }),
+    Some(PrefixCtx {
+        table: [
+            188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+            204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+            220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+            79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+            222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+            254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+            108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+            124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+            140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+            172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+        ],
+        offset: 6,
+        embd_entry: 497,
+        norm_entry: 498,
+        eps: 9.999999974752427e-07,
+        embd_scale: 1.0,
+    }),
+    None,
+];
+
+/// The prefix context of `tier`, `None` when the tier is not audited.
+pub fn prefix_ctx(tier: u8) -> Option<&'static PrefixCtx> {
+    PREFIXES.get(tier as usize).and_then(|p| p.as_ref())
+}
+
+/// Whether a response accepted at `accepted_daa` is opened under the prefix rule.
+pub fn prefix_active(accepted_daa: u64) -> bool {
+    accepted_daa >= crate::pom::trace_prefix_activation_daa()
+}
+
+/// The token ids the request id puts at the prefix positions of a traced prompt.
+pub fn prefix_tokens(ctx: &PrefixCtx, request_hash: &[u8; 32]) -> Vec<i32> {
+    request_hash.iter().map(|b| ctx.table[*b as usize] as i32).collect()
+}
 
 /// Manifest of an audited tier: the canonical product list and its root `M_T`.
 pub struct TierManifest {
@@ -49,6 +170,22 @@ impl TierManifest {
     /// The embedded manifest of `tier`, `None` when the tier is not audited.
     pub fn for_tier(tier: u8) -> Option<Self> {
         MANIFESTS.get(tier as usize).copied().flatten().and_then(Self::parse)
+    }
+
+    /// The manifest the node holds for a response accepted at `accepted_daa`: the embedded one
+    /// under the prefix rule, else its entries before the embedding and norm.
+    pub fn for_tier_at(tier: u8, accepted_daa: u64) -> Option<Self> {
+        let m = Self::for_tier(tier)?;
+        if prefix_active(accepted_daa) { Some(m) } else { Some(m.legacy()) }
+    }
+
+    /// This manifest without the prefix entries (`M_T` of the node's `TRACE_MANIFESTS_H14`).
+    pub fn legacy(&self) -> Self {
+        let n = self.entries.iter().position(|(e, _)| e.role == manifest::ROLE_EMBD).unwrap_or(self.entries.len());
+        let entries: Vec<(Entry, Vec<u8>)> = self.entries[..n].to_vec();
+        let leaves: Vec<Hash> = self.leaves[..n].to_vec();
+        let (m_t, _) = rt_range_proof(&leaves, 0, 1);
+        Self { entries, n_products: self.n_products, leaves, m_t }
     }
 
     pub fn raw_for_tier(tier: u8) -> Option<&'static [u8]> {
@@ -306,9 +443,37 @@ pub fn build_point(m: &TierManifest, rec: &TraceRecord, p: &PointSpec, x: Vec<u8
     })
 }
 
+/// The prefix position the draw of `seed` opens.
+pub fn draw_prefix(ctx: &PrefixCtx, seed: &Hash) -> u64 {
+    prefix::position(seed, ctx.offset)
+}
+
+/// The prefix point at position `t` from the captured input bytes `x` of the first product.
+pub fn build_prefix_point(m: &TierManifest, rec: &TraceRecord, ctx: &PrefixCtx, request_hash: &[u8; 32], t: u64, x: Vec<u8>, index: &WeightIndex) -> Option<PrefixPoint> {
+    if t >= rec.n_pos as u64 {
+        return None;
+    }
+    let tok = prefix::expected_token(ctx, request_hash, t)?;
+    let embd = m.entry(ctx.embd_entry as u64);
+    let norm = m.entry(ctx.norm_entry as u64);
+    let (first, last, _) = embd.row_chunks(0, tok as u64)?;
+    let norm_last = norm.chunk_base + (4 * norm.k - 1) / 32;
+    let pos_leaves = rec.leaves_at(t);
+    Some(PrefixPoint {
+        n_ubatch: rec.ubatch[t as usize],
+        pos_path: b3_path(&rec.pos_roots, t as usize),
+        meta_path: b3_path(pos_leaves, rec.n_leaves - 1),
+        entry: m.entry_opening(0),
+        x,
+        x_path: b3_path(pos_leaves, 0),
+        embd: (m.entry_opening(ctx.embd_entry as u64), range_proof(index, first, last)?),
+        norm: (m.entry_opening(ctx.norm_entry as u64), range_proof(index, norm.chunk_base, norm_last)?),
+    })
+}
+
 /// Encoded opening body, `None` above the consensus size cap.
-pub fn opening_body(response_txid: [u8; 32], points: Vec<Point>) -> Option<Vec<u8>> {
-    let body = Opening { response_txid, points }.encode();
+pub fn opening_body(response_txid: [u8; 32], points: Vec<Point>, prefix: Option<PrefixPoint>) -> Option<Vec<u8>> {
+    let body = Opening { response_txid, points, prefix }.encode();
     (body.len() <= opening::MAX_BODY_LEN).then_some(body)
 }
 
@@ -328,12 +493,20 @@ mod tests {
     use keryx_verifiable_inference::merkle::{rt_range_proof, rt_verify_range};
     use keryx_verifiable_inference::verify::{verify_point, ResponseCtx, TierCtx};
 
-    /// `M_T`, entries and products pinned by the node (`TRACE_MANIFESTS_H14`).
+    /// `M_T`, entries and products pinned by the node (`TRACE_MANIFESTS_PREFIX`).
     const PINNED: [(&str, u64, u64); 4] = [
-        ("4c6212d16c7fc573b372e57e60176190b63ed3637a7bdfa93fbf6a7ca2bfd492", 249, 249),
-        ("c586bd7c3ef5aeadd669a48e28beb135a9df43890bf4b30a26072cdebba1b045", 361, 241),
-        ("1550e2f3a709f1653663111196edeb8088a0c50873687e70ef77bbbcdaa949c8", 329, 329),
-        ("5ff3b42ff04356106ae7a56512321fae0f37bde171495b774bf944e4d0235c33", 497, 497),
+        ("9b802ae5f4cafe073bd97b72222a77f44eb597491ab07235180c5ef8783f62bc", 251, 249),
+        ("5d678ffbd6c4164cc8d4006168adc276541fdf3f181ea8a89cac70231e7d7d1a", 363, 241),
+        ("c09c80b1815b93dba8b430f2648e50be87137de945f96ca82e4cfa2084b2a808", 331, 329),
+        ("98dc87dc3cf1297232e89e58bfae501c1172ba05626807a086ca38cdaffb4c47", 499, 497),
+    ];
+
+    /// `M_T` and entries pinned by the node before the prefix rule (`TRACE_MANIFESTS_H14`).
+    const PINNED_LEGACY: [(&str, u64); 4] = [
+        ("4c6212d16c7fc573b372e57e60176190b63ed3637a7bdfa93fbf6a7ca2bfd492", 249),
+        ("c586bd7c3ef5aeadd669a48e28beb135a9df43890bf4b30a26072cdebba1b045", 361),
+        ("1550e2f3a709f1653663111196edeb8088a0c50873687e70ef77bbbcdaa949c8", 329),
+        ("5ff3b42ff04356106ae7a56512321fae0f37bde171495b774bf944e4d0235c33", 497),
     ];
 
     #[test]
@@ -347,9 +520,42 @@ mod tests {
                 let eo = m.entry_opening(i);
                 assert!(manifest::verify_entry(&m.m_t, *n_entries, i, &eo.bytes, &eo.path));
             }
+            let ctx = prefix_ctx(tier as u8).expect("prefix context");
+            let (embd, norm) = (m.entry(ctx.embd_entry as u64), m.entry(ctx.norm_entry as u64));
+            assert_eq!((embd.role, norm.role), (manifest::ROLE_EMBD, manifest::ROLE_NORM), "tier {tier}");
+            assert_eq!((embd.k, norm.k, norm.wtype), (m.entry(0).k, m.entry(0).k, 0), "tier {tier}");
+            assert_eq!(m.entry(0).role, manifest::ROLE_PRODUCT, "tier {tier}");
+            assert_eq!(ctx.table.iter().collect::<std::collections::BTreeSet<_>>().len(), 256, "tier {tier}");
+
+            let (m_t, n_entries) = PINNED_LEGACY[tier];
+            let legacy = m.legacy();
+            assert_eq!(hex::encode(legacy.m_t), m_t, "tier {tier}");
+            assert_eq!(legacy.entries.len() as u64, n_entries, "tier {tier}");
+            assert_eq!(legacy.n_products, m.n_products, "tier {tier}");
+            assert!(legacy.entries.iter().all(|(e, _)| e.role != manifest::ROLE_EMBD && e.role != manifest::ROLE_NORM));
         }
         assert!(TierManifest::for_tier(4).is_none());
         assert!(TierManifest::for_tier(9).is_none());
+        assert!(prefix_ctx(4).is_none());
+    }
+
+    #[test]
+    fn prefix_tokens_follow_the_tier_table() {
+        let ctx = prefix_ctx(0).unwrap();
+        let mut rh = [0u8; 32];
+        rh[0] = 0x41;
+        rh[31] = 0xff;
+        let toks = prefix_tokens(ctx, &rh);
+        assert_eq!(toks.len(), prefix::PREFIX_LEN as usize);
+        assert_eq!(toks[0], ctx.table[0x41] as i32);
+        assert_eq!(toks[31], ctx.table[0xff] as i32);
+        assert_eq!(toks[1], ctx.table[0] as i32);
+        for t in 0..64u8 {
+            let seed = [t; 32];
+            let p = draw_prefix(ctx, &seed);
+            assert!((ctx.offset as u64..ctx.offset as u64 + 32).contains(&p));
+            assert_eq!(prefix::expected_token(ctx, &rh, p), Some(toks[(p - ctx.offset as u64) as usize] as u32));
+        }
     }
 
     #[test]
@@ -484,7 +690,7 @@ mod tests {
                 assert_eq!(*blake3::hash(&x).as_bytes(), rec.leaf(p.t, p.leaf_x()), "{model} seed {counter}: X leaf");
                 assert_eq!(*blake3::hash(&y).as_bytes(), rec.leaf(p.t, p.leaf_y()), "{model} seed {counter}: Y leaf");
                 let point = build_point(&m, &rec, &p, x, &y, &index).unwrap();
-                let body = opening_body([3u8; 32], vec![point]).unwrap();
+                let body = opening_body([3u8; 32], vec![point], None).unwrap();
                 let decoded = Opening::decode(&body).unwrap();
                 let report = verify_point(&tier_ctx, &resp, &seed, 0, &decoded.points[0]).unwrap_or_else(|e| panic!("{model} seed {counter}: {e:?}"));
                 assert_eq!((report.t, report.rank, report.row), (p.t, p.rank, p.row));
@@ -511,7 +717,7 @@ mod tests {
         assert_eq!(nl, m.n_leaves());
         let prompt = "Explain in two sentences why the sky is blue.";
         let t0 = std::time::Instant::now();
-        let g = llama_engine::generate_traced(&gguf, 0, prompt, 24, 0, 0).unwrap();
+        let g = llama_engine::generate_traced(&gguf, 0, prompt, None, 24, 0, 0).unwrap();
         eprintln!("generated {} tokens ({} prompt) in {:.2?}: {:?}", g.tokens.len(), g.n_prompt, t0.elapsed(), g.text);
         assert_eq!(g.n_pos as usize, g.tokens.len());
         assert_eq!(g.leaves.len(), g.tokens.len() * nl);
@@ -532,7 +738,7 @@ mod tests {
                 assert_eq!(*blake3::hash(&x).as_bytes(), rec.leaf(p.t, p.leaf_x()), "seed {counter} point {i}: X leaf");
                 assert_eq!(*blake3::hash(&y).as_bytes(), rec.leaf(p.t, p.leaf_y()), "seed {counter} point {i}: Y leaf");
                 let point = build_point(&m, &rec, &p, x, &y, &index).unwrap();
-                let body = opening_body([3u8; 32], vec![point]).unwrap();
+                let body = opening_body([3u8; 32], vec![point], None).unwrap();
                 let decoded = Opening::decode(&body).unwrap();
                 let report = verify_point(&tier_ctx, &resp, &seed, i, &decoded.points[0]).unwrap_or_else(|e| panic!("seed {counter} point {i}: {e:?}"));
                 assert_eq!((report.t, report.rank, report.row), (p.t, p.rank, p.row));
@@ -544,11 +750,35 @@ mod tests {
             }
         }
         // Shape padding: the prompt grows to the floor and the answer gets its generated positions.
-        let g = llama_engine::generate_traced(&gguf, 0, prompt, 8, 64, 1).unwrap();
+        let g = llama_engine::generate_traced(&gguf, 0, prompt, None, 8, 64, 1).unwrap();
         assert_eq!(g.n_prompt, 64);
         assert!(g.n_pos - g.n_prompt >= g.text.len().min(8) as u32, "{} generated for {} B", g.n_pos - g.n_prompt, g.text.len());
         assert_eq!(g.n_pos as usize, g.tokens.len());
         assert!(TraceRecord::new(&m, g.n_prompt, g.ubatch.clone(), g.leaves.clone()).is_some());
+
+        // Prefix: the request id sits at the tier offset and its point verifies as the node would.
+        let ctx = prefix_ctx(tier).expect("prefix context");
+        let (head, rest) = crate::llm::format_prompt_parts(spec.name, prompt).expect("prefix template");
+        let rh: [u8; 32] = std::array::from_fn(|i| (i * 8 + 3) as u8);
+        let toks = prefix_tokens(ctx, &rh);
+        let prefix = llama_engine::PromptPrefix { tokens: &toks, head_tokens: ctx.offset, rest: &rest };
+        let g = llama_engine::generate_traced(&gguf, 0, &head, Some(prefix), 8, 0, 0).unwrap();
+        assert_eq!(&g.tokens[ctx.offset as usize..ctx.offset as usize + 32], toks.as_slice());
+        let rec = TraceRecord::new(&m, g.n_prompt, g.ubatch.clone(), g.leaves.clone()).expect("complete trace");
+        let resp = ResponseCtx { trace_root: rec.trace_root, n_prompt: rec.n_prompt, n_pos: rec.n_pos };
+        for counter in 0..4u64 {
+            let seed = *blake3::hash(&counter.to_le_bytes()).as_bytes();
+            let t = draw_prefix(ctx, &seed);
+            let (x, _) = llama_engine::replay(&gguf, 0, &g.tokens, g.n_prompt, t as u32, 0, 1).unwrap();
+            assert_eq!(*blake3::hash(&x).as_bytes(), rec.leaf(t, 0), "seed {counter}: prefix X leaf");
+            let point = build_prefix_point(&m, &rec, ctx, &rh, t, x, &index).unwrap();
+            let body = opening_body([3u8; 32], vec![], Some(point)).unwrap();
+            let decoded = Opening::decode(&body).unwrap();
+            let opened = prefix::verify_prefix_point(&tier_ctx, ctx, &resp, &seed, &rh, decoded.prefix.as_ref().unwrap())
+                .unwrap_or_else(|e| panic!("seed {counter}: prefix {e:?}"));
+            assert_eq!(opened, t);
+            eprintln!("seed {counter}: prefix position {t} verified, body {} B", body.len());
+        }
         llama_engine::unload(0);
         assert_eq!(n_ok, 8 * POINTS);
     }

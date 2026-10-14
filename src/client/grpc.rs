@@ -102,6 +102,7 @@ struct TraceContext {
 struct PendingTrace {
     model_id: [u8; 32],
     tier: u8,
+    request_hash: [u8; 32],
     max_tokens: u32,
     trace: Arc<keryx_miner::trace::ResponseTrace>,
     submitted_daa: u64,
@@ -114,6 +115,8 @@ struct PendingTrace {
 struct TraceDraw {
     seed_hash: String,
     seed_daa: u64,
+    /// DAA score of the chain block that accepted the response.
+    accepted_daa: u64,
     seed: [u8; 32],
     audited: bool,
     deadline_daa: u64,
@@ -148,14 +151,15 @@ fn hash32(hex_str: &str) -> Option<[u8; 32]> {
 }
 
 /// The seed block of a response accepted by chain block `accepted`: the first later chain block
-/// at `TRACE_SEED_DELAY_DAA` or more. `None` while a block on the way has no DAA score yet.
-fn seed_block_after<'a>(log: &'a VecDeque<ChainEntry>, accepted: &str) -> Option<(&'a str, u64)> {
+/// at `TRACE_SEED_DELAY_DAA` or more, with its DAA score and the accepting block's. `None` while
+/// a block on the way has no DAA score yet.
+fn seed_block_after<'a>(log: &'a VecDeque<ChainEntry>, accepted: &str) -> Option<(&'a str, u64, u64)> {
     let start = log.iter().position(|e| e.hash == accepted)?;
     let accepted_daa = log[start].daa?;
     for e in log.iter().skip(start + 1) {
         let daa = e.daa?;
         if daa >= accepted_daa + keryx_miner::trace::TRACE_SEED_DELAY_DAA {
-            return Some((e.hash.as_str(), daa));
+            return Some((e.hash.as_str(), daa, accepted_daa));
         }
     }
     None
@@ -813,7 +817,7 @@ impl KeryxdHandler {
             info!("Inference: spawning LLM inference (max_tokens={}{})", max_tokens, if tier.is_some() { ", traced" } else { "" });
             tokio::task::spawn_blocking(move || {
                 let result = match tier {
-                    Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len),
+                    Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len, &request_hash),
                     None => keryx_miner::llm::load_and_run_inference(&model_id, &prompt, max_tokens)
                         .map(|text| keryx_miner::llm::Generated { text, trace: None }),
                 };
@@ -847,14 +851,14 @@ impl KeryxdHandler {
         let p = self.pending_traces.get_mut(&txid).unwrap();
         let d = p.draw.as_mut().unwrap();
         d.opened = true;
-        let (seed, seed_hash) = (d.seed, d.seed_hash.clone());
-        let (model_id, tier, trace) = (p.model_id, p.tier, Arc::clone(&p.trace));
+        let (seed, seed_hash, accepted_daa) = (d.seed, d.seed_hash.clone(), d.accepted_daa);
+        let (model_id, tier, trace, request_hash) = (p.model_id, p.tier, Arc::clone(&p.trace), p.request_hash);
         info!("Trace: response {} audited at chain block {} — replaying {} points", txid, seed_hash, keryx_miner::trace::POINTS);
         self.set_opoi_pause(true);
         miner.process_block(None).await?;
         let (tx_done, rx_done) = oneshot::channel::<Option<Vec<u8>>>();
         tokio::task::spawn_blocking(move || {
-            let body = keryx_miner::llm::open_trace(&model_id, tier, &trace, &seed, txid_bytes);
+            let body = keryx_miner::llm::open_trace(&model_id, tier, &trace, &seed, txid_bytes, &request_hash, accepted_daa);
             let _ = tx_done.send(body);
         });
         self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, rx: rx_done });
@@ -979,12 +983,15 @@ impl KeryxdHandler {
                 continue;
             }
             let Some(accepted) = p.accepted_hash.as_deref() else { continue };
-            let Some((seed_hash, daa)) = seed_block_after(&self.chain_log, accepted) else { continue };
+            let Some((seed_hash, daa, accepted_daa)) = seed_block_after(&self.chain_log, accepted) else { continue };
             let (Some(txid_bytes), Some(seed_block)) = (hash32(txid), hash32(seed_hash)) else { continue };
             let seed = keryx_miner::trace::trace_seed(&seed_block, &txid_bytes);
             let audited = keryx_miner::trace::audited(&seed);
             let deadline_daa = daa + keryx_miner::trace::opening_window_daa(p.tier, p.max_tokens);
-            drawn.push((txid.clone(), TraceDraw { seed_hash: seed_hash.to_string(), seed_daa: daa, seed, audited, deadline_daa, opened: false }));
+            drawn.push((
+                txid.clone(),
+                TraceDraw { seed_hash: seed_hash.to_string(), seed_daa: daa, accepted_daa, seed, audited, deadline_daa, opened: false },
+            ));
         }
         for (txid, d) in drawn {
             if d.audited {
@@ -1261,6 +1268,7 @@ impl KeryxdHandler {
                 let pending = PendingTrace {
                     model_id: t.model_id,
                     tier: t.tier,
+                    request_hash,
                     max_tokens: t.max_tokens,
                     trace: Arc::new(t.trace),
                     submitted_daa: self.last_known_daa,
@@ -1867,7 +1875,7 @@ mod tests {
             [entry("a", Some(1_000)), entry("b", Some(1_000 + delay - 1)), entry("c", None), entry("d", Some(1_000 + delay + 5))].into();
         assert_eq!(seed_block_after(&log, "a"), None, "an unknown DAA on the way holds the draw");
         log[2].daa = Some(1_000 + delay);
-        assert_eq!(seed_block_after(&log, "a"), Some(("c", 1_000 + delay)));
+        assert_eq!(seed_block_after(&log, "a"), Some(("c", 1_000 + delay, 1_000)));
         assert_eq!(seed_block_after(&log, "b"), None, "no block past the delay yet");
         assert_eq!(seed_block_after(&log, "zz"), None);
         log[0].daa = None;

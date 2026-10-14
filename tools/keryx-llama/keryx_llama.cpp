@@ -410,7 +410,7 @@ static int keryx_trace_reset(KeryxLlama* h) {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 5; }
+KERYX_EXPORT int keryx_llama_abi() { return 6; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -599,10 +599,14 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
 // token) in `tokens`: that sequence replays the response. Generation stops when `tokens` is full.
 // The prompt is padded to `min_prompt` tokens, and padding positions are decoded after the answer
 // until `answer bytes / answer_bytes_per_position` (at most `max_tokens`) have been generated.
-KERYX_EXPORT int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap,
+// With `n_prefix > 0`, the fed prompt is `prompt` tokenized alone (it must give `head_tokens`
+// tokens, else -8), then the `prefix` token ids, then `rest` tokenized without special tokens.
+KERYX_EXPORT int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, const int32_t* prefix, int n_prefix,
+                                             int head_tokens, const char* rest, int max_tokens, char* out, int cap,
                                              int32_t* tokens, int tokens_cap, int* n_prompt_out, int* n_fed_out,
                                              int min_prompt, int answer_bytes_per_position) {
     if (!h || !prompt || !out || cap < 2 || !tokens || tokens_cap < 1 || !n_prompt_out || !n_fed_out) return -1;
+    if (n_prefix > 0 && (!prefix || !rest)) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 
@@ -610,6 +614,26 @@ KERYX_EXPORT int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, 
     int n = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt), toks.data(), (int32_t)toks.size(), true, true);
     if (n <= 0) return -1;
     toks.resize(n);
+    if (n_prefix > 0) {
+        if (n != head_tokens) {
+            keryx_set_error("prefix", "the prompt head tokenizes to " + std::to_string(n) + " tokens, " +
+                                      std::to_string(head_tokens) + " expected");
+            return -8;
+        }
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        for (int i = 0; i < n_prefix; i++) {
+            if (prefix[i] < 0 || prefix[i] >= n_vocab) {
+                keryx_set_error("prefix", "prefix token out of the vocabulary");
+                return -1;
+            }
+            toks.push_back((llama_token)prefix[i]);
+        }
+        std::vector<llama_token> rt(strlen(rest) + 16);
+        const int nr = llama_tokenize(vocab, rest, (int32_t)strlen(rest), rt.data(), (int32_t)rt.size(), false, true);
+        if (nr < 0) return -1;
+        toks.insert(toks.end(), rt.begin(), rt.begin() + nr);
+        n = (int)toks.size();
+    }
     const llama_token pad = keryx_pad_token(vocab);
     if (min_prompt > n) {
         toks.resize((size_t)min_prompt, pad);

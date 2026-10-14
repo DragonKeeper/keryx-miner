@@ -31,6 +31,10 @@ type ProbeDeviceFn = unsafe extern "C" fn(c_int) -> c_int;
 type GenTracedFn = unsafe extern "C" fn(
     *mut c_void,
     *const c_char,
+    *const i32,
+    c_int,
+    c_int,
+    *const c_char,
     c_int,
     *mut c_char,
     c_int,
@@ -60,7 +64,7 @@ type ReplayFn = unsafe extern "C" fn(
     *mut u32,
 ) -> c_int;
 
-const ABI: c_int = 5;
+const ABI: c_int = 6;
 /// Largest captured leaf the engine hands back.
 const CAPTURE_CAP: usize = 4 << 20;
 
@@ -150,6 +154,8 @@ pub enum GenError {
     Unavailable,
     /// The prompt does not fit the engine's context window.
     PromptTooLong(String),
+    /// The prompt head does not tokenize to the expected prefix offset.
+    PromptHead(String),
     /// Any other native failure, with the engine's detail when it gave one.
     Failed(String),
 }
@@ -590,13 +596,22 @@ pub fn traced_for(gguf: &str, gpu: usize) -> bool {
     slot(gpu).lock().map_or(false, |g| g.as_ref().is_some_and(|e| e.gguf == gguf && e.trace_leaves > 0))
 }
 
-/// Generate with the trace on: the text, the fed tokens and the leaves of every position.
-/// Traced generation; the prompt is padded to `min_prompt` positions and the answer to
-/// `answer bytes / answer_bytes_per_position` generated positions (0 = no answer padding).
+/// The request-bound prefix of a traced prompt: its token ids, the token count of the prompt
+/// head they follow, and the rest of the prompt after them.
+pub struct PromptPrefix<'a> {
+    pub tokens: &'a [i32],
+    pub head_tokens: u32,
+    pub rest: &'a str,
+}
+
+/// Traced generation: the text, the fed tokens and the leaves of every position. The prompt is
+/// padded to `min_prompt` positions and the answer to `answer bytes / answer_bytes_per_position`
+/// generated positions (0 = no answer padding). With `prefix`, `prompt` is the head alone.
 pub fn generate_traced(
     gguf: &str,
     gpu: usize,
     prompt: &str,
+    prefix: Option<PromptPrefix<'_>>,
     max_tokens: usize,
     min_prompt: u32,
     answer_bytes_per_position: u32,
@@ -605,6 +620,11 @@ pub fn generate_traced(
     let g = slot.lock().map_err(|_| GenError::Unavailable)?;
     let e = g.as_ref().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or(GenError::Unavailable)?;
     let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
+    let rest = CString::new(prefix.as_ref().map_or("", |p| p.rest)).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
+    let (prefix_ptr, n_prefix, head_tokens) = match &prefix {
+        Some(p) => (p.tokens.as_ptr(), p.tokens.len() as c_int, p.head_tokens.min(c_int::MAX as u32) as c_int),
+        None => (std::ptr::null(), 0, 0),
+    };
     let mut buf = vec![0u8; 64 * 1024];
     let mut tokens = vec![0i32; e.n_ctx.max(1) as usize];
     let (mut n_prompt, mut n_fed): (c_int, c_int) = (0, 0);
@@ -613,6 +633,10 @@ pub fn generate_traced(
         (e.generate_traced)(
             e.model,
             cp.as_ptr(),
+            prefix_ptr,
+            n_prefix,
+            head_tokens,
+            rest.as_ptr(),
             max_tokens as c_int,
             buf.as_mut_ptr() as *mut c_char,
             buf.len() as c_int,
@@ -626,7 +650,11 @@ pub fn generate_traced(
     };
     if n < 0 {
         let detail = engine_error(e, "");
-        return Err(if n == -2 { GenError::PromptTooLong(detail) } else { GenError::Failed(detail) });
+        return Err(match n {
+            -2 => GenError::PromptTooLong(detail),
+            -8 => GenError::PromptHead(detail),
+            _ => GenError::Failed(detail),
+        });
     }
     buf.truncate(n as usize);
     let text = String::from_utf8(buf).map_err(|_| GenError::Failed("generated text is not UTF-8".to_string()))?;
