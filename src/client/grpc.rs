@@ -986,7 +986,7 @@ impl KeryxdHandler {
             let Some((seed_hash, daa, accepted_daa)) = seed_block_after(&self.chain_log, accepted) else { continue };
             let (Some(txid_bytes), Some(seed_block)) = (hash32(txid), hash32(seed_hash)) else { continue };
             let seed = keryx_miner::trace::trace_seed(&seed_block, &txid_bytes);
-            let audited = keryx_miner::trace::audited(&seed);
+            let audited = keryx_miner::trace::audit_all_active(accepted_daa) || keryx_miner::trace::audited(&seed);
             let deadline_daa = daa + keryx_miner::trace::opening_window_daa(p.tier, p.max_tokens);
             drawn.push((
                 txid.clone(),

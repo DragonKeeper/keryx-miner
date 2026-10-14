@@ -143,6 +143,11 @@ pub fn prefix_active(accepted_daa: u64) -> bool {
     accepted_daa >= crate::pom::trace_prefix_activation_daa()
 }
 
+/// Whether every traced response accepted at `accepted_daa` is audited.
+pub fn audit_all_active(accepted_daa: u64) -> bool {
+    accepted_daa >= crate::pom::trace_audit_activation_daa()
+}
+
 /// The token ids the request id puts at the prefix positions of a traced prompt.
 pub fn prefix_tokens(ctx: &PrefixCtx, request_hash: &[u8; 32]) -> Vec<i32> {
     request_hash.iter().map(|b| ctx.table[*b as usize] as i32).collect()
