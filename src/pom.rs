@@ -1604,7 +1604,7 @@ pub fn trace_prefix_activation_daa() -> u64 {
 
 /// DAA from which every traced response is audited (mirror of the node's `trace_audit_activation`).
 pub fn trace_audit_activation_daa() -> u64 {
-    gate(u64::MAX, u64::MAX)
+    gate(u64::MAX, 240_000)
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
