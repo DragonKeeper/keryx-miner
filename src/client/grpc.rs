@@ -45,6 +45,9 @@ const AI_BACKFILL_INFLIGHT: usize = 32;
 /// Seconds between AiResponse resubmissions while the mempool has not accepted it.
 const AI_RESPONSE_RETRY_SECS: u64 = 3;
 
+/// Chain blocks fetched at once while rebuilding the chain after a restart.
+const CHAIN_RESTORE_INFLIGHT: usize = 8;
+
 /// Submission attempts before giving up on an AiResponse.
 const AI_RESPONSE_MAX_ATTEMPTS: u32 = 100;
 
@@ -109,6 +112,8 @@ struct PendingTrace {
     /// Chain block that accepted the response.
     accepted_hash: Option<String>,
     draw: Option<TraceDraw>,
+    /// Opening already built and submitted for this response.
+    opening: Option<keryx_miner::trace_store::StoredOpening>,
 }
 
 /// The draw of an accepted response once its seed block is on the chain.
@@ -231,6 +236,12 @@ pub struct KeryxdHandler {
 
     /// Recent chain blocks in chain order, back to the oldest one a pending trace needs.
     chain_log: VecDeque<ChainEntry>,
+
+    /// On-disk copy of the pending traces.
+    trace_store: keryx_miner::trace_store::TraceStore,
+    /// Chain blocks to fetch after a restart, from the accepting block of each restored trace.
+    chain_restore_queue: VecDeque<String>,
+    chain_restore_pending: std::collections::HashSet<String>,
 
     /// In-flight replay building an opening.
     replay_rx: Option<ReplayJob>,
@@ -369,6 +380,8 @@ impl KeryxdHandler {
         D: std::convert::TryInto<tonic::transport::Endpoint>,
         D::Error: Into<Error>,
     {
+        let trace_store = keryx_miner::trace_store::TraceStore::new(&escrow_state_file);
+        let (restored_traces, restored_openings) = Self::restore_traces(&trace_store);
         // Build EscrowWatcher from the resolved escrow privkey (derived or loaded from file).
         // The watcher also provides the pubkey to embed in coinbase extra_data.
         let (escrow_pubkey, escrow_watcher) = match escrow_privkey {
@@ -426,10 +439,13 @@ impl KeryxdHandler {
             backfill_pending: std::collections::HashSet::new(),
             backfill_visited: std::collections::HashSet::new(),
             inference_rx: None,
-            pending_traces: std::collections::HashMap::new(),
+            pending_traces: restored_traces,
             chain_log: VecDeque::new(),
+            trace_store,
+            chain_restore_queue: VecDeque::new(),
+            chain_restore_pending: std::collections::HashSet::new(),
             replay_rx: None,
-            opening_inflight: std::collections::HashMap::new(),
+            opening_inflight: restored_openings,
             publish_rx: None,
             challenge_inference_rx: None,
             opoi_challenge_active: None,
@@ -846,6 +862,7 @@ impl KeryxdHandler {
         };
         let Some(txid_bytes) = hash32(&txid) else {
             self.pending_traces.remove(&txid);
+            self.trace_store.remove(&txid);
             return Ok(());
         };
         let p = self.pending_traces.get_mut(&txid).unwrap();
@@ -903,9 +920,23 @@ impl KeryxdHandler {
             info!("Trace: submitting the opening of response {} ({} B)", job.response_txid, body.len());
             self.opening_inflight.insert(
                 txid,
-                OpeningInflight { tx: rpc_tx.clone(), response_txid: job.response_txid, deadline_daa, attempts: 1, last: std::time::Instant::now() },
+                OpeningInflight {
+                    tx: rpc_tx.clone(),
+                    response_txid: job.response_txid.clone(),
+                    deadline_daa,
+                    attempts: 1,
+                    last: std::time::Instant::now(),
+                },
             );
         }
+        if let Some(p) = self.pending_traces.get_mut(&job.response_txid) {
+            p.opening = Some(keryx_miner::trace_store::StoredOpening {
+                seed_hash: job.seed_hash.clone(),
+                deadline_daa,
+                payload: rpc_tx.payload.clone(),
+            });
+        }
+        self.persist_trace(&job.response_txid);
         if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
             warn!("Trace: failed to send the opening tx: {}", e);
         }
@@ -944,6 +975,116 @@ impl KeryxdHandler {
     }
 
     /// Records a chain block's DAA score once its GetBlock answer arrives.
+    /// Writes the on-disk copy of a pending trace.
+    fn persist_trace(&self, txid: &str) {
+        let Some(p) = self.pending_traces.get(txid) else { return };
+        let record = keryx_miner::trace_store::StoredTraceRef {
+            version: keryx_miner::trace_store::StoredTraceRef::version(),
+            response_txid: txid,
+            model_id: &p.model_id,
+            tier: p.tier,
+            request_hash: &p.request_hash,
+            max_tokens: p.max_tokens,
+            submitted_daa: p.submitted_daa,
+            accepted_hash: &p.accepted_hash,
+            opening: &p.opening,
+            trace: &p.trace,
+        };
+        if let Err(e) = self.trace_store.save(&record) {
+            warn!("Trace: cannot persist response {}: {}", txid, e);
+        }
+    }
+
+    /// Loads the stored traces of a previous run and the openings they had already submitted.
+    fn restore_traces(
+        store: &keryx_miner::trace_store::TraceStore,
+    ) -> (std::collections::HashMap<String, PendingTrace>, std::collections::HashMap<String, OpeningInflight>) {
+        let mut traces = std::collections::HashMap::new();
+        let mut openings = std::collections::HashMap::new();
+        for t in store.load_all() {
+            if let Some(o) = t.opening.as_ref() {
+                let rpc_tx = crate::proto::RpcTransaction {
+                    version: 0,
+                    inputs: vec![],
+                    outputs: vec![],
+                    lock_time: 0,
+                    subnetwork_id: keryx_inference::SUBNETWORK_ID_AI_OPENING_HEX.to_string(),
+                    gas: 0,
+                    payload: o.payload.clone(),
+                    mass: 0,
+                    verbose_data: None,
+                };
+                if let Some(txid) = Self::compute_rpc_txid(&rpc_tx) {
+                    openings.insert(
+                        txid,
+                        OpeningInflight {
+                            tx: rpc_tx,
+                            response_txid: t.response_txid.clone(),
+                            deadline_daa: o.deadline_daa,
+                            attempts: 1,
+                            last: std::time::Instant::now() - std::time::Duration::from_secs(60),
+                        },
+                    );
+                }
+            }
+            traces.insert(
+                t.response_txid.clone(),
+                PendingTrace {
+                    model_id: t.model_id,
+                    tier: t.tier,
+                    request_hash: t.request_hash,
+                    max_tokens: t.max_tokens,
+                    trace: Arc::new(t.trace),
+                    submitted_daa: t.submitted_daa,
+                    accepted_hash: t.accepted_hash,
+                    draw: None,
+                    opening: t.opening,
+                },
+            );
+        }
+        if !traces.is_empty() {
+            info!("Trace: restored {} pending response(s) from {} ({} opening(s) to resend)", traces.len(), store.dir().display(), openings.len());
+        }
+        (traces, openings)
+    }
+
+    /// After a restart, asks the node for the chain from the accepting block of every restored
+    /// trace so its draw can be resolved again.
+    async fn start_chain_restore(&mut self) -> Result<(), Error> {
+        let accepted: Vec<String> = self
+            .pending_traces
+            .values()
+            .filter(|p| p.draw.is_none())
+            .filter_map(|p| p.accepted_hash.clone())
+            .collect();
+        for hash in accepted {
+            if !self.chain_log.iter().any(|e| e.hash == hash) {
+                self.chain_log.push_back(ChainEntry { hash: hash.clone(), daa: None });
+                self.chain_restore_queue.push_back(hash.clone());
+            }
+            info!("Trace: rebuilding the chain from block {} for a restored response", hash);
+            self.client_send(crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage { start_hash: hash }).await?;
+        }
+        self.chain_restore_pump().await
+    }
+
+    /// Fetches the queued chain blocks a few at a time until every restored trace is drawn.
+    async fn chain_restore_pump(&mut self) -> Result<(), Error> {
+        let needed = self.pending_traces.values().any(|p| p.accepted_hash.is_some() && p.draw.is_none());
+        if !needed {
+            self.chain_restore_queue.clear();
+            return Ok(());
+        }
+        while self.chain_restore_pending.len() < CHAIN_RESTORE_INFLIGHT {
+            let Some(hash) = self.chain_restore_queue.pop_front() else { break };
+            if !self.chain_restore_pending.insert(hash.clone()) {
+                continue;
+            }
+            self.client_send(GetBlockRequestMessage { hash, include_transactions: false }).await?;
+        }
+        Ok(())
+    }
+
     fn note_chain_block(&mut self, hash: &str, daa: u64) {
         if let Some(e) = self.chain_log.iter_mut().rev().find(|e| e.hash == hash) {
             e.daa = Some(daa);
@@ -971,6 +1112,10 @@ impl KeryxdHandler {
         for txid in reset {
             info!("Trace: chain reorg — the draw of response {} is reset", txid);
             self.opening_inflight.retain(|_, o| o.response_txid != txid);
+            if let Some(p) = self.pending_traces.get_mut(&txid) {
+                p.opening = None;
+            }
+            self.persist_trace(&txid);
         }
     }
 
@@ -990,7 +1135,15 @@ impl KeryxdHandler {
             let deadline_daa = daa + keryx_miner::trace::opening_window_daa(p.tier, p.max_tokens);
             drawn.push((
                 txid.clone(),
-                TraceDraw { seed_hash: seed_hash.to_string(), seed_daa: daa, accepted_daa, seed, audited, deadline_daa, opened: false },
+                TraceDraw {
+                    seed_hash: seed_hash.to_string(),
+                    seed_daa: daa,
+                    accepted_daa,
+                    seed,
+                    audited,
+                    deadline_daa,
+                    opened: p.opening.as_ref().is_some_and(|o| o.seed_hash == seed_hash),
+                },
             ));
         }
         for (txid, d) in drawn {
@@ -1006,6 +1159,7 @@ impl KeryxdHandler {
     /// Drops the traces past their window and the chain log they no longer need.
     fn prune_traces(&mut self) {
         let daa = self.last_known_daa;
+        let before: Vec<String> = self.pending_traces.keys().cloned().collect();
         self.pending_traces.retain(|txid, p| match p.draw.as_ref() {
             None => p.accepted_hash.is_some() || p.submitted_daa + AI_BACKFILL_WINDOW_DAA > daa,
             Some(d) if !d.audited => d.seed_daa + TRACE_UNAUDITED_GRACE_DAA > daa,
@@ -1016,6 +1170,9 @@ impl KeryxdHandler {
                 daa <= d.deadline_daa
             }
         });
+        for txid in before.iter().filter(|t| !self.pending_traces.contains_key(*t)) {
+            self.trace_store.remove(txid);
+        }
         let needed = self
             .pending_traces
             .values()
@@ -1274,8 +1431,10 @@ impl KeryxdHandler {
                     submitted_daa: self.last_known_daa,
                     accepted_hash: None,
                     draw: None,
+                    opening: None,
                 };
                 self.pending_traces.insert(txid.clone(), pending);
+                self.persist_trace(&txid);
             }
             self.ai_response_inflight.insert(txid, (rpc_tx.clone(), 1, std::time::Instant::now()));
         }
@@ -1523,6 +1682,10 @@ impl KeryxdHandler {
                         .escrow_watcher
                         .as_mut()
                         .map_or(false, |w| w.on_block_validation_error(&e.message));
+                    if let Some(h) = self.chain_restore_pending.iter().find(|h| e.message.contains(h.as_str())).cloned() {
+                        self.chain_restore_pending.remove(&h);
+                        self.chain_restore_pump().await?;
+                    }
                     if !was_validation {
                         if self.backfill_pending.iter().any(|h| e.message.contains(h.as_str())) {
                             self.backfill_note_error(&e.message);
@@ -1539,6 +1702,9 @@ impl KeryxdHandler {
                     if let Some(daa) = block.header.as_ref().map(|h| h.daa_score) {
                         self.note_chain_block(&hash, daa);
                         self.resolve_traces();
+                    }
+                    if self.chain_restore_pending.remove(&hash) {
+                        self.chain_restore_pump().await?;
                     }
                     was_validation = self
                         .escrow_watcher
@@ -1706,7 +1872,10 @@ impl KeryxdHandler {
                 Some(e) => error!("Failed registering for block added notifications: {:?}", e),
             },
             Payload::NotifyVirtualSelectedParentChainChangedResponse(res) => match res.error {
-                None => info!("Registered for virtual chain notifications (escrow tracking)"),
+                None => {
+                    info!("Registered for virtual chain notifications (escrow tracking)");
+                    self.start_chain_restore().await?;
+                }
                 Some(e) => error!("Failed registering for virtual chain notifications: {:?}", e),
             },
             // Virtual chain advanced: fetch every added chain block in full. Their coinbases
@@ -1721,17 +1890,35 @@ impl KeryxdHandler {
                 for hash in &notif.added_chain_block_hashes {
                     self.chain_log.push_back(ChainEntry { hash: hash.clone(), daa: None });
                 }
+                let mut accepted_now: Vec<String> = Vec::new();
                 for accepted in &notif.accepted_transaction_ids {
                     for txid in &accepted.accepted_transaction_ids {
                         if let Some(p) = self.pending_traces.get_mut(txid).filter(|p| p.accepted_hash.is_none()) {
                             p.accepted_hash = Some(accepted.accepting_block_hash.clone());
                             info!("Trace: response {} accepted by chain block {}", txid, accepted.accepting_block_hash);
+                            accepted_now.push(txid.clone());
                         }
                     }
+                }
+                for txid in accepted_now {
+                    self.persist_trace(&txid);
                 }
                 for hash in notif.added_chain_block_hashes {
                     self.client_send(GetBlockRequestMessage { hash, include_transactions: true }).await?;
                 }
+            }
+            Payload::GetVirtualSelectedParentChainFromBlockResponse(msg) => {
+                if let Some(e) = msg.error {
+                    warn!("Trace: chain rebuild failed: {}", e.message);
+                    return Ok(());
+                }
+                for hash in msg.added_chain_block_hashes {
+                    if !self.chain_log.iter().any(|e| e.hash == hash) {
+                        self.chain_log.push_back(ChainEntry { hash: hash.clone(), daa: None });
+                        self.chain_restore_queue.push_back(hash);
+                    }
+                }
+                self.chain_restore_pump().await?;
             }
             msg => info!("got unknown msg: {:?}", msg),
         }

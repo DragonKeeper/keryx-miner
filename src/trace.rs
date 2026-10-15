@@ -4,6 +4,7 @@
 use keryx_inference::TraceCommitment;
 use keryx_verifiable_inference::draw;
 use keryx_verifiable_inference::manifest::{self, Entry};
+use borsh::{BorshDeserialize, BorshSerialize};
 use keryx_verifiable_inference::merkle::{b3_chunk_cv, b3_path, b3_root, rt_range_proof, Hash, B3_CHUNK};
 use keryx_verifiable_inference::opening::{self, ChunkRange, EntryOpening, Opening, Point, PrefixPoint};
 use keryx_verifiable_inference::prefix::{self, PrefixCtx};
@@ -216,6 +217,7 @@ impl TierManifest {
 }
 
 /// Trace of one response: the leaves the engine wrote, their position roots and `trace_root`.
+#[derive(BorshSerialize, BorshDeserialize)]
 pub struct TraceRecord {
     pub n_prompt: u32,
     pub n_pos: u32,
@@ -295,10 +297,28 @@ pub fn audited(seed: &Hash) -> bool {
 }
 
 /// What the miner keeps of a traced response to open it later.
+#[derive(BorshSerialize, BorshDeserialize)]
 pub struct ResponseTrace {
     pub record: TraceRecord,
     /// Prompt then generated tokens, as fed to the engine.
     pub tokens: Vec<i32>,
+}
+
+impl ResponseTrace {
+    /// A small synthetic trace for store tests.
+    #[cfg(test)]
+    pub fn test_sample() -> Self {
+        let record = TraceRecord {
+            n_prompt: 2,
+            n_pos: 3,
+            ubatch: vec![2, 1],
+            n_leaves: 3,
+            leaves: (0..9u8).map(|i| [i; 32]).collect(),
+            pos_roots: (0..3u8).map(|i| [0x10 + i; 32]).collect(),
+            trace_root: [0xaa; 32],
+        };
+        Self { record, tokens: vec![5, 6, 7] }
+    }
 }
 
 /// Opening window after the seed block, in DAA. MUST equal the node's `service_window_daa_at`.
