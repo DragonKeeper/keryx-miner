@@ -452,6 +452,17 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             return Err(failed("native_load", detail, true));
         }
         if n_ctx < floor {
+            if configured_ctx.is_none() {
+                free(model);
+                return Err(failed(
+                    "context",
+                    format!(
+                        "context {} tokens is below the {}-token floor of this model (free VRAM, or set KERYX_LLAMA_CTX to run below the floor knowingly)",
+                        n_ctx, floor
+                    ),
+                    true,
+                ));
+            }
             log::warn!("llama engine: context {} tokens is below the {}-token floor clients assume for this model", n_ctx, floor);
         }
         let context_info = sym::<ContextInfoFn>(lib, "keryx_llama_context_info")

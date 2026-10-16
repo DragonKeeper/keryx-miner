@@ -1059,9 +1059,9 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: O
             None
         }
         Err(crate::llama_engine::GenError::PromptTooLong(detail)) => {
-            log::warn!("LlmEngine '{}': prompt too long ({}) — answering with the fixed error text", spec.name, detail);
+            log::warn!("LlmEngine '{}': prompt too long ({}) — response dropped", spec.name, detail);
             mark_model_available(model_id, "generation_success");
-            Some(Generated { text: PROMPT_TOO_LONG_ANSWER.to_string(), trace: None })
+            None
         }
         Err(e) => {
             log::warn!("LlmEngine '{}': llama generate failed ({:?}) — response dropped", spec.name, e);
@@ -1128,10 +1128,6 @@ pub fn open_trace(
     }
     opening_body(response_txid, points, prefix)
 }
-
-/// Answer sent when a request's prompt does not fit the model's context window.
-pub const PROMPT_TOO_LONG_ANSWER: &str =
-    "This request could not be served: the prompt is longer than the model's context window. Send a shorter message or less conversation history.";
 
 #[cfg(test)]
 mod tests {
