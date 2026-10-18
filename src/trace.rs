@@ -2,6 +2,7 @@
 //! node's `collateral.rs` trace rules on top of the shared `keryx-verifiable-inference` crate.
 
 use keryx_inference::TraceCommitment;
+use keryx_verifiable_inference::chain::ChainCtx;
 use keryx_verifiable_inference::draw;
 use keryx_verifiable_inference::manifest::{self, Entry};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -133,6 +134,50 @@ const PREFIXES: [Option<PrefixCtx>; 5] = [
     }),
     None,
 ];
+
+/// Stage committed once `trace_chain_activation` is live: products, chain leaves and links.
+pub const STAGE_CHAIN: u8 = keryx_verifiable_inference::chain::STAGE_CHAIN;
+
+/// Serialized stage-2 manifests (`KXMANIF2`), in tier order. MUST equal the node's
+/// `TRACE_CHAINS_H15` manifests.
+const CHAIN_MANIFESTS: [&[u8]; 5] = [
+    include_bytes!("../assets/trace-manifests/chain-tier0.bin"),
+    include_bytes!("../assets/trace-manifests/chain-tier1.bin"),
+    include_bytes!("../assets/trace-manifests/chain-tier2.bin"),
+    include_bytes!("../assets/trace-manifests/chain-tier3.bin"),
+    include_bytes!("../assets/trace-manifests/chain-tier4.bin"),
+];
+
+/// Stage-2 chain context of each tier, with the prefix embedding and norm entries of its
+/// manifest. MUST equal the node's `TRACE_CHAINS_H15`.
+const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; 5] = [
+    Some((ChainCtx { n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0 }, 249, 250)),
+    Some((ChainCtx { n_layers: 40, layer_base: 523, embd_entry: 361, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 0 }, 361, 362)),
+    Some((ChainCtx { n_layers: 48, layer_base: 523, embd_entry: 329, eps: 9.999999974752427e-07, embd_scale: 61.967735290527344, trim_last: false, n_used: 0 }, 329, 330)),
+    Some((ChainCtx { n_layers: 64, layer_base: 627, embd_entry: 497, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0 }, 497, 498)),
+    Some((ChainCtx { n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8 }, 395, 396)),
+];
+
+/// Entries of the stage-2 manifest of `tier` and its product count.
+pub fn chain_manifest(tier: u8) -> Option<keryx_verifiable_inference::manifest::Manifest> {
+    keryx_verifiable_inference::manifest::read_file(CHAIN_MANIFESTS.get(tier as usize)?)
+}
+
+/// Stage-2 chain context of `tier`, and its prefix context on the stage-2 manifest.
+pub fn chain_ctx(tier: u8) -> Option<(ChainCtx, PrefixCtx)> {
+    let (ctx, embd, norm) = (*CHAIN_CTX.get(tier as usize)?)?;
+    let prefix = PREFIXES.get(tier as usize)?.clone().map(|p| PrefixCtx { embd_entry: embd, norm_entry: norm, ..p });
+    let prefix = match (tier, prefix) {
+        (_, Some(p)) => p,
+        (4, None) => PrefixCtx { table: PREFIXES[0].clone()?.table, offset: KIMI_PREFIX_OFFSET, embd_entry: embd, norm_entry: norm, eps: ctx.eps, embd_scale: ctx.embd_scale },
+        _ => return None,
+    };
+    Some((ctx, prefix))
+}
+
+/// Tokens of the Kimi chat-template head before the request prefix (`<|im_system|>system<|im_middle|>Request id:`).
+pub const KIMI_PREFIX_OFFSET: u32 = 6;
+
 
 /// The prefix context of `tier`, `None` when the tier is not audited.
 pub fn prefix_ctx(tier: u8) -> Option<&'static PrefixCtx> {
@@ -498,7 +543,7 @@ pub fn build_prefix_point(m: &TierManifest, rec: &TraceRecord, ctx: &PrefixCtx, 
 
 /// Encoded opening body, `None` above the consensus size cap.
 pub fn opening_body(response_txid: [u8; 32], points: Vec<Point>, prefix: Option<PrefixPoint>) -> Option<Vec<u8>> {
-    let body = Opening { response_txid, points, prefix }.encode();
+    let body = Opening { response_txid, points, prefix, links: Vec::new(), experts: Vec::new(), resid: None }.encode();
     (body.len() <= opening::MAX_BODY_LEN).then_some(body)
 }
 
@@ -533,6 +578,29 @@ mod tests {
         ("1550e2f3a709f1653663111196edeb8088a0c50873687e70ef77bbbcdaa949c8", 329),
         ("5ff3b42ff04356106ae7a56512321fae0f37bde171495b774bf944e4d0235c33", 497),
     ];
+
+    /// `M_T`, entries and products of the stage-2 manifests pinned by the node (`TRACE_CHAINS_H15`).
+    const PINNED_CHAIN: [(&str, u64, u64); 5] = [
+        ("9f1ea28681bfa10a6afe4d68cbe27ebea8656f76369af1bfa2adbf71e10374d0", 347, 249),
+        ("0431fa87e1a48b48151370c3fc7604de9b72461c9ac82881beeebb11febbfdeb", 563, 241),
+        ("4463e82828cc458ec86753a2c792d8f0da50c0d13d9758b9a49ad030dc2bef0f", 571, 329),
+        ("bc417110ea8e18db4fe6fe656bb6c7a47375585c86f9047ab7e40c28e11d0800", 691, 497),
+        ("c846b9cf4d7fd0119653d517c11cec3ac096013ed07268839db6949f0de7db93", 530, 375),
+    ];
+
+    #[test]
+    fn chain_manifests_match_the_node_pins() {
+        for (tier, (m_t, n_entries, n_products)) in PINNED_CHAIN.iter().enumerate() {
+            let (entries, np) = chain_manifest(tier as u8).expect("chain manifest");
+            let leaves: Vec<_> = entries.iter().map(|(_, b)| keryx_verifiable_inference::manifest::Entry::leaf(b)).collect();
+            assert_eq!(hex::encode(rt_range_proof(&leaves, 0, 1).0), *m_t, "tier {tier}");
+            assert_eq!((entries.len() as u64, np as u64), (*n_entries, *n_products), "tier {tier}");
+            let (ctx, prefix) = chain_ctx(tier as u8).expect("chain ctx");
+            assert_eq!(entries[prefix.embd_entry as usize].0.role, keryx_verifiable_inference::manifest::ROLE_EMBD, "tier {tier}");
+            assert_eq!(entries[prefix.norm_entry as usize].0.role, keryx_verifiable_inference::manifest::ROLE_NORM, "tier {tier}");
+            assert_eq!(entries[ctx.layer_base as usize].0.role, keryx_verifiable_inference::manifest::ROLE_LAYER, "tier {tier}");
+        }
+    }
 
     #[test]
     fn embedded_manifests_match_the_node_pins() {

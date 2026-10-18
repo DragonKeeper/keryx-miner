@@ -4,7 +4,7 @@ use crate::draw;
 use crate::manifest;
 use crate::merkle::{Hash, b3_fold, b3_verify};
 use crate::opening::PrefixPoint;
-use crate::verify::{Fail, ResponseCtx, TierCtx, layout_for, open_bytes, open_entry, open_row, x_len};
+use crate::verify::{Fail, PosShape, ResponseCtx, TierCtx, layout_for, open_bytes, open_entry, open_row, x_len};
 use crate::{q8, quant};
 
 /// Prefix tokens, one per byte of the request id.
@@ -63,6 +63,9 @@ pub fn deviation(x: &[u8], layout: u8, v: &[f64]) -> Option<f64> {
     let mut worst = 0f64;
     for (b, (d, q)) in blocks.iter().enumerate() {
         let vals = &v[b * 32..((b + 1) * 32).min(v.len())];
+        if !d.is_finite() || vals.iter().any(|a| !a.is_finite()) {
+            return None;
+        }
         if *d == 0.0 {
             if vals.iter().any(|a| a.abs() > 1e-6 * vmax) {
                 return None;
@@ -84,6 +87,19 @@ pub fn verify_prefix_point(
     seed: &Hash,
     request_txid: &Hash,
     p: &PrefixPoint,
+) -> Result<u64, Fail> {
+    verify_prefix_point_at(tier, ctx, resp, seed, request_txid, p, |_| PosShape::stage1(tier.n_products), false)
+}
+
+pub(crate) fn verify_prefix_point_at(
+    tier: &TierCtx,
+    ctx: &PrefixCtx,
+    resp: &ResponseCtx,
+    seed: &Hash,
+    request_txid: &Hash,
+    p: &PrefixPoint,
+    shape_for: impl Fn(u32) -> PosShape,
+    fragment: bool,
 ) -> Result<u64, Fail> {
     if resp.n_pos == 0 || resp.n_prompt == 0 || resp.n_prompt > resp.n_pos || !fits(resp.n_prompt, ctx.offset) {
         return Err(Fail::Shape);
@@ -107,7 +123,8 @@ pub fn verify_prefix_point(
         return Err(Fail::Manifest);
     }
 
-    let n_pos_leaves = 2 * tier.n_products + 1;
+    let shape = shape_for(tok);
+    let n_pos_leaves = shape.n_leaves;
     let layout = layout_for(p.n_ubatch, first.wtype);
     if p.x.len() as u64 != x_len(first.k, layout) {
         return Err(Fail::Shape);
@@ -116,20 +133,25 @@ pub fn verify_prefix_point(
     if !b3_verify(&resp.trace_root, resp.n_pos as u64, t, &pos_root, &p.pos_path) {
         return Err(Fail::Trace);
     }
-    let mut meta = [0u8; 8];
-    meta[..4].copy_from_slice(&(t as u32).to_le_bytes());
-    meta[4..].copy_from_slice(&p.n_ubatch.to_le_bytes());
-    if !b3_verify(&pos_root, n_pos_leaves, 2 * tier.n_products, blake3::hash(&meta).as_bytes(), &p.meta_path) {
+    if !b3_verify(&pos_root, n_pos_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path) {
         return Err(Fail::Trace);
     }
 
     let k = first.k as usize;
     let row = open_row(tier, &embd, &p.embd.1, tok as u64)?;
     let e = quant::dequant_row(embd.wtype, &row, k).ok_or(Fail::Unsupported)?;
-    let w_bytes = open_bytes(tier, &norm, &p.norm.1, 0, 4 * k as u64)?;
+    let (b0, nb) = if fragment { crate::chain::norm_fragment(seed, PREFIX_POINT, k as u64) } else { (0, (k as u64).div_ceil(32)) };
+    let (lo, len) = (b0 * 32, (nb * 32).min(k as u64 - b0 * 32));
+    let w_bytes = open_bytes(tier, &norm, &p.norm.1, 4 * lo, 4 * len)?;
     let w: Vec<f32> = w_bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-    let v = expected_input(&e, &w, ctx.eps, ctx.embd_scale);
-    match deviation(&p.x, layout, &v) {
+    let dev = if fragment {
+        let s = crate::chain::rms_scaled(&e, ctx.eps, ctx.embd_scale);
+        let v: Vec<f64> = s[lo as usize..(lo + len) as usize].iter().zip(&w).map(|(a, &b)| a * b as f64).collect();
+        crate::chain::block_deviation(&p.x, layout, k, b0 as usize, &v)
+    } else {
+        deviation(&p.x, layout, &expected_input(&e, &w, ctx.eps, ctx.embd_scale))
+    };
+    match dev {
         Some(dev) if dev <= THRESHOLD => Ok(t),
         _ => Err(Fail::Mismatch),
     }
@@ -182,6 +204,9 @@ mod tests {
         assert!(dev <= 0.5 + 0.2, "{dev}");
         let shifted: Vec<f64> = v.iter().map(|a| a + 0.05).collect();
         assert!(deviation(&leaf, q8::MMVQ, &shifted).unwrap() > 1.0);
+        let mut nan = v.clone();
+        nan[5] = f64::NAN;
+        assert_eq!(deviation(&leaf, q8::MMVQ, &nan), None);
         let zero = vec![0u8; 72];
         assert_eq!(deviation(&zero, q8::MMVQ, &vec![0.0; 64]), Some(0.0));
         assert_eq!(deviation(&zero, q8::MMVQ, &v), None);

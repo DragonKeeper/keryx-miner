@@ -1569,6 +1569,12 @@ pub fn pom_v4_activation_daa() -> u64 {
     gate(79_210_000, 1)
 }
 
+/// Block task gate: headers carry `task_root`, hashed into the pre-PoW and block hashes.
+/// MUST equal the node's `block_task_activation`.
+pub fn block_task_activation_daa() -> u64 {
+    gate(u64::MAX, u64::MAX)
+}
+
 /// H10 gate: walk-seed switch at/after this score. MUST equal the node's `h10_activation`.
 pub fn h10_activation_daa() -> u64 {
     gate(87_360_000, 1)

@@ -437,6 +437,15 @@ pub fn serialize_header<H: Hasher>(hasher: &mut H, header: &RpcBlockHeader, for_
     decode_to_slice(&header.pruning_point, &mut hash).unwrap();
     hasher.update(hash);
 
+    // Block task: the root of the window's task trace, in the pre-PoW hash as well.
+    if header.daa_score >= pom::block_task_activation_daa() {
+        let mut root = [0u8; 32];
+        if !header.task_root.is_empty() {
+            decode_to_slice(&header.task_root, &mut root).unwrap();
+        }
+        hasher.update(root);
+    }
+
     // H3: the block hash commits to the walk's final state. NEVER part of the pre-PoW hash
     // (the walk seed derives from it). Mirrors the node's `hashing::header::hash`.
     if !for_pre_pow && header.daa_score >= pom::pom_level_activation_daa() {
@@ -610,6 +619,7 @@ mod tests {
             pom_final_state: 0,
             service_state_hash: String::new(),
             pom_tier: 0,
+            task_root: String::new(),
         };
         let expected_res = [
             245, 95, 9, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 98, 165, 238, 232, 42, 189, 244, 74, 45, 11, 117,
