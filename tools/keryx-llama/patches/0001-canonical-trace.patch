@@ -73,7 +73,7 @@ index 0878ab9..462d88e 100644
  
  #ifdef USE_CUDA_GRAPH
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index bf9f5d5..d553e9e 100644
+index bf9f5d5..725c0be 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -1,5 +1,6 @@
@@ -83,39 +83,77 @@ index bf9f5d5..d553e9e 100644
  #include "quantize.cuh"
  #include "mmid.cuh"
  
-@@ -125,6 +126,9 @@ void ggml_cuda_mul_mat_q(
+@@ -125,6 +126,16 @@ void ggml_cuda_mul_mat_q(
      // TODO: tighter pool buffer size vs q8 path
      const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
  
-+    const int q8c_r = (!ids && ggml_cuda_q8c_enabled()) ? ggml_cuda_q8c_rank(src0->name) : -1;
-+    const int q8c_shift = q8c_r >= 0 ? ggml_cuda_q8c_row_shift(q8c_r, ne11*ne12*ne13) : 0;
++    int q8c_r = ggml_cuda_q8c_enabled() && !use_native_fp4 ? ggml_cuda_q8c_rank(src0->name) : -1;
++    const int q8c_lay = ggml_cuda_q8c_layout(q8c_r);
++    if ((ids != nullptr) != (q8c_lay == Q8C_EXPERTS)) {
++        q8c_r = -1;
++    }
++    const bool q8c_tok3 = ne13 > 1;
++    const int64_t q8c_leaves = q8c_lay == Q8C_EXPERTS ? ne12 : q8c_lay == Q8C_HEADS ? (q8c_tok3 ? ne13 : ne11) : ne11*ne12*ne13;
++    const int q8c_shift = q8c_r >= 0 ? ggml_cuda_q8c_row_shift(q8c_r, q8c_leaves) : 0;
++    const int64_t q8c_row_bytes = ne10_padded/(4*QK8_1) * sizeof(block_q8_1_mmq);
 +
      if (!ids) {
          const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
              ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
-@@ -142,6 +146,10 @@ void ggml_cuda_mul_mat_q(
+@@ -142,6 +153,12 @@ void ggml_cuda_mul_mat_q(
              } else {
                  quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
-+                if (q8c_r >= 0) {
-+                    ggml_cuda_q8c_rows(src1_q8_1.get(), Q8C_MMQ, ne11*ne12*ne13, ne10_padded/(4*QK8_1) * sizeof(block_q8_1_mmq),
-+                                       ne11, 2*q8c_r, -1, q8c_shift, stream);
++                if (q8c_r >= 0 && q8c_lay == Q8C_HEADS) {
++                    ggml_cuda_q8c_gather_rows(src1_q8_1.get(), Q8C_MMQ, q8c_leaves, q8c_row_bytes, ne11, ne12,
++                                              q8c_tok3 ? ne11*ne12 : 1, ne11, nullptr, 0, 0, 2*q8c_r, -1, q8c_shift, stream);
++                } else if (q8c_r >= 0) {
++                    ggml_cuda_q8c_rows(src1_q8_1.get(), Q8C_MMQ, ne11*ne12*ne13, q8c_row_bytes, ne11, 2*q8c_r, -1, q8c_shift, stream);
 +                }
              }
              CUDA_CHECK(cudaGetLastError());
          }
-@@ -159,6 +167,9 @@ void ggml_cuda_mul_mat_q(
+@@ -159,6 +176,12 @@ void ggml_cuda_mul_mat_q(
              ne03, ne13, s03, s13, s3,
              ne1};
          ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
-+        if (q8c_r >= 0 && ggml_cuda_q8c_plain(q8c_r)) {
++        if (q8c_r >= 0 && ggml_cuda_q8c_plain(q8c_r) && q8c_lay == Q8C_HEADS) {
++            ggml_cuda_q8c_gather_rows(dst_d, Q8C_ROWS, q8c_leaves, dst->ne[0]*sizeof(float), 0, dst->ne[2],
++                                      q8c_tok3 ? dst->ne[1]*dst->ne[2] : 1, dst->ne[1], nullptr, 0, 0, 2*q8c_r + 1, -1, q8c_shift, stream);
++        } else if (q8c_r >= 0 && ggml_cuda_q8c_plain(q8c_r)) {
 +            ggml_cuda_q8c_out(dst_d, ggml_nrows(dst), dst->ne[0]*sizeof(float), 2*q8c_r + 1, q8c_shift, false, stream);
 +        }
          return;
      }
  
+@@ -203,6 +226,14 @@ void ggml_cuda_mul_mat_q(
+         } else {
+             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
++            if (q8c_r >= 0) {
++                ggml_cuda_pool_alloc<char> q8c_canon(ctx.pool(), ne12*ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
++                    ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq));
++                quantize_mmq_q8_1_cuda(src1_d, nullptr, q8c_canon.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
++                                       ne11, ne12, ne13, stream);
++                ggml_cuda_q8c_gather_rows(q8c_canon.get(), Q8C_MMQ, ne12, q8c_row_bytes, ne11, ne11, ne11, 1, nullptr, 0, 0,
++                                          2*q8c_r, -1, q8c_shift, stream);
++            }
+         }
+         CUDA_CHECK(cudaGetLastError());
+     }
+@@ -221,6 +252,10 @@ void ggml_cuda_mul_mat_q(
+         ne12};
+ 
+     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
++    if (q8c_r >= 0 && ggml_cuda_q8c_plain(q8c_r)) {
++        ggml_cuda_q8c_gather_rows(dst_d, Q8C_ROWS, dst->ne[2], dst->ne[0]*sizeof(float), 0, dst->ne[1], dst->ne[1], 1,
++                                  ids->data, dst->ne[1]*sizeof(int32_t), ids->nb[1], 2*q8c_r + 1, -1, q8c_shift, stream);
++    }
+ }
+ 
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index e18ada5..baecc74 100644
+index e18ada5..d136adb 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
@@ -124,15 +162,16 @@ index e18ada5..baecc74 100644
  #include "quantize.cuh"
  #include "unary.cuh"
  #include "vecdotq.cuh"
-@@ -1220,12 +1221,36 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1220,12 +1221,45 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 -    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-+    int q8c_x = -1, q8c_x2 = -1, q8c_y = -1, q8c_shift = 0;
-+    if (!ids && ggml_cuda_q8c_enabled()) {
++    int q8c_x = -1, q8c_x2 = -1, q8c_y = -1, q8c_shift = 0, q8c_lay = Q8C_DENSE;
++    if (ggml_cuda_q8c_enabled()) {
 +        const int r0 = ggml_cuda_q8c_rank(src0->name);
-+        if (r0 >= 0) {
++        q8c_lay = ggml_cuda_q8c_layout(r0);
++        if (r0 >= 0 && (ids != nullptr) == (q8c_lay == Q8C_EXPERTS) && (!ids || ne13 == 1)) {
 +            if (fusion && fusion->gate) {
 +                const int g = ggml_cuda_q8c_rank(fusion->gate->name);
 +                q8c_x  = 2*g;
@@ -144,11 +183,12 @@ index e18ada5..baecc74 100644
 +                    q8c_y = 2*r0 + 1;
 +                }
 +            }
-+            q8c_shift = ggml_cuda_q8c_row_shift(r0, ne11*ne12*ne13);
++            const int64_t n_leaves = q8c_lay == Q8C_EXPERTS ? ne12 : q8c_lay == Q8C_HEADS ? (ne13 > 1 ? ne13 : ne11) : ne11*ne12*ne13;
++            q8c_shift = ggml_cuda_q8c_row_shift(r0, n_leaves);
 +        }
 +    }
 +    const int64_t q8c_row_bytes = ne10_padded/QK8_1 * sizeof(block_q8_1);
-+    char * src1_q8_1_slot = q8c_x >= 0 ? (char *) ggml_cuda_q8c_slot(ne11*ne12*ne13, q8c_row_bytes, q8c_x, q8c_x2, q8c_shift) : nullptr;
++    char * src1_q8_1_slot = q8c_x >= 0 && q8c_lay == Q8C_DENSE ? (char *) ggml_cuda_q8c_slot(ne11*ne12*ne13, q8c_row_bytes, q8c_x, q8c_x2, q8c_shift) : nullptr;
 +    ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
 +    char * src1_q8_1 = src1_q8_1_slot ? src1_q8_1_slot : src1_q8_1_pool.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
      {
@@ -157,13 +197,20 @@ index e18ada5..baecc74 100644
          const int64_t s13 = src1->nb[3] / ts_src1;
 -        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
 +        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-+        if (q8c_x >= 0 && !src1_q8_1_slot) {
++        if (q8c_x >= 0 && q8c_lay == Q8C_EXPERTS) {
++            ggml_cuda_q8c_gather_rows(src1_q8_1, Q8C_ROWS, ne12, q8c_row_bytes, 0, ne11, ne11, 1, nullptr, 0, 0,
++                                      q8c_x, q8c_x2, q8c_shift, stream);
++        } else if (q8c_x >= 0 && q8c_lay == Q8C_HEADS) {
++            const bool tok3 = ne13 > 1;
++            ggml_cuda_q8c_gather_rows(src1_q8_1, Q8C_ROWS, tok3 ? ne13 : ne11, q8c_row_bytes, 0, ne12, tok3 ? ne11*ne12 : 1, ne11,
++                                      nullptr, 0, 0, q8c_x, q8c_x2, q8c_shift, stream);
++        } else if (q8c_x >= 0 && !src1_q8_1_slot) {
 +            ggml_cuda_q8c_rows(src1_q8_1, Q8C_ROWS, ne11*ne12*ne13, q8c_row_bytes, 0, q8c_x, q8c_x2, q8c_shift, stream);
 +        }
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1251,10 +1276,11 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1251,10 +1285,20 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(
@@ -172,16 +219,25 @@ index e18ada5..baecc74 100644
          ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
          ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
          ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
-+    ggml_cuda_q8c_out(dst_d, ggml_nrows(dst), dst->ne[0]*sizeof(float), q8c_y, q8c_shift, true, stream);
++    if (q8c_y >= 0 && q8c_lay == Q8C_EXPERTS) {
++        ggml_cuda_q8c_gather_rows(dst_d, Q8C_ROWS, dst->ne[2], dst->ne[0]*sizeof(float), 0, dst->ne[1], dst->ne[1], 1,
++                                  ids->data, dst->ne[1]*sizeof(int32_t), ids->nb[1], q8c_y, -1, q8c_shift, stream);
++    } else if (q8c_y >= 0 && q8c_lay == Q8C_HEADS) {
++        const bool tok3 = dst->ne[3] > 1;
++        ggml_cuda_q8c_gather_rows(dst_d, Q8C_ROWS, tok3 ? dst->ne[3] : dst->ne[1], dst->ne[0]*sizeof(float), 0, dst->ne[2],
++                                  tok3 ? dst->ne[1]*dst->ne[2] : 1, dst->ne[1], nullptr, 0, 0, q8c_y, -1, q8c_shift, stream);
++    } else {
++        ggml_cuda_q8c_out(dst_d, ggml_nrows(dst), dst->ne[0]*sizeof(float), q8c_y, q8c_shift, true, stream);
++    }
  }
  
  void ggml_cuda_op_mul_mat_vec_q(
 diff --git a/ggml/src/ggml-cuda/q8canon.cu b/ggml/src/ggml-cuda/q8canon.cu
 new file mode 100644
-index 0000000..c2407f1
+index 0000000..923ecca
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/q8canon.cu
-@@ -0,0 +1,923 @@
+@@ -0,0 +1,1021 @@
 +#include "q8canon.cuh"
 +
 +#include "ggml.h"
@@ -351,7 +407,38 @@ index 0000000..c2407f1
 +    return { base + row*row_bytes, 0, false };
 +}
 +
-+static __device__ void q8c_chunk_cv(const q8c_cursor & cur, uint32_t row_bytes, uint32_t c, uint32_t nch, uint32_t out[8]) {
++// Leaf made of `n_sub` rows, row `leaf*leaf_stride + sub*sub_stride` for sub-row `sub`, then an
++// optional `tail_bytes` tail at `tail + leaf*tail_pitch`.
++struct q8c_gather {
++    const uint8_t * base;
++    int             kind;
++    int64_t         row_bytes;
++    int64_t         rpc;
++    int64_t         n_sub;
++    int64_t         leaf_stride;
++    int64_t         sub_stride;
++    const uint8_t * tail;
++    int64_t         tail_bytes;
++    int64_t         tail_pitch;
++};
++
++struct q8c_gcursor {
++    q8c_gather g;
++    int64_t    leaf;
++
++    __device__ uint32_t word(uint32_t off) const {
++        const int64_t body = g.n_sub*g.row_bytes;
++        if ((int64_t) off >= body) {
++            return *(const uint32_t *) (g.tail + leaf*g.tail_pitch + (off - body));
++        }
++        const int64_t sub = off / g.row_bytes;
++        const q8c_cursor c = q8c_row_cursor(g.base, g.kind, leaf*g.leaf_stride + sub*g.sub_stride, g.row_bytes, g.rpc);
++        return c.word((uint32_t) (off - sub*g.row_bytes));
++    }
++};
++
++template <typename Cursor>
++static __device__ void q8c_chunk_cv(const Cursor & cur, uint32_t row_bytes, uint32_t c, uint32_t nch, uint32_t out[8]) {
 +    const uint32_t chunk_off = c*Q8C_CHUNK;
 +    const uint32_t len  = min((uint32_t) Q8C_CHUNK, row_bytes - chunk_off);
 +    const uint32_t nblk = (len + 63) / 64;
@@ -386,7 +473,8 @@ index 0000000..c2407f1
 +    }
 +}
 +
-+static __device__ void q8c_capture(uint32_t pos, int leaf_a, int leaf_b, const q8c_cursor & cur, uint32_t row_bytes) {
++template <typename Cursor>
++static __device__ void q8c_capture(uint32_t pos, int leaf_a, int leaf_b, const Cursor & cur, uint32_t row_bytes) {
 +    for (uint32_t k = 0; k < q8c_cap_n; ++k) {
 +        const uint32_t l = q8c_cap_leaf[k];
 +        const bool hit = (leaf_a >= 0 && (uint32_t) leaf_a == l) || (leaf_b >= 0 && (uint32_t) leaf_b == l);
@@ -426,6 +514,31 @@ index 0000000..c2407f1
 +        q8c_put_leaf(pos, leaf_b, cvs[0]);
 +    }
 +    q8c_capture(pos, leaf_a, leaf_b, cur, (uint32_t) row_bytes);
++}
++
++// One block per leaf of a gathered layout.
++static __global__ void q8c_gather_kernel(const q8c_gather g, int leaf_a, int leaf_b, int row_shift) {
++    __shared__ uint32_t cvs[Q8C_MAX_CHUNKS][8];
++    const int64_t  leaf  = blockIdx.x;
++    const uint32_t bytes = (uint32_t) (g.n_sub*g.row_bytes + g.tail_bytes);
++    const uint32_t nch   = (bytes + Q8C_CHUNK - 1) / Q8C_CHUNK;
++    const q8c_gcursor cur = { g, leaf };
++    for (uint32_t c = threadIdx.x; c < nch; c += blockDim.x) {
++        uint32_t cv[8];
++        q8c_chunk_cv(cur, bytes, c, nch, cv);
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            cvs[c][i] = cv[i];
++        }
++    }
++    __syncthreads();
++    q8c_block_tree(cvs, nch);
++    const uint32_t pos = q8c_pos_base + row_shift + (uint32_t) leaf;
++    if (threadIdx.x == 0) {
++        q8c_put_leaf(pos, leaf_a, cvs[0]);
++        q8c_put_leaf(pos, leaf_b, cvs[0]);
++    }
++    q8c_capture(pos, leaf_a, leaf_b, cur, bytes);
 +}
 +
 +struct q8c_zc {
@@ -507,6 +620,7 @@ index 0000000..c2407f1
 +    int  form;
 +    int  bias;
 +    bool head;
++    int  layout;
 +};
 +
 +struct q8c_graph {
@@ -592,11 +706,13 @@ index 0000000..c2407f1
 +        std::string name((const char *) &b[o + 2], nl);
 +        const uint8_t * r = &b[o + 2 + nl];
 +        uint8_t role = r[44], form = r[46];
-+        uint32_t bias;
++        uint32_t bias, n_exp;
 +        memcpy(&bias, &r[51], 4);
++        memcpy(&n_exp, &r[20], 4);
 +        if (i < n_products) {
++            const int layout = role == 7 ? Q8C_HEADS : n_exp > 1 ? Q8C_EXPERTS : Q8C_DENSE;
 +            s.rank[name] = (int) i;
-+            s.prod.push_back({ form, bias == Q8C_NONE ? -1 : (int) bias, role == 2 });
++            s.prod.push_back({ form, bias == Q8C_NONE ? -1 : (int) bias, role == 2, layout });
 +        }
 +        o += 2 + nl + 55;
 +        if (chain) {
@@ -732,6 +848,14 @@ index 0000000..c2407f1
 +    return it == s->rank.end() ? -1 : it->second;
 +}
 +
++int ggml_cuda_q8c_layout(int rank) {
++    const q8c_dev * s = q8c_current();
++    if (!s || !s->on || rank < 0 || (size_t) rank >= s->prod.size()) {
++        return Q8C_DENSE;
++    }
++    return s->prod[rank].layout;
++}
++
 +bool ggml_cuda_q8c_plain(int rank) {
 +    const q8c_dev * s = q8c_current();
 +    if (!s || !s->on || rank < 0 || (size_t) rank >= s->prod.size()) {
@@ -804,6 +928,23 @@ index 0000000..c2407f1
 +                                                          kind == Q8C_MMQ ? rows_per_channel : nrows, leaf_a, leaf_b, row_shift);
 +}
 +
++void ggml_cuda_q8c_gather_rows(const void * base, int kind, int64_t n_leaves, int64_t row_bytes, int64_t rpc, int64_t n_sub,
++                               int64_t leaf_stride, int64_t sub_stride, const void * tail, int64_t tail_bytes, int64_t tail_pitch,
++                               int leaf_a, int leaf_b, int row_shift, cudaStream_t stream) {
++    q8c_dev * s = q8c_current();
++    if (!s || !s->on || !s->cur || n_leaves <= 0 || leaf_a < 0) {
++        return;
++    }
++    const int64_t bytes = n_sub*row_bytes + (tail ? tail_bytes : 0);
++    if (row_bytes % 4 != 0 || tail_bytes % 4 != 0 || (bytes + Q8C_CHUNK - 1) / Q8C_CHUNK > Q8C_MAX_CHUNKS) {
++        return;
++    }
++    q8c_note_tokens(*s, leaf_a, n_leaves);
++    const q8c_gather g = { (const uint8_t *) base, kind, row_bytes, rpc, n_sub, leaf_stride, sub_stride,
++                           (const uint8_t *) tail, tail ? tail_bytes : 0, tail_pitch };
++    q8c_gather_kernel<<<(unsigned) n_leaves, 256, 0, stream>>>(g, leaf_a, leaf_b, row_shift);
++}
++
 +void ggml_cuda_q8c_out(const void * data, int64_t nrows, int64_t row_bytes, int leaf, int row_shift, bool stage,
 +                       cudaStream_t stream) {
 +    if (leaf < 0 || !ggml_cuda_q8c_enabled()) {
@@ -839,6 +980,9 @@ index 0000000..c2407f1
 +    if (is("attn_residual") || is("ffn_inp") || is("attn_out")) {
 +        return base;
 +    }
++    if (s.n_router > 0 && is("ffn_moe_logits")) {
++        return (int) (2*s.n_products + 2*s.n_layers + il);
++    }
 +    return -1;
 +}
 +
@@ -870,7 +1014,7 @@ index 0000000..c2407f1
 +        return;
 +    }
 +    const ggml_tensor * mm = node->src[0];
-+    if (!mm || mm->op != GGML_OP_MUL_MAT || !mm->src[0]) {
++    if (!mm || (mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID) || !mm->src[0]) {
 +        return;
 +    }
 +    const int r = ggml_cuda_q8c_rank(mm->src[0]->name);
@@ -878,6 +1022,16 @@ index 0000000..c2407f1
 +        return;
 +    }
 +    const q8c_product & p = q8c_current()->prod[r];
++    if (mm->op == GGML_OP_MUL_MAT_ID) {
++        const ggml_tensor * ids = mm->src[2];
++        if (node->op == GGML_OP_GLU && p.form != 0 && p.layout == Q8C_EXPERTS && ids && node->ne[3] == 1) {
++            const int64_t n_used = node->ne[1], n_leaves = node->ne[2];
++            ggml_cuda_q8c_gather_rows(node->data, Q8C_ROWS, n_leaves, node->ne[0]*sizeof(float), 0, n_used, n_used, 1,
++                                      ids->data, n_used*sizeof(int32_t), ids->nb[1], 2*r + 1,
++                                      -1, ggml_cuda_q8c_row_shift(r, n_leaves), stream);
++        }
++        return;
++    }
 +    bool y = false;
 +    if (node->op == GGML_OP_GLU) {
 +        y = p.form != 0;
@@ -1107,10 +1261,10 @@ index 0000000..c2407f1
 +}
 diff --git a/ggml/src/ggml-cuda/q8canon.cuh b/ggml/src/ggml-cuda/q8canon.cuh
 new file mode 100644
-index 0000000..cf2f966
+index 0000000..d138cba
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/q8canon.cuh
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,60 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -1128,15 +1282,26 @@ index 0000000..cf2f966
 +    Q8C_MMQ  = 1,
 +};
 +
++// Leaf layout of a product: one row per position, one row per active expert, one row per head.
++enum q8c_layout {
++    Q8C_DENSE   = 0,
++    Q8C_EXPERTS = 1,
++    Q8C_HEADS   = 2,
++};
++
 +// Hooks (current device).
 +bool   ggml_cuda_q8c_enabled();
 +int    ggml_cuda_q8c_rank(const char * name);
 +bool   ggml_cuda_q8c_plain(int rank);
++int    ggml_cuda_q8c_layout(int rank);
 +int    ggml_cuda_q8c_row_shift(int rank, int64_t nrows);
 +void   ggml_cuda_q8c_begin(const void * graph_key);
 +void * ggml_cuda_q8c_slot(int64_t nrows, int64_t row_bytes, int leaf_a, int leaf_b, int row_shift);
 +void   ggml_cuda_q8c_rows(const void * data, int kind, int64_t nrows, int64_t row_bytes, int64_t rows_per_channel,
 +                          int leaf_a, int leaf_b, int row_shift, cudaStream_t stream);
++void   ggml_cuda_q8c_gather_rows(const void * base, int kind, int64_t n_leaves, int64_t row_bytes, int64_t rpc, int64_t n_sub,
++                                 int64_t leaf_stride, int64_t sub_stride, const void * tail, int64_t tail_bytes, int64_t tail_pitch,
++                                 int leaf_a, int leaf_b, int row_shift, cudaStream_t stream);
 +void   ggml_cuda_q8c_out(const void * data, int64_t nrows, int64_t row_bytes, int leaf, int row_shift, bool stage,
 +                         cudaStream_t stream);
 +void   ggml_cuda_q8c_node(const ggml_tensor * node, cudaStream_t stream);

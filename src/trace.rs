@@ -8,7 +8,8 @@ use keryx_verifiable_inference::manifest::{self, Chain, Entry};
 use borsh::{BorshDeserialize, BorshSerialize};
 use keryx_verifiable_inference::merkle::{b3_chunk_cv, b3_path, b3_root, rt_range_proof, Hash, B3_CHUNK};
 use keryx_verifiable_inference::opening::{
-    self, ChunkRange, EntryOpening, LeafBytes, LeafChunk, LinkOpening, Opening, Point, PrefixPoint, ResidAdd, ResidPoint, ResidSrc,
+    self, ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, MoeAdd, Opening, Point, PrefixPoint, ResidAdd, ResidPoint,
+    ResidSrc,
 };
 use keryx_verifiable_inference::prefix::{self, PrefixCtx};
 use keryx_verifiable_inference::verify::{ResponseCtx, TierCtx};
@@ -372,6 +373,14 @@ impl TraceRecord {
                 pos[chain::resid_leaf(np, last, Resid::Attn) as usize] = empty;
                 pos[chain::resid_leaf(np, last, Resid::Out) as usize] = empty;
             }
+            if ctx.n_used > 0 {
+                for l in 0..ctx.n_layers as u64 {
+                    let routed = matches!(m.entry(ctx.layer_base as u64 + l).chain, Chain::Layer(ll) if ll.moe.is_some());
+                    if !routed || (ctx.trim_last && l == last && before_output) {
+                        pos[chain::router_leaf(np, ctx.n_layers as u64, l) as usize] = empty;
+                    }
+                }
+            }
             pos[nl - 1] = *blake3::hash(&chain::meta(t as u32, ubatch[t], tokens[t] as u32)).as_bytes();
         }
         if leaves.iter().any(|h| *h == [0u8; 32]) {
@@ -463,6 +472,11 @@ pub struct PointSpec {
     pub g_rank: u64,
     pub t: u64,
     pub row: u64,
+    /// Rows per leaf: active experts, heads, or 1.
+    pub n_used: u64,
+    pub slot: u64,
+    /// The output leaf ends with the expert ids of its slots.
+    pub experts: bool,
 }
 
 impl PointSpec {
@@ -492,14 +506,39 @@ pub fn draw_point(m: &TierManifest, n_prompt: u32, n_pos: u32, seed: &Hash, i: u
     };
     let g_rank = if e0.glu_form == manifest::FORM_PAIR_UP { e0.partner as u64 } else { rank };
     let g = m.entry(g_rank);
-    if g.n_exp != 1 {
+    let heads = e0.role == manifest::ROLE_HEADS;
+    let experts = g.n_exp > 1 && !heads;
+    if g.n_exp != 1 && m.chain.is_none() {
         return None;
     }
+    let n_used = if experts {
+        m.chain?.n_used as u64
+    } else if heads {
+        g.n_exp as u64
+    } else {
+        1
+    };
     let m_out = if g.glu_form == manifest::FORM_SPLIT { g.m / 2 } else { g.m };
-    if m_out == 0 {
+    if m_out == 0 || n_used == 0 {
         return None;
     }
-    Some(PointSpec { rank, g_rank, t, row: d[2] % m_out })
+    let slot = if n_used > 1 { (d[3] >> 32) % n_used } else { 0 };
+    Some(PointSpec { rank, g_rank, t, row: d[2] % m_out, n_used, slot, experts })
+}
+
+/// Chunk `c` of `b` and its path to the BLAKE3 root of `b`.
+fn chunk_with_path(b: &[u8], c: usize) -> Option<(Vec<u8>, Vec<Hash>)> {
+    let n = b.len().div_ceil(B3_CHUNK).max(1);
+    if c >= n {
+        return None;
+    }
+    let path = if n == 1 {
+        Vec::new()
+    } else {
+        let cvs: Vec<Hash> = (0..n).map(|k| b3_chunk_cv(&b[k * B3_CHUNK..((k + 1) * B3_CHUNK).min(b.len())], k as u64)).collect();
+        b3_path(&cvs, c)
+    };
+    Some((b[c * B3_CHUNK..((c + 1) * B3_CHUNK).min(b.len())].to_vec(), path))
 }
 
 /// Chunks `first..=last` of the resident model with their range proof against `R_T`.
@@ -535,11 +574,24 @@ pub fn range_proof(index: &WeightIndex, first: u64, last: u64) -> Option<ChunkRa
 pub fn build_point(m: &TierManifest, rec: &TraceRecord, p: &PointSpec, x: Vec<u8>, y: &[u8], index: &WeightIndex) -> Option<Point> {
     let g = m.entry(p.g_rank);
     let m_out = if g.glu_form == manifest::FORM_SPLIT { g.m / 2 } else { g.m };
-    if y.len() as u64 != m_out * 4 || p.t >= rec.n_pos as u64 {
+    let body = p.n_used * m_out * 4;
+    let total = body + if p.experts { 4 * p.n_used } else { 0 };
+    if y.len() as u64 != total || p.t >= rec.n_pos as u64 || p.slot >= p.n_used {
+        return None;
+    }
+    let exp = if p.experts {
+        let o = (body + 4 * p.slot) as usize;
+        u32::from_le_bytes(y[o..o + 4].try_into().ok()?) as u64
+    } else if p.n_used > 1 {
+        p.slot
+    } else {
+        0
+    };
+    if exp >= g.n_exp as u64 {
         return None;
     }
     let row_range = |e: &Entry, row: u64| -> Option<ChunkRange> {
-        let (first, last, _) = e.row_chunks(0, row)?;
+        let (first, last, _) = e.row_chunks(exp, row)?;
         range_proof(index, first, last)
     };
     let mut rows = vec![row_range(g, p.row)?];
@@ -565,14 +617,8 @@ pub fn build_point(m: &TierManifest, rec: &TraceRecord, p: &PointSpec, x: Vec<u8
     };
     let pos_leaves = rec.leaves_at(p.t);
     let nl = rec.n_leaves;
-    let c = (p.row * 4 / B3_CHUNK as u64) as usize;
-    let n_yc = y.len().div_ceil(B3_CHUNK);
-    let y_chunk_path = if n_yc == 1 {
-        Vec::new()
-    } else {
-        let cvs: Vec<Hash> = (0..n_yc).map(|j| b3_chunk_cv(&y[j * B3_CHUNK..((j + 1) * B3_CHUNK).min(y.len())], j as u64)).collect();
-        b3_path(&cvs, c)
-    };
+    let c = ((p.slot * m_out + p.row) * 4 / B3_CHUNK as u64) as usize;
+    let (y_chunk, y_chunk_path) = chunk_with_path(y, c)?;
     Some(Point {
         n_ubatch: rec.ubatch[p.t as usize],
         pos_path: b3_path(&rec.pos_roots, p.t as usize),
@@ -585,7 +631,7 @@ pub fn build_point(m: &TierManifest, rec: &TraceRecord, p: &PointSpec, x: Vec<u8
         x_path: b3_path(pos_leaves, p.leaf_x() as usize),
         y_total_len: y.len() as u32,
         y_chunk_index: c as u32,
-        y_chunk: y[c * B3_CHUNK..((c + 1) * B3_CHUNK).min(y.len())].to_vec(),
+        y_chunk,
         y_chunk_path,
         y_path: b3_path(pos_leaves, p.leaf_y() as usize),
     })
@@ -634,6 +680,8 @@ pub struct ResidDraw {
     /// Product whose output is added.
     pub rank: u64,
     pub c: u64,
+    /// Routed experts added with it.
+    pub moe: Option<manifest::MoeLinks>,
 }
 
 impl ResidDraw {
@@ -657,6 +705,7 @@ pub struct ChainDraw {
     pub points: Vec<(PointSpec, Option<u32>)>,
     pub prefix_t: u64,
     pub resid: ResidDraw,
+    pub n_layers: u64,
 }
 
 fn link_leaf(m: &TierManifest, ctx: &ChainCtx, g_rank: u64) -> Option<Option<u32>> {
@@ -694,13 +743,11 @@ pub fn draw_chain(m: &TierManifest, pctx: &PrefixCtx, rec: &TraceRecord, seed: &
         Chain::Layer(ll) if ll.layer as u64 == layer => ll,
         _ => return None,
     };
-    if kind == Resid::Out && ll.moe.is_some() {
-        return None;
-    }
+    let moe = ll.moe.filter(|_| kind == Resid::Out);
     let rank = if kind == Resid::Attn { ll.proj } else { ll.down } as u64;
     let dim = m.entry(rank).m;
     let c = d[2] % (4 * dim).div_ceil(B3_CHUNK as u64).max(1);
-    Some(ChainDraw { points, prefix_t: draw_prefix(pctx, seed), resid: ResidDraw { t, layer, kind, rank, c } })
+    Some(ChainDraw { points, prefix_t: draw_prefix(pctx, seed), resid: ResidDraw { t, layer, kind, rank, c, moe }, n_layers })
 }
 
 impl ChainDraw {
@@ -726,6 +773,11 @@ impl ChainDraw {
             add(r.t, l);
         }
         add(r.t, 2 * r.rank as u32 + 1);
+        if let Some(moe) = &r.moe {
+            add(r.t, 2 * moe.down_exps + 1);
+            add(r.t, 2 * moe.gate_exps);
+            add(r.t, chain::router_leaf(np, self.n_layers, r.layer) as u32);
+        }
         out
     }
 }
@@ -736,7 +788,11 @@ pub fn leaf_cap(m: &TierManifest, leaf: u32) -> usize {
     let leaf = leaf as usize;
     if leaf < 2 * np {
         let e = m.entry((leaf / 2) as u64);
-        let n = (e.n_exp.max(1) as u64).max(m.chain.map_or(1, |c| c.n_used as u64));
+        let n = match (e.role, e.n_exp) {
+            (manifest::ROLE_HEADS, h) => h as u64,
+            (_, 1) => 1,
+            _ => m.chain.map_or(1, |c| c.n_used as u64).max(1),
+        };
         let bytes = if leaf % 2 == 0 { e.k.div_ceil(512) * 512 / 32 * 36 } else { 4 * e.m + 4 };
         return (bytes * n) as usize;
     }
@@ -769,24 +825,18 @@ fn leaf_bytes(rec: &TraceRecord, t: u64, leaf: u32, bytes: &[u8]) -> LeafBytes {
 }
 
 fn leaf_chunk(rec: &TraceRecord, t: u64, leaf: u32, b: &[u8], c: u64) -> Option<LeafChunk> {
-    let n = b.len().div_ceil(B3_CHUNK).max(1);
-    let c = c as usize;
-    if c >= n {
+    let (chunk, chunk_path) = chunk_with_path(b, c as usize)?;
+    Some(LeafChunk { total_len: b.len() as u32, index: c as u32, chunk, chunk_path, leaf_path: b3_path(rec.leaves_at(t), leaf as usize) })
+}
+
+/// The expert ids that close an expert output leaf `y` of `n_used` slots.
+fn expert_ids(y: &[u8], n_used: u64) -> Option<ExpertIds> {
+    let body = y.len().checked_sub(4 * n_used as usize)?;
+    if body % B3_CHUNK != 0 {
         return None;
     }
-    let chunk_path = if n == 1 {
-        Vec::new()
-    } else {
-        let cvs: Vec<Hash> = (0..n).map(|k| b3_chunk_cv(&b[k * B3_CHUNK..((k + 1) * B3_CHUNK).min(b.len())], k as u64)).collect();
-        b3_path(&cvs, c)
-    };
-    Some(LeafChunk {
-        total_len: b.len() as u32,
-        index: c as u32,
-        chunk: b[c * B3_CHUNK..((c + 1) * B3_CHUNK).min(b.len())].to_vec(),
-        chunk_path,
-        leaf_path: b3_path(rec.leaves_at(t), leaf as usize),
-    })
+    let (chunk, chunk_path) = chunk_with_path(y, body / B3_CHUNK)?;
+    Some(ExpertIds { chunk, chunk_path })
 }
 
 /// Captured leaf bytes, by `(position, leaf)`.
@@ -819,9 +869,12 @@ pub fn chain_opening_body(
 
     let mut points = Vec::with_capacity(d.points.len());
     let mut links = Vec::with_capacity(d.points.len());
+    let mut experts = Vec::with_capacity(d.points.len());
     for (i, (p, link_leaf)) in d.points.iter().enumerate() {
         let i = i as u32;
-        let point = build_point(m, rec, p, cap(p.t, p.leaf_x())?.to_vec(), cap(p.t, p.leaf_y())?, index)?;
+        let y = cap(p.t, p.leaf_y())?;
+        let point = build_point(m, rec, p, cap(p.t, p.leaf_x())?.to_vec(), y, index)?;
+        experts.push(if p.experts { Some(expert_ids(y, p.n_used)?) } else { None });
         let Chain::Product(pl) = m.entry(p.g_rank).chain else { return None };
         let link = match (pl.link, link_leaf) {
             (manifest::LINK_NONE, None) => LinkOpening::None,
@@ -829,6 +882,15 @@ pub fn chain_opening_body(
                 embd: row_opening(m, index, ctx.embd_entry as u64, tok(p.t)? as u64)?,
                 norm: norm_fragment(m, index, pl.norm as u64, seed, i)?,
             },
+            (manifest::LINK_GLU, Some(l)) if p.experts => {
+                let y = cap(p.t, *l)?;
+                let per_slot = m.entry(p.g_rank).k * 4 / B3_CHUNK as u64;
+                if per_slot == 0 {
+                    return None;
+                }
+                let c = p.slot * per_slot + draw::point(seed, i)[3] % per_slot;
+                LinkOpening::Source { src: m.entry_opening(pl.src as u64), y: leaf_chunk(rec, p.t, *l, y, c)?, ids: Some(expert_ids(y, p.n_used)?) }
+            }
             (manifest::LINK_GLU | manifest::LINK_DIRECT, Some(l)) => {
                 let y = cap(p.t, *l)?;
                 let c = draw::point(seed, i)[3] % y.len().div_ceil(B3_CHUNK).max(1) as u64;
@@ -875,7 +937,29 @@ pub fn chain_opening_body(
     let y_leaf = 2 * r.rank as u32 + 1;
     let y = cap(r.t, y_leaf)?;
     let post = if r.kind == Resid::Attn { ll.post_attn } else { ll.post_ffn };
-    let add = if post == manifest::NONE {
+    let add = if let Some(moe) = &r.moe {
+        let n_used = ctx.n_used as u64;
+        let dim = m.entry(r.rank).m;
+        let per_slot = dim * 4 / B3_CHUNK as u64;
+        let router = m.entry(moe.router as u64);
+        let n_exp = router.m;
+        let down_leaf = 2 * moe.down_exps + 1;
+        let down_y = cap(r.t, down_leaf)?;
+        let slots = (0..n_used).map(|sl| leaf_chunk(rec, r.t, down_leaf, down_y, sl * per_slot + r.c)).collect::<Option<Vec<_>>>()?;
+        let router_leaf = chain::router_leaf(np, ctx.n_layers as u64, r.layer) as u32;
+        let row = draw::point(seed, chain::RESID_POINT)[3] % n_exp;
+        let gate_leaf = 2 * moe.gate_exps;
+        ResidAdd::Moe(Box::new(MoeAdd {
+            scores: leaf_bytes(rec, r.t, router_leaf, cap(r.t, router_leaf)?),
+            bias: bytes_range(m, index, moe.probs_bias as u64, 0, 4 * n_exp)?,
+            ids: expert_ids(down_y, n_used)?,
+            slots,
+            shexp: leaf_chunk(rec, r.t, y_leaf, y, r.c)?,
+            router_row: bytes_range(m, index, moe.router as u64, row * 4 * dim, 4 * dim)?,
+            gate: m.entry_opening(moe.gate_exps as u64),
+            gate_x: leaf_bytes(rec, r.t, gate_leaf, cap(r.t, gate_leaf)?),
+        }))
+    } else if post == manifest::NONE {
         ResidAdd::Chunk(leaf_chunk(rec, r.t, y_leaf, y, r.c)?)
     } else {
         let off = r.c * B3_CHUNK as u64 / 4;
@@ -895,7 +979,8 @@ pub fn chain_opening_body(
         add,
     };
     let n = points.len();
-    let body = Opening { response_txid, points, prefix: Some(prefix), links, experts: vec![None; n], resid: Some(resid) }.encode();
+    debug_assert_eq!(experts.len(), n);
+    let body = Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: Some(resid) }.encode();
     (body.len() <= opening::MAX_BODY_LEN).then_some(body)
 }
 
@@ -1098,7 +1183,8 @@ mod tests {
 
     #[test]
     fn chain_draw_opens_the_leaves_the_verifier_reads() {
-        for tier in 0..4u8 {
+        let (mut experts, mut heads, mut moe) = (0, 0, 0);
+        for tier in 0..5u8 {
             let m = TierManifest::for_chain(tier).unwrap();
             let ctx = m.chain.unwrap();
             let (_, pctx) = chain_ctx(tier).unwrap();
@@ -1123,9 +1209,19 @@ mod tests {
                 for (p, link) in &d.points {
                     let Chain::Product(pl) = m.entry(p.g_rank).chain else { panic!("tier {tier}: product without link") };
                     assert_eq!(link.is_none(), pl.link == manifest::LINK_NONE || (pl.link == manifest::LINK_ATTN_IN && pl.layer == 0));
+                    assert!(p.slot < p.n_used);
+                    experts += p.experts as u32;
+                    heads += (m.entry(p.rank).role == manifest::ROLE_HEADS) as u32;
+                }
+                if let Some(mo) = &r.moe {
+                    assert_eq!(r.kind, Resid::Out);
+                    assert!(caps.contains(&(r.t as u32, chain::router_leaf(np, ctx.n_layers as u64, r.layer) as u32)));
+                    assert!(caps.contains(&(r.t as u32, 2 * mo.gate_exps)));
+                    moe += 1;
                 }
             }
         }
+        assert!(experts > 0 && heads > 0 && moe > 0, "{experts} {heads} {moe}");
     }
 
     #[test]

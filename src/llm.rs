@@ -398,6 +398,15 @@ pub(crate) fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, S
                 SYSTEM_PROMPT_NEXT, prompt
             ),
         ),
+        "kimi-linear-48b" => (
+            "<|im_system|>system<|im_middle|>Request id:".to_string(),
+            format!(
+                "\n{}<|im_end|>\
+                 <|im_user|>user<|im_middle|>{}<|im_end|>\
+                 <|im_assistant|>assistant<|im_middle|>",
+                SYSTEM_PROMPT_NEXT, prompt
+            ),
+        ),
         _ => return None,
     })
 }
@@ -1243,13 +1252,13 @@ mod tests {
     /// role line, for every audited model.
     #[test]
     fn prefix_parts_rebuild_the_plain_template() {
-        for name in ["qwen3.5-9b-abliterated", "glm-4-9b-0414", "gemma-4-12b-abliterated", "qwen3.8-27b"] {
+        for name in ["qwen3.5-9b-abliterated", "glm-4-9b-0414", "gemma-4-12b-abliterated", "qwen3.8-27b", "kimi-linear-48b"] {
             let (head, rest) = format_prompt_parts(name, "hi").unwrap();
-            assert!(head.ends_with("\nRequest id:"), "{name}: {head:?}");
+            assert!(head.ends_with("Request id:"), "{name}: {head:?}");
             assert!(rest.starts_with('\n'), "{name}: {rest:?}");
             assert_eq!(format!("{head}{rest}").replace("Request id:\n", ""), format_prompt_by_name(name, "hi"), "{name}");
         }
-        assert!(format_prompt_parts("kimi-linear-48b", "hi").is_none());
+        assert!(format_prompt_parts("not-a-real-model", "hi").is_none());
     }
 
     /// Stage-2 traces of a real model open and verify as the node would, over many seeds.
