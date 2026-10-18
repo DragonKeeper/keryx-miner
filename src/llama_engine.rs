@@ -63,8 +63,21 @@ type ReplayFn = unsafe extern "C" fn(
     *mut u32,
     *mut u32,
 ) -> c_int;
+type ReplayMultiFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const i32,
+    c_int,
+    c_int,
+    *const u32,
+    *const u32,
+    u32,
+    u32,
+    *mut u8,
+    usize,
+    *mut u32,
+) -> c_int;
 
-const ABI: c_int = 6;
+const ABI: c_int = 7;
 /// Largest captured leaf the engine hands back.
 const CAPTURE_CAP: usize = 4 << 20;
 
@@ -123,6 +136,7 @@ struct Engine {
     trace_leaf_count: TraceLeafCountFn,
     trace_read: TraceReadFn,
     replay: ReplayFn,
+    replay_multi: ReplayMultiFn,
     free: FreeFn,
     tensor_device: Option<TensorDeviceFn>,
     last_error: Option<ErrorFn>,
@@ -132,6 +146,8 @@ struct Engine {
     n_ctx: c_int,
     /// Leaves per traced position, 0 until the trace is configured.
     trace_leaves: usize,
+    /// BLAKE3 of the configured trace manifest.
+    trace_manifest: [u8; 32],
 }
 
 /// A traced response: its text and everything needed to commit to and replay it.
@@ -408,12 +424,13 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
         if got != ABI {
             return Err(failed("abi", format!("{} has ABI {}, this miner expects {}", so.display(), got, ABI), false));
         }
-        let (Some(generate_traced), Some(trace_configure), Some(trace_leaf_count), Some(trace_read), Some(replay)) = (
+        let (Some(generate_traced), Some(trace_configure), Some(trace_leaf_count), Some(trace_read), Some(replay), Some(replay_multi)) = (
             sym::<GenTracedFn>(lib, "keryx_llama_generate_traced"),
             sym::<TraceConfigureFn>(lib, "keryx_llama_trace_configure"),
             sym::<TraceLeafCountFn>(lib, "keryx_llama_trace_leaf_count"),
             sym::<TraceReadFn>(lib, "keryx_llama_trace_read"),
             sym::<ReplayFn>(lib, "keryx_llama_replay"),
+            sym::<ReplayMultiFn>(lib, "keryx_llama_replay_multi"),
         ) else {
             return Err(failed("symbols", format!("{} is missing trace symbols", so.display()), false));
         };
@@ -478,6 +495,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             trace_leaf_count,
             trace_read,
             replay,
+            replay_multi,
             free,
             tensor_device,
             last_error,
@@ -485,6 +503,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             attempt,
             n_ctx,
             trace_leaves: 0,
+            trace_manifest: [0u8; 32],
         });
         log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves inference ({}).", context_info);
         Ok(attempt)
@@ -599,12 +618,14 @@ pub fn trace_configure(gguf: &str, gpu: usize, manifest: &[u8]) -> Result<usize,
         return Err("trace configured without leaves".to_string());
     }
     e.trace_leaves = nl as usize;
+    e.trace_manifest = *blake3::hash(manifest).as_bytes();
     Ok(e.trace_leaves)
 }
 
-/// Whether the engine hosting `gguf` on `gpu` traces its responses.
-pub fn traced_for(gguf: &str, gpu: usize) -> bool {
-    slot(gpu).lock().map_or(false, |g| g.as_ref().is_some_and(|e| e.gguf == gguf && e.trace_leaves > 0))
+/// Whether the engine hosting `gguf` on `gpu` traces its responses under `manifest`.
+pub fn traced_with(gguf: &str, gpu: usize, manifest: &[u8]) -> bool {
+    let h = *blake3::hash(manifest).as_bytes();
+    slot(gpu).lock().map_or(false, |g| g.as_ref().is_some_and(|e| e.gguf == gguf && e.trace_leaves > 0 && e.trace_manifest == h))
 }
 
 /// The request-bound prefix of a traced prompt: its token ids, the token count of the prompt
@@ -723,6 +744,44 @@ pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, l
     x.truncate(x_len as usize);
     y.truncate(y_len as usize);
     Ok((x, y))
+}
+
+/// Most captures one replay takes.
+pub const REPLAY_MAX_CAPTURES: usize = 32;
+
+/// Replays a traced response up to the last requested position and returns the bytes of each
+/// `(position, leaf)` capture, in order. `slot_bytes` bounds every captured leaf.
+pub fn replay_multi(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, caps: &[(u32, u32)], slot_bytes: usize) -> Result<Vec<Vec<u8>>, String> {
+    if caps.is_empty() || caps.len() > REPLAY_MAX_CAPTURES || slot_bytes == 0 || slot_bytes > CAPTURE_CAP || slot_bytes % 4 != 0 {
+        return Err("invalid replay request".to_string());
+    }
+    let slot = slot(gpu);
+    let g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_ref().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    let pos: Vec<u32> = caps.iter().map(|c| c.0).collect();
+    let leaf: Vec<u32> = caps.iter().map(|c| c.1).collect();
+    let mut out = vec![0u8; caps.len() * slot_bytes];
+    let mut lens = vec![0u32; caps.len()];
+    let _native = native();
+    let rc = unsafe {
+        (e.replay_multi)(
+            e.model,
+            tokens.as_ptr(),
+            tokens.len() as c_int,
+            n_prompt as c_int,
+            pos.as_ptr(),
+            leaf.as_ptr(),
+            caps.len() as u32,
+            slot_bytes as u32,
+            out.as_mut_ptr(),
+            out.len(),
+            lens.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(engine_error(e, &format!("replay failed ({rc})")));
+    }
+    Ok(out.chunks(slot_bytes).zip(&lens).map(|(c, &l)| c[..(l as usize).min(slot_bytes)].to_vec()).collect())
 }
 
 #[cfg(test)]

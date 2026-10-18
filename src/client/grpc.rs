@@ -818,6 +818,7 @@ impl KeryxdHandler {
             let (tx_done, rx_done) = oneshot::channel::<Option<keryx_miner::llm::Generated>>();
             let traced = self.last_known_daa >= keryx_miner::pom::verifiable_inference_activation_daa();
             let tier = traced.then(|| keryx_miner::models::pom_tier_index(&model_id, self.last_known_daa)).flatten();
+            let chain = keryx_miner::trace::chain_active(self.last_known_daa);
             let job = InferenceJob { request_hash, private, model_id, tier, max_tokens: max_tokens as u32, rx: rx_done };
             if matches!(private, Some(PrivateRequest::Unreadable)) {
                 // No inference to run: the answer is the fixed error text.
@@ -833,7 +834,7 @@ impl KeryxdHandler {
             info!("Inference: spawning LLM inference (max_tokens={}{})", max_tokens, if tier.is_some() { ", traced" } else { "" });
             tokio::task::spawn_blocking(move || {
                 let result = match tier {
-                    Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len, &request_hash),
+                    Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len, &request_hash, chain),
                     None => keryx_miner::llm::load_and_run_inference(&model_id, &prompt, max_tokens)
                         .map(|text| keryx_miner::llm::Generated { text, trace: None }),
                 };

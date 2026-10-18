@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 0878ab9..b3411b3 100644
+index 0878ab9..462d88e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -32,6 +32,7 @@
@@ -10,7 +10,17 @@ index 0878ab9..b3411b3 100644
  #include "ggml-cuda/norm.cuh"
  #include "ggml-cuda/opt-step-adamw.cuh"
  #include "ggml-cuda/opt-step-sgd.cuh"
-@@ -3620,6 +3621,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3192,6 +3193,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         std::fill(ops, ops + 8, node->op);
+ 
+         for (; n_fuse <= 6; ++n_fuse) {
++            if (ggml_cuda_q8c_is_resid(cgraph->nodes[i + n_fuse])) {
++                break;
++            }
+             if (!ggml_can_fuse(cgraph, i + n_fuse, ops + n_fuse, 2)) {
+                 break;
+             }
+@@ -3620,6 +3624,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              }
  
              const ggml_tensor * bias = with_bias ? get_bias_tensor(out_node, scale_node, bias_op) : nullptr;
@@ -20,7 +30,7 @@ index 0878ab9..b3411b3 100644
              if (with_bias && !bias) {
                  continue;
              }
-@@ -3689,6 +3693,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3689,6 +3696,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              continue;
          }
  
@@ -30,7 +40,7 @@ index 0878ab9..b3411b3 100644
          if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
              continue;
          }
-@@ -3790,6 +3797,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -3790,6 +3800,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          // With the use of CUDA graphs, the execution will be performed by the graph launch.
          if (!use_cuda_graph || cuda_graph_update_required) {
              [[maybe_unused]] int prev_i = 0;
@@ -38,7 +48,15 @@ index 0878ab9..b3411b3 100644
  
              if (stream_ctx.concurrent_events.size() > 0) {
                  should_launch_concurrent_events = true;
-@@ -3921,6 +3929,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -3905,6 +3916,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
+ #endif
+                     i += nodes_to_skip;
++                    ggml_cuda_q8c_resid(cgraph->nodes[i], cuda_ctx->stream());
+                     continue;
+                 }
+ #ifndef NDEBUG
+@@ -3921,6 +3933,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  #endif  // NDEBUG
  
                  bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
@@ -46,7 +64,7 @@ index 0878ab9..b3411b3 100644
                  if (!ok) {
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
-@@ -3967,6 +3976,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -3967,6 +3980,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }
@@ -160,14 +178,15 @@ index e18ada5..baecc74 100644
  void ggml_cuda_op_mul_mat_vec_q(
 diff --git a/ggml/src/ggml-cuda/q8canon.cu b/ggml/src/ggml-cuda/q8canon.cu
 new file mode 100644
-index 0000000..4324d1c
+index 0000000..c2407f1
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/q8canon.cu
-@@ -0,0 +1,785 @@
+@@ -0,0 +1,923 @@
 +#include "q8canon.cuh"
 +
 +#include "ggml.h"
 +
++#include <algorithm>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
@@ -183,6 +202,7 @@ index 0000000..4324d1c
 +#define Q8C_MAX_SCHUNKS  262144
 +#define Q8C_CAP_BYTES    (1u << 22)
 +#define Q8C_MAX_DEVICES  16
++#define Q8C_MAX_CAPS     32
 +#define Q8C_NONE         0xFFFFFFFFu
 +
 +#define B3_CHUNK_START 1u
@@ -200,13 +220,12 @@ index 0000000..4324d1c
 +__device__ uint32_t   q8c_overflow = 0;
 +__device__ uint32_t (*q8c_leaves)[8] = nullptr;
 +__device__ uint32_t * q8c_ubatch   = nullptr;
-+__device__ uint32_t   q8c_cap_pos    = Q8C_NONE;
-+__device__ uint32_t   q8c_cap_leaf_x = Q8C_NONE;
-+__device__ uint32_t   q8c_cap_leaf_y = Q8C_NONE;
-+__device__ uint32_t   q8c_cap_x_len  = 0;
-+__device__ uint32_t   q8c_cap_y_len  = 0;
-+__device__ uint8_t *  q8c_cap_x      = nullptr;
-+__device__ uint8_t *  q8c_cap_y      = nullptr;
++__device__ uint32_t   q8c_cap_n    = 0;
++__device__ uint32_t   q8c_cap_slot = 0;
++__device__ uint32_t   q8c_cap_pos[Q8C_MAX_CAPS];
++__device__ uint32_t   q8c_cap_leaf[Q8C_MAX_CAPS];
++__device__ uint32_t   q8c_cap_len[Q8C_MAX_CAPS];
++__device__ uint8_t *  q8c_cap_buf  = nullptr;
 +__device__ uint32_t   q8c_cvs[Q8C_MAX_SCHUNKS][8];
 +
 +static __device__ __forceinline__ uint32_t q8c_rotr(uint32_t x, int n) {
@@ -368,23 +387,18 @@ index 0000000..4324d1c
 +}
 +
 +static __device__ void q8c_capture(uint32_t pos, int leaf_a, int leaf_b, const q8c_cursor & cur, uint32_t row_bytes) {
-+    if (pos != q8c_cap_pos) {
-+        return;
-+    }
-+    const bool cx = (leaf_a >= 0 && (uint32_t) leaf_a == q8c_cap_leaf_x) || (leaf_b >= 0 && (uint32_t) leaf_b == q8c_cap_leaf_x);
-+    const bool cy = leaf_a >= 0 && (uint32_t) leaf_a == q8c_cap_leaf_y;
-+    if (!(cx || cy) || row_bytes > Q8C_CAP_BYTES) {
-+        return;
-+    }
-+    uint32_t * dst = (uint32_t *) (cx ? q8c_cap_x : q8c_cap_y);
-+    for (uint32_t i = threadIdx.x; i < row_bytes / 4; i += blockDim.x) {
-+        dst[i] = cur.word(4*i);
-+    }
-+    if (threadIdx.x == 0) {
-+        if (cx) {
-+            q8c_cap_x_len = row_bytes;
-+        } else {
-+            q8c_cap_y_len = row_bytes;
++    for (uint32_t k = 0; k < q8c_cap_n; ++k) {
++        const uint32_t l = q8c_cap_leaf[k];
++        const bool hit = (leaf_a >= 0 && (uint32_t) leaf_a == l) || (leaf_b >= 0 && (uint32_t) leaf_b == l);
++        if (q8c_cap_pos[k] != pos || !hit || row_bytes > q8c_cap_slot) {
++            continue;
++        }
++        uint32_t * dst = (uint32_t *) (q8c_cap_buf + (uint64_t) k*q8c_cap_slot);
++        for (uint32_t i = threadIdx.x; i < row_bytes / 4; i += blockDim.x) {
++            dst[i] = cur.word(4*i);
++        }
++        if (threadIdx.x == 0) {
++            q8c_cap_len[k] = row_bytes;
 +        }
 +    }
 +}
@@ -509,13 +523,17 @@ index 0000000..4324d1c
 +    std::unordered_map<std::string, int> rank;
 +    std::vector<q8c_product> prod;
 +    uint32_t n_products = 0;
++    uint32_t n_layers   = 0;
++    uint32_t n_router   = 0;
 +    uint32_t nl         = 0;
 +    uint32_t max_pos    = 0;
 +    uint8_t * stage     = nullptr;
 +    void *    h_leaves  = nullptr;
 +    void *    h_ubatch  = nullptr;
-+    uint8_t * cap_x     = nullptr;
-+    uint8_t * cap_y     = nullptr;
++    uint8_t * cap_buf   = nullptr;
++    size_t    cap_bytes = 0;
++    uint32_t  cap_n     = 0;
++    uint32_t  cap_slot  = 0;
 +    std::unordered_map<const void *, q8c_graph> graphs;
 +    q8c_graph * cur = nullptr;
 +    uint64_t    off = 0;
@@ -549,15 +567,18 @@ index 0000000..4324d1c
 +};
 +
 +static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
-+    if (len < 16 || memcmp(b, "KXMANIF1", 8) != 0) {
++    if (len < 16 || (memcmp(b, "KXMANIF1", 8) != 0 && memcmp(b, "KXMANIF2", 8) != 0)) {
 +        return false;
 +    }
++    const bool chain = b[7] == '2';
 +    uint32_t n_entries, n_products;
 +    memcpy(&n_entries, &b[8], 4);
 +    memcpy(&n_products, &b[12], 4);
 +    if (n_products == 0 || n_products > n_entries) {
 +        return false;
 +    }
++    uint32_t n_layers = 0;
++    bool moe = false;
 +    size_t o = 16;
 +    for (uint32_t i = 0; i < n_entries; ++i) {
 +        if (o + 2 > len) {
@@ -578,9 +599,31 @@ index 0000000..4324d1c
 +            s.prod.push_back({ form, bias == Q8C_NONE ? -1 : (int) bias, role == 2 });
 +        }
 +        o += 2 + nl + 55;
++        if (chain) {
++            if (o >= len) {
++                return false;
++            }
++            const uint8_t tag = b[o];
++            const size_t ext = tag == 0 ? 1 : tag == 1 ? 14 : tag == 2 ? 25 : tag == 3 ? 49 : 0;
++            if (ext == 0 || o + ext > len) {
++                return false;
++            }
++            if (tag >= 2) {
++                uint32_t layer;
++                memcpy(&layer, &b[o + 1], 4);
++                if (layer != n_layers) {
++                    return false;
++                }
++                n_layers++;
++                moe = moe || tag == 3;
++            }
++            o += ext;
++        }
 +    }
 +    s.n_products = n_products;
-+    s.nl = 2*n_products + 1;
++    s.n_layers   = n_layers;
++    s.n_router   = moe ? n_layers : 0;
++    s.nl = 2*n_products + 2*n_layers + s.n_router + 1;
 +    return true;
 +}
 +
@@ -594,11 +637,8 @@ index 0000000..4324d1c
 +    if (s.stage) {
 +        cudaFree(s.stage);
 +    }
-+    if (s.cap_x) {
-+        cudaFree(s.cap_x);
-+    }
-+    if (s.cap_y) {
-+        cudaFree(s.cap_y);
++    if (s.cap_buf) {
++        cudaFree(s.cap_buf);
 +    }
 +    if (s.h_leaves) {
 +        cudaFreeHost(s.h_leaves);
@@ -615,10 +655,10 @@ index 0000000..4324d1c
 +        cudaHostGetDevicePointer(&d_ubatch, s.h_ubatch, 0) != cudaSuccess) {
 +        return -3;
 +    }
++    const uint32_t zero = 0;
 +    if (cudaMemcpyToSymbol(q8c_leaves, &d_leaves, sizeof(d_leaves)) != cudaSuccess ||
 +        cudaMemcpyToSymbol(q8c_ubatch, &d_ubatch, sizeof(d_ubatch)) != cudaSuccess ||
-+        cudaMemcpyToSymbol(q8c_cap_x, &s.cap_x, sizeof(s.cap_x)) != cudaSuccess ||
-+        cudaMemcpyToSymbol(q8c_cap_y, &s.cap_y, sizeof(s.cap_y)) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_n, &zero, 4) != cudaSuccess ||
 +        cudaMemcpyToSymbol(q8c_nl, &s.nl, 4) != cudaSuccess ||
 +        cudaMemcpyToSymbol(q8c_max_pos, &s.max_pos, 4) != cudaSuccess) {
 +        return -3;
@@ -646,8 +686,6 @@ index 0000000..4324d1c
 +    const size_t leaves_bytes = (size_t) max_pos*s.nl*32;
 +    if (cudaHostAlloc(&s.h_leaves, leaves_bytes, cudaHostAllocMapped) != cudaSuccess ||
 +        cudaHostAlloc(&s.h_ubatch, (size_t) max_pos*4, cudaHostAllocMapped) != cudaSuccess ||
-+        cudaMalloc((void **) &s.cap_x, Q8C_CAP_BYTES) != cudaSuccess ||
-+        cudaMalloc((void **) &s.cap_y, Q8C_CAP_BYTES) != cudaSuccess ||
 +        cudaMalloc((void **) &s.stage, Q8C_STAGE_BYTES) != cudaSuccess) {
 +        q8c_free_dev(s);
 +        return -3;
@@ -726,7 +764,7 @@ index 0000000..4324d1c
 +}
 +
 +static void q8c_note_tokens(q8c_dev & s, int leaf_a, int64_t nrows) {
-+    if (s.cur && s.cur->n_tokens == 0 && leaf_a >= 0 && leaf_a % 2 == 0) {
++    if (s.cur && s.cur->n_tokens == 0 && leaf_a >= 0 && leaf_a % 2 == 0 && (uint32_t) leaf_a < 2*s.n_products) {
 +        s.cur->n_tokens = (uint32_t) nrows;
 +    }
 +}
@@ -781,8 +819,54 @@ index 0000000..4324d1c
 +    ggml_cuda_q8c_rows(data, Q8C_ROWS, nrows, row_bytes, 0, leaf, -1, row_shift, stream);
 +}
 +
++// Residual leaf of a layer-stream node named `<kind>-<layer>`, or -1.
++static int q8c_resid_leaf(const q8c_dev & s, const char * name) {
++    const char * dash = strrchr(name, '-');
++    if (s.n_layers == 0 || !dash || dash[1] < '0' || dash[1] > '9') {
++        return -1;
++    }
++    char * end = nullptr;
++    const unsigned long il = strtoul(dash + 1, &end, 10);
++    if (*end != '\0' || il >= s.n_layers) {
++        return -1;
++    }
++    const size_t n = (size_t) (dash - name);
++    auto is = [&](const char * k) { return strlen(k) == n && strncmp(name, k, n) == 0; };
++    const int base = (int) (2*s.n_products + 2*il);
++    if (is("l_out")) {
++        return base + 1;
++    }
++    if (is("attn_residual") || is("ffn_inp") || is("attn_out")) {
++        return base;
++    }
++    return -1;
++}
++
++bool ggml_cuda_q8c_is_resid(const ggml_tensor * node) {
++    const q8c_dev * s = q8c_current();
++    return s && s->on && q8c_resid_leaf(*s, node->name) >= 0;
++}
++
++bool ggml_cuda_q8c_resid(const ggml_tensor * node, cudaStream_t stream) {
++    q8c_dev * s = q8c_current();
++    if (!s || !s->on) {
++        return false;
++    }
++    const int leaf = q8c_resid_leaf(*s, node->name);
++    if (leaf < 0) {
++        return false;
++    }
++    if (!ggml_is_contiguous(node) || node->type != GGML_TYPE_F32) {
++        return true;
++    }
++    const int64_t nrows = ggml_nrows(node);
++    const int shift = s->cur && (int64_t) s->cur->n_tokens > nrows ? (int) (s->cur->n_tokens - nrows) : 0;
++    ggml_cuda_q8c_out(node->data, nrows, node->ne[0]*sizeof(float), leaf, shift, nrows <= 8, stream);
++    return true;
++}
++
 +void ggml_cuda_q8c_node(const ggml_tensor * node, cudaStream_t stream) {
-+    if (!ggml_cuda_q8c_enabled() || !ggml_is_contiguous(node) || node->type != GGML_TYPE_F32) {
++    if (!ggml_cuda_q8c_enabled() || ggml_cuda_q8c_resid(node, stream) || !ggml_is_contiguous(node) || node->type != GGML_TYPE_F32) {
 +        return;
 +    }
 +    const ggml_tensor * mm = node->src[0];
@@ -855,39 +939,67 @@ index 0000000..4324d1c
 +        return -2;
 +    }
 +    q8c_dev & s = q8c_devs[device];
-+    const uint32_t zero = 0, none = Q8C_NONE;
++    const uint32_t zero = 0;
 +    cudaDeviceSynchronize();
 +    memset(s.h_leaves, 0, (size_t) s.max_pos*s.nl*32);
 +    memset(s.h_ubatch, 0, (size_t) s.max_pos*4);
 +    s.short_of_stage = false;
++    s.cap_n = 0;
 +    if (cudaMemcpyToSymbol(q8c_pos_base, &zero, 4) != cudaSuccess ||
 +        cudaMemcpyToSymbol(q8c_overflow, &zero, 4) != cudaSuccess ||
-+        cudaMemcpyToSymbol(q8c_cap_pos, &none, 4) != cudaSuccess ||
-+        cudaMemcpyToSymbol(q8c_cap_x_len, &zero, 4) != cudaSuccess ||
-+        cudaMemcpyToSymbol(q8c_cap_y_len, &zero, 4) != cudaSuccess) {
++        cudaMemcpyToSymbol(q8c_cap_n, &zero, 4) != cudaSuccess) {
 +        return -3;
 +    }
 +    return 0;
 +}
 +
-+extern "C" int ggml_cuda_q8c_arm_capture(int device, uint32_t pos, uint32_t leaf_x, uint32_t leaf_y) {
-+    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on) {
++extern "C" int ggml_cuda_q8c_arm_captures(int device, const uint32_t * pos, const uint32_t * leaf, uint32_t n,
++                                          uint32_t slot_bytes) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on || !pos || !leaf || n == 0 ||
++        n > Q8C_MAX_CAPS || slot_bytes == 0 || slot_bytes > Q8C_CAP_BYTES || slot_bytes % 4 != 0) {
 +        return -1;
 +    }
 +    q8c_scoped_device sd(device);
 +    if (!sd.ok) {
 +        return -2;
 +    }
++    q8c_dev & s = q8c_devs[device];
 +    const uint32_t zero = 0;
++    const uint32_t lens[Q8C_MAX_CAPS] = {};
 +    cudaDeviceSynchronize();
-+    if (cudaMemcpyToSymbol(q8c_cap_pos, &pos, 4) != cudaSuccess ||
-+        cudaMemcpyToSymbol(q8c_cap_leaf_x, &leaf_x, 4) != cudaSuccess ||
-+        cudaMemcpyToSymbol(q8c_cap_leaf_y, &leaf_y, 4) != cudaSuccess ||
-+        cudaMemcpyToSymbol(q8c_cap_x_len, &zero, 4) != cudaSuccess ||
-+        cudaMemcpyToSymbol(q8c_cap_y_len, &zero, 4) != cudaSuccess) {
++    s.cap_n = 0;
++    if (cudaMemcpyToSymbol(q8c_cap_n, &zero, 4) != cudaSuccess) {
 +        return -3;
 +    }
++    const size_t need = (size_t) n*slot_bytes;
++    if (s.cap_bytes < need) {
++        if (s.cap_buf) {
++            cudaFree(s.cap_buf);
++        }
++        s.cap_buf   = nullptr;
++        s.cap_bytes = 0;
++        if (cudaMalloc((void **) &s.cap_buf, need) != cudaSuccess) {
++            s.cap_buf = nullptr;
++            return -3;
++        }
++        s.cap_bytes = need;
++    }
++    if (cudaMemcpyToSymbol(q8c_cap_buf, &s.cap_buf, sizeof(s.cap_buf)) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_slot, &slot_bytes, 4) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_pos, pos, (size_t) n*4) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_leaf, leaf, (size_t) n*4) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_len, lens, sizeof(lens)) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_n, &n, 4) != cudaSuccess) {
++        return -3;
++    }
++    s.cap_n    = n;
++    s.cap_slot = slot_bytes;
 +    return 0;
++}
++
++extern "C" int ggml_cuda_q8c_arm_capture(int device, uint32_t pos, uint32_t leaf_x, uint32_t leaf_y) {
++    const uint32_t p[2] = { pos, pos }, l[2] = { leaf_x, leaf_y };
++    return ggml_cuda_q8c_arm_captures(device, p, l, 2, Q8C_CAP_BYTES);
 +}
 +
 +extern "C" int ggml_cuda_q8c_read(int device, uint8_t * leaves, size_t leaves_cap, uint32_t * ubatch, size_t ubatch_cap,
@@ -921,9 +1033,10 @@ index 0000000..4324d1c
 +    return 0;
 +}
 +
-+extern "C" int ggml_cuda_q8c_read_capture(int device, uint8_t * x, size_t x_cap, uint8_t * y, size_t y_cap,
-+                                          uint32_t * x_len, uint32_t * y_len) {
-+    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on || !x || !y || !x_len || !y_len) {
++// Copies the armed captures into `outs[k]` (capacity `caps[k]`), sets `lens[k]`, then disarms
++// and frees the capture buffer.
++static int q8c_take_captures(int device, uint8_t * const * outs, const size_t * caps, uint32_t * lens, uint32_t n) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on || !outs || !caps || !lens) {
 +        return -1;
 +    }
 +    q8c_scoped_device sd(device);
@@ -931,30 +1044,73 @@ index 0000000..4324d1c
 +        return -2;
 +    }
 +    q8c_dev & s = q8c_devs[device];
++    if (n == 0 || n != s.cap_n) {
++        return -1;
++    }
 +    cudaDeviceSynchronize();
-+    uint32_t xl = 0, yl = 0;
-+    if (cudaMemcpyFromSymbol(&xl, q8c_cap_x_len, 4) != cudaSuccess || cudaMemcpyFromSymbol(&yl, q8c_cap_y_len, 4) != cudaSuccess) {
++    uint32_t got[Q8C_MAX_CAPS] = {};
++    if (cudaMemcpyFromSymbol(got, q8c_cap_len, (size_t) n*4) != cudaSuccess) {
 +        return -3;
 +    }
-+    *x_len = xl;
-+    *y_len = yl;
-+    if (xl == 0 || yl == 0) {
-+        return -7;
++    int rc = 0;
++    for (uint32_t k = 0; k < n; ++k) {
++        lens[k] = got[k];
++        if (got[k] == 0) {
++            rc = rc ? rc : -7;
++        } else if (!outs[k] || caps[k] < got[k]) {
++            rc = rc ? rc : -6;
++        }
 +    }
-+    if (x_cap < xl || y_cap < yl) {
-+        return -6;
++    for (uint32_t k = 0; rc == 0 && k < n; ++k) {
++        if (cudaMemcpy(outs[k], s.cap_buf + (size_t) k*s.cap_slot, got[k], cudaMemcpyDeviceToHost) != cudaSuccess) {
++            rc = -3;
++        }
 +    }
-+    if (cudaMemcpy(x, s.cap_x, xl, cudaMemcpyDeviceToHost) != cudaSuccess || cudaMemcpy(y, s.cap_y, yl, cudaMemcpyDeviceToHost) != cudaSuccess) {
-+        return -3;
++    const uint32_t zero = 0;
++    cudaMemcpyToSymbol(q8c_cap_n, &zero, 4);
++    s.cap_n = 0;
++    if (s.cap_buf) {
++        cudaFree(s.cap_buf);
 +    }
-+    return 0;
++    s.cap_buf   = nullptr;
++    s.cap_bytes = 0;
++    return rc;
++}
++
++extern "C" int ggml_cuda_q8c_read_captures(int device, uint8_t * out, size_t out_cap, uint32_t * lens, uint32_t n) {
++    if (!out || !lens || n == 0 || n > Q8C_MAX_CAPS || device < 0 || device >= Q8C_MAX_DEVICES) {
++        return -1;
++    }
++    const size_t slot = q8c_devs[device].cap_slot;
++    uint8_t * outs[Q8C_MAX_CAPS];
++    size_t    caps[Q8C_MAX_CAPS];
++    for (uint32_t k = 0; k < n; ++k) {
++        const size_t off = (size_t) k*slot;
++        outs[k] = off < out_cap ? out + off : nullptr;
++        caps[k] = off < out_cap ? std::min(slot, out_cap - off) : 0;
++    }
++    return q8c_take_captures(device, outs, caps, lens, n);
++}
++
++extern "C" int ggml_cuda_q8c_read_capture(int device, uint8_t * x, size_t x_cap, uint8_t * y, size_t y_cap,
++                                          uint32_t * x_len, uint32_t * y_len) {
++    if (!x || !y || !x_len || !y_len) {
++        return -1;
++    }
++    uint8_t * outs[2] = { x, y };
++    const size_t caps[2] = { x_cap, y_cap };
++    uint32_t lens[2] = { 0, 0 };
++    const int rc = q8c_take_captures(device, outs, caps, lens, 2);
++    *x_len = lens[0];
++    *y_len = lens[1];
++    return rc;
 +}
 diff --git a/ggml/src/ggml-cuda/q8canon.cuh b/ggml/src/ggml-cuda/q8canon.cuh
 new file mode 100644
-index 0000000..d563736
+index 0000000..cf2f966
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/q8canon.cuh
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,49 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -964,7 +1120,8 @@ index 0000000..d563736
 +struct ggml_tensor;
 +
 +// Canonical trace leaves of verifiable inference: BLAKE3 of the Q8_1 input rows and of the
-+// output rows of every manifest product, written per position into host-mapped memory.
++// output rows of every manifest product, and of the layer residual rows, written per position
++// into host-mapped memory.
 +
 +enum q8c_kind {
 +    Q8C_ROWS = 0,
@@ -983,6 +1140,8 @@ index 0000000..d563736
 +void   ggml_cuda_q8c_out(const void * data, int64_t nrows, int64_t row_bytes, int leaf, int row_shift, bool stage,
 +                         cudaStream_t stream);
 +void   ggml_cuda_q8c_node(const ggml_tensor * node, cudaStream_t stream);
++bool   ggml_cuda_q8c_is_resid(const ggml_tensor * node);
++bool   ggml_cuda_q8c_resid(const ggml_tensor * node, cudaStream_t stream);
 +void   ggml_cuda_q8c_commit(const void * graph_key, cudaStream_t stream);
 +
 +// Control (any device). Every call returns 0 on success and a negative value otherwise.
@@ -992,6 +1151,10 @@ index 0000000..d563736
 +    int  ggml_cuda_q8c_leaf_count(int device);
 +    int  ggml_cuda_q8c_begin_response(int device);
 +    int  ggml_cuda_q8c_arm_capture(int device, uint32_t pos, uint32_t leaf_x, uint32_t leaf_y);
++    // Up to 32 (position, leaf) captures of at most `slot_bytes` each; read back slot-strided.
++    int  ggml_cuda_q8c_arm_captures(int device, const uint32_t * pos, const uint32_t * leaf, uint32_t n,
++                                    uint32_t slot_bytes);
++    int  ggml_cuda_q8c_read_captures(int device, uint8_t * out, size_t out_cap, uint32_t * lens, uint32_t n);
 +    int  ggml_cuda_q8c_read(int device, uint8_t * leaves, size_t leaves_cap, uint32_t * ubatch, size_t ubatch_cap,
 +                            uint32_t * n_pos);
 +    int  ggml_cuda_q8c_read_capture(int device, uint8_t * x, size_t x_cap, uint8_t * y, size_t y_cap,

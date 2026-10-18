@@ -266,6 +266,8 @@ int  ggml_cuda_q8c_begin_response(int device);
 int  ggml_cuda_q8c_arm_capture(int device, uint32_t pos, uint32_t leaf_x, uint32_t leaf_y);
 int  ggml_cuda_q8c_read(int device, uint8_t* leaves, size_t leaves_cap, uint32_t* ubatch, size_t ubatch_cap, uint32_t* n_pos);
 int  ggml_cuda_q8c_read_capture(int device, uint8_t* x, size_t x_cap, uint8_t* y, size_t y_cap, uint32_t* x_len, uint32_t* y_len);
+int  ggml_cuda_q8c_arm_captures(int device, const uint32_t* pos, const uint32_t* leaf, uint32_t n, uint32_t slot_bytes);
+int  ggml_cuda_q8c_read_captures(int device, uint8_t* out, size_t out_cap, uint32_t* lens, uint32_t n);
 }
 #endif
 
@@ -410,7 +412,7 @@ static int keryx_trace_reset(KeryxLlama* h) {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 6; }
+KERYX_EXPORT int keryx_llama_abi() { return 7; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -732,6 +734,33 @@ KERYX_EXPORT int keryx_llama_trace_read(KeryxLlama* h, uint8_t* leaves, size_t l
 #endif
 }
 
+#ifndef __APPLE__
+// Feeds `tokens` up to position `pos` with the batching of the original run. The caller holds
+// `gen_lock` and has armed the captures.
+static int keryx_replay_to(KeryxLlama* h, const int32_t* tokens, int n_prompt, uint32_t pos) {
+    const int n_batch = std::max(1, (int)llama_n_batch(h->ctx));
+    llama_token* toks = const_cast<llama_token*>(tokens);
+    // The prompt is fed in the same n_batch chunks as the original run, up to the chunk holding `pos`.
+    const int prompt_end = pos < (uint32_t)n_prompt ? std::min(n_prompt, ((int)pos / n_batch + 1) * n_batch) : n_prompt;
+    for (int i = 0; i < prompt_end; i += n_batch) {
+        llama_batch batch = llama_batch_get_one(toks + i, std::min(n_batch, prompt_end - i));
+        if (llama_decode(h->ctx, batch) != 0) return -3;
+    }
+    for (int i = n_prompt; pos >= (uint32_t)n_prompt && i <= (int)pos; i++) {
+        llama_batch batch = llama_batch_get_one(toks + i, 1);
+        if (llama_decode(h->ctx, batch) != 0) return -3;
+    }
+    return 0;
+}
+
+static int keryx_replay_begin(KeryxLlama* h, int n_tokens) {
+    if (n_tokens > (int)llama_n_ctx(h->ctx)) return -2;
+    llama_memory_clear(llama_get_memory(h->ctx), true);
+    llama_sampler_reset(h->smpl);
+    return ggml_cuda_q8c_begin_response(h->gpu) != 0 ? -5 : 0;
+}
+#endif
+
 // Replays the fed token sequence of a traced response up to position `pos` with the same batching
 // and copies the bytes of leaves `leaf_x` and `leaf_y` at that position. Returns 0 on success,
 // -1 (arguments), -2 (context), -3 (decode), -5 (trace), -6 (buffers), -7 (nothing captured).
@@ -746,23 +775,39 @@ KERYX_EXPORT int keryx_llama_replay(KeryxLlama* h, const int32_t* tokens, int n_
     if (!h || !h->traced || !tokens || n_prompt <= 0 || n_tokens < n_prompt || pos >= (uint32_t)n_tokens ||
         !x || !y || !x_len || !y_len) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
-    if (n_tokens > (int)llama_n_ctx(h->ctx)) return -2;
-    llama_memory_clear(llama_get_memory(h->ctx), true);
-    llama_sampler_reset(h->smpl);
-    if (ggml_cuda_q8c_begin_response(h->gpu) != 0 || ggml_cuda_q8c_arm_capture(h->gpu, pos, leaf_x, leaf_y) != 0) return -5;
-    const int n_batch = std::max(1, (int)llama_n_batch(h->ctx));
-    llama_token* toks = const_cast<llama_token*>(tokens);
-    // The prompt is fed in the same n_batch chunks as the original run, up to the chunk holding `pos`.
-    const int prompt_end = pos < (uint32_t)n_prompt ? std::min(n_prompt, ((int)pos / n_batch + 1) * n_batch) : n_prompt;
-    for (int i = 0; i < prompt_end; i += n_batch) {
-        llama_batch batch = llama_batch_get_one(toks + i, std::min(n_batch, prompt_end - i));
-        if (llama_decode(h->ctx, batch) != 0) return -3;
-    }
-    for (int i = n_prompt; pos >= (uint32_t)n_prompt && i <= (int)pos; i++) {
-        llama_batch batch = llama_batch_get_one(toks + i, 1);
-        if (llama_decode(h->ctx, batch) != 0) return -3;
-    }
+    int rc = keryx_replay_begin(h, n_tokens);
+    if (rc != 0) return rc;
+    if (ggml_cuda_q8c_arm_capture(h->gpu, pos, leaf_x, leaf_y) != 0) return -5;
+    rc = keryx_replay_to(h, tokens, n_prompt, pos);
+    if (rc != 0) return rc;
     return ggml_cuda_q8c_read_capture(h->gpu, x, x_cap, y, y_cap, x_len, y_len);
+#endif
+}
+
+// Replays a traced response up to the last of `n` positions and copies leaf `leaf[k]` at
+// position `pos[k]` into `out + k * slot_bytes`, its length into `lens[k]`. Same return codes as
+// keryx_llama_replay.
+KERYX_EXPORT int keryx_llama_replay_multi(KeryxLlama* h, const int32_t* tokens, int n_tokens, int n_prompt,
+                                          const uint32_t* pos, const uint32_t* leaf, uint32_t n, uint32_t slot_bytes,
+                                          uint8_t* out, size_t out_cap, uint32_t* lens) {
+#ifdef __APPLE__
+    (void)h; (void)tokens; (void)n_tokens; (void)n_prompt; (void)pos; (void)leaf; (void)n; (void)slot_bytes;
+    (void)out; (void)out_cap; (void)lens;
+    return -1;
+#else
+    if (!h || !h->traced || !tokens || n_prompt <= 0 || n_tokens < n_prompt || !pos || !leaf || n == 0 || !out || !lens) return -1;
+    uint32_t last = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        if (pos[k] >= (uint32_t)n_tokens) return -1;
+        last = std::max(last, pos[k]);
+    }
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    int rc = keryx_replay_begin(h, n_tokens);
+    if (rc != 0) return rc;
+    if (ggml_cuda_q8c_arm_captures(h->gpu, pos, leaf, n, slot_bytes) != 0) return -5;
+    rc = keryx_replay_to(h, tokens, n_prompt, last);
+    if (rc != 0) return rc;
+    return ggml_cuda_q8c_read_captures(h->gpu, out, out_cap, lens, n);
 #endif
 }
 

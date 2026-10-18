@@ -1613,6 +1613,11 @@ pub fn trace_audit_activation_daa() -> u64 {
     gate(u64::MAX, 240_000)
 }
 
+/// Node `trace_chain_activation`: responses accepted from this DAA commit the stage-2 trace.
+pub fn trace_chain_activation_daa() -> u64 {
+    gate(u64::MAX, u64::MAX)
+}
+
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
 /// A tier POSITION shifts across eras (a lineup insertion renumbers the models below it) while
 /// the model's index bytes are identical — keying by position would strand a built index at a
