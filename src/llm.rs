@@ -1155,6 +1155,63 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: O
     }
 }
 
+/// The block task trace of `tier` for the window seeded by `window_seed`, on the engine hosting
+/// `model_id`. Blocking.
+pub fn run_block_task(model_id: &[u8; 32], tier: u8, window_seed: &[u8; 32]) -> Option<crate::trace::ResponseTrace> {
+    use keryx_verifiable_inference::block_task::{task_tokens, TASK_LEN};
+    let _serving = ServingGuard::new();
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let (gguf, dev_id) = resident_engine(spec)?;
+    if !arm_trace(spec, &gguf, dev_id, tier, true) {
+        return None;
+    }
+    let m = crate::trace::TierManifest::for_chain(tier)?;
+    let (_, pctx) = crate::trace::chain_ctx(tier)?;
+    let tokens: Vec<i32> = task_tokens(&pctx.table, window_seed).into_iter().map(|t| t as i32).collect();
+    let traced = match crate::llama_engine::trace_tokens(&gguf, dev_id as usize, &tokens) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("LlmEngine '{}': block task not traced ({})", spec.name, e);
+            return None;
+        }
+    };
+    let record = crate::trace::TraceRecord::new_chain(&m, TASK_LEN, traced.ubatch, traced.leaves, &tokens);
+    if record.is_none() {
+        log::warn!("LlmEngine '{}': incomplete block task trace", spec.name);
+    }
+    Some(crate::trace::ResponseTrace { record: record?, tokens })
+}
+
+/// The task opening of the block `block_hash` from the task trace of its window, checked as the
+/// node will check it. Blocking.
+pub fn open_block_task(model_id: &[u8; 32], tier: u8, trace: &crate::trace::ResponseTrace, window_seed: &[u8; 32], block_hash: &[u8; 32]) -> Option<Vec<u8>> {
+    use keryx_verifiable_inference::block_task::{draw_seed, task_bytes, task_prefix, verify_block_task};
+    let _serving = ServingGuard::new();
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let (gguf, dev_id) = resident_engine(spec)?;
+    if !arm_trace(spec, &gguf, dev_id, tier, true) {
+        return None;
+    }
+    let index = weight_index(spec, &gguf)?;
+    let m = crate::trace::TierManifest::for_chain(tier)?;
+    let (ctx, pctx) = crate::trace::chain_ctx(tier)?;
+    let body = match open_chain(&gguf, dev_id, &m, &task_prefix(&pctx), trace, &draw_seed(block_hash), &task_bytes(window_seed), [0u8; 32], &index) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("LlmEngine '{}': block task opening failed ({})", spec.name, e);
+            return None;
+        }
+    };
+    let opening = keryx_verifiable_inference::opening::Opening::decode(&body)?;
+    if let Err(e) = verify_block_task(&m.tier_ctx(&index), &ctx, &pctx, &trace.record.trace_root, window_seed, block_hash, &opening) {
+        log::error!("LlmEngine '{}': block task opening fails its self-check ({:?})", spec.name, e);
+        return None;
+    }
+    Some(body)
+}
+
 /// Builds the opening body of an audited response on the GPU that served it: replays the
 /// response to each drawn position and proves the captured bytes against the possession index.
 /// The opening of an audited response: the drawn points and, for a response accepted under the
@@ -1305,6 +1362,28 @@ mod tests {
                 sizes.push(body.len());
             }
             eprintln!("{label}: max body {} B, coverage {:?}", sizes.iter().max().unwrap(), kinds);
+        }
+
+        // Block task: the window trace opens and verifies for several block hashes.
+        use keryx_verifiable_inference::block_task::{draw_seed, task_bytes, task_prefix, task_tokens, verify_block_task, TASK_LEN};
+        let window_seed = [0x5au8; 32];
+        let tokens: Vec<i32> = task_tokens(&pctx.table, &window_seed).into_iter().map(|t| t as i32).collect();
+        let t0 = std::time::Instant::now();
+        let traced = llama_engine::trace_tokens(&gguf, 0, &tokens).unwrap();
+        eprintln!("block task traced in {:.2?}", t0.elapsed());
+        let record = TraceRecord::new_chain(&m, TASK_LEN, traced.ubatch, traced.leaves, &tokens).expect("complete task trace");
+        let task = ResponseTrace { record, tokens };
+        let tp = task_prefix(&pctx);
+        for counter in 0..16u64 {
+            let block_hash = *blake3::hash(&counter.to_le_bytes()).as_bytes();
+            let t0 = std::time::Instant::now();
+            let body = open_chain(&gguf, 0, &m, &tp, &task, &draw_seed(&block_hash), &task_bytes(&window_seed), [0u8; 32], &index)
+                .unwrap_or_else(|e| panic!("task {counter}: {e}"));
+            let took = t0.elapsed();
+            let opening = keryx_verifiable_inference::opening::Opening::decode(&body).unwrap();
+            verify_block_task(&tier_ctx, &ctx, &pctx, &task.record.trace_root, &window_seed, &block_hash, &opening)
+                .unwrap_or_else(|e| panic!("task {counter}: {e:?}"));
+            eprintln!("task {counter}: verified, body {} B, replay+build {:.2?}", body.len(), took);
         }
         llama_engine::unload(0);
     }

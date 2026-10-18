@@ -13,6 +13,7 @@ pub mod pom;
 pub mod pom_gpu;
 pub mod pom_v3;
 pub mod pom_v4;
+pub mod block_task;
 pub mod trace;
 pub mod trace_store;
 pub mod llm;

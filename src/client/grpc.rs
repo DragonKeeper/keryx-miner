@@ -26,6 +26,70 @@ pub async fn query_virtual_daa(address: String) -> Option<u64> {
     None
 }
 
+/// Selected-parent chain entries seen while resolving block task seeds: `(daa_score, selected
+/// parent, blue_work)` by block hash.
+type ChainCache = std::collections::HashMap<String, (u64, String, String)>;
+
+async fn chain_entry(
+    tx: &mpsc::Sender<KaspadMessage>,
+    stream: &mut Streaming<KaspadMessage>,
+    cache: &mut ChainCache,
+    hash: &str,
+) -> Option<(u64, String, String)> {
+    if let Some(e) = cache.get(hash) {
+        return Some(e.clone());
+    }
+    tx.send(GetBlockRequestMessage { hash: hash.to_string(), include_transactions: false }.into()).await.ok()?;
+    while let Ok(Some(msg)) = stream.message().await {
+        if let Some(Payload::GetBlockResponse(resp)) = msg.payload {
+            if resp.error.is_some() {
+                return None;
+            }
+            let block = resp.block?;
+            let (header, verbose) = (block.header?, block.verbose_data?);
+            let e = (header.daa_score, verbose.selected_parent_hash, header.blue_work);
+            cache.insert(hash.to_string(), e.clone());
+            return Some(e);
+        }
+    }
+    None
+}
+
+fn blue_work_key(w: &str) -> (usize, String) {
+    let w = w.trim_start_matches('0').to_ascii_lowercase();
+    (w.len(), w)
+}
+
+/// Seed block of the task window starting at `start` for a block over `parents`: its selected
+/// parent's chain walked back to the first block whose DAA score is at most `start`.
+async fn task_window_seed(client: &RpcClient<TonicChannel>, parents: &[String], start: u64, cache: &mut ChainCache) -> Option<[u8; 32]> {
+    let mut client = client.clone();
+    let (tx, rx) = mpsc::channel(4);
+    let mut stream = client.message_stream(ReceiverStream::new(rx)).await.ok()?.into_inner();
+    let mut best: Option<((usize, String), String)> = None;
+    for p in parents {
+        let (_, _, work) = chain_entry(&tx, &mut stream, cache, p).await?;
+        let cand = (blue_work_key(&work), p.to_ascii_lowercase());
+        if best.as_ref().is_none_or(|b| cand > *b) {
+            best = Some(cand);
+        }
+    }
+    let mut cur = best?.1;
+    for _ in 0..4096 {
+        let (daa, selected_parent, _) = chain_entry(&tx, &mut stream, cache, &cur).await?;
+        if daa <= start {
+            let mut seed = [0u8; 32];
+            hex::decode_to_slice(&cur, &mut seed).ok()?;
+            return Some(seed);
+        }
+        if selected_parent.is_empty() {
+            return None;
+        }
+        cur = selected_parent;
+    }
+    None
+}
+
 /// Max AiRequest queue size — drop oldest when full to prevent unbounded memory growth.
 const MAX_AI_QUEUE_SIZE: usize = 64;
 /// Max boot-time escrow-validation GetBlock requests in flight at once — each answer
@@ -186,6 +250,7 @@ type BlockHandle = JoinHandle<Result<(), PollSendError<KaspadMessage>>>;
 #[allow(dead_code)]
 pub struct KeryxdHandler {
     client: RpcClient<TonicChannel>,
+    task_chain: ChainCache,
     pub send_channel: Sender<KaspadMessage>,
     stream: Streaming<KaspadMessage>,
     miner_address: String,
@@ -422,6 +487,7 @@ impl KeryxdHandler {
         let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone(), Arc::clone(&pending_block_submissions));
         Ok(Box::new(Self {
             client,
+            task_chain: ChainCache::new(),
             stream,
             send_channel,
             miner_address,
@@ -844,6 +910,28 @@ impl KeryxdHandler {
                 let _ = tx_done.send(result);
             });
             self.inference_rx = Some(job);
+        }
+    }
+
+    /// Records the seed block of the block task window of a template, once per window.
+    async fn resolve_task_seed(&mut self, header: &crate::proto::RpcBlockHeader) {
+        use keryx_verifiable_inference::block_task::{window, window_start};
+        if !keryx_miner::block_task::active(header.daa_score) {
+            return;
+        }
+        let Some(w) = window(header.daa_score) else { return };
+        if keryx_miner::block_task::seed(w).is_some() {
+            return;
+        }
+        let Some(parents) = header.parents.first().map(|p| p.parent_hashes.clone()) else { return };
+        if self.task_chain.len() > 4096 {
+            self.task_chain.clear();
+        }
+        let lookup = task_window_seed(&self.client, &parents, window_start(w), &mut self.task_chain);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
+            Ok(Some(seed)) => keryx_miner::block_task::set_seed(w, seed),
+            Ok(None) => warn!("Block task: no seed block found for window {}", w),
+            Err(_) => warn!("Block task: seed lookup for window {} timed out", w),
         }
     }
 
@@ -1647,6 +1735,9 @@ impl KeryxdHandler {
                 }
                 // Past this point any pause comes from the node, not from us.
                 self.set_opoi_pause(false);
+                if let Some(header) = template.block.as_ref().and_then(|b| b.header.as_ref()) {
+                    self.resolve_task_seed(header).await;
+                }
                 match (template.block, template.is_synced, template.error) {
                     (Some(b), true, None) => miner.process_block(Some(FullBlock {
                         block: Box::new(b),

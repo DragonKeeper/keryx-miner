@@ -693,6 +693,28 @@ KERYX_EXPORT int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, 
     return written;
 }
 
+// Traced evaluation of `tokens` as a prompt with nothing generated; the trace is read with
+// keryx_llama_trace_read. Returns 0 on success, -1 (arguments), -2 (context), -3 (decode),
+// -5 (trace).
+KERYX_EXPORT int keryx_llama_trace_tokens(KeryxLlama* h, const int32_t* tokens, int n_tokens) {
+#ifdef __APPLE__
+    (void)h; (void)tokens; (void)n_tokens;
+    return -1;
+#else
+    if (!h || !h->traced || !tokens || n_tokens <= 0) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(h->model));
+    for (int i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || tokens[i] >= n_vocab) return -1;
+    }
+    if (n_tokens > (int)llama_n_ctx(h->ctx)) return -2;
+    llama_memory_clear(llama_get_memory(h->ctx), true);
+    llama_sampler_reset(h->smpl);
+    if (keryx_trace_reset(h) != 0) return -5;
+    return keryx_feed_prompt(h, tokens, n_tokens);
+#endif
+}
+
 // Enables the canonical trace on the engine's GPU for the model described by `manifest`
 // (`max_pos` positions per response; the context size when 0). Returns 0 on success.
 KERYX_EXPORT int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest, size_t manifest_len, int max_pos) {

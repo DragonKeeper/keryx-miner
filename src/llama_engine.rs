@@ -63,6 +63,7 @@ type ReplayFn = unsafe extern "C" fn(
     *mut u32,
     *mut u32,
 ) -> c_int;
+type TraceTokensFn = unsafe extern "C" fn(*mut c_void, *const i32, c_int) -> c_int;
 type ReplayMultiFn = unsafe extern "C" fn(
     *mut c_void,
     *const i32,
@@ -137,6 +138,7 @@ struct Engine {
     trace_read: TraceReadFn,
     replay: ReplayFn,
     replay_multi: ReplayMultiFn,
+    trace_tokens: TraceTokensFn,
     free: FreeFn,
     tensor_device: Option<TensorDeviceFn>,
     last_error: Option<ErrorFn>,
@@ -424,13 +426,14 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
         if got != ABI {
             return Err(failed("abi", format!("{} has ABI {}, this miner expects {}", so.display(), got, ABI), false));
         }
-        let (Some(generate_traced), Some(trace_configure), Some(trace_leaf_count), Some(trace_read), Some(replay), Some(replay_multi)) = (
+        let (Some(generate_traced), Some(trace_configure), Some(trace_leaf_count), Some(trace_read), Some(replay), Some(replay_multi), Some(trace_tokens)) = (
             sym::<GenTracedFn>(lib, "keryx_llama_generate_traced"),
             sym::<TraceConfigureFn>(lib, "keryx_llama_trace_configure"),
             sym::<TraceLeafCountFn>(lib, "keryx_llama_trace_leaf_count"),
             sym::<TraceReadFn>(lib, "keryx_llama_trace_read"),
             sym::<ReplayFn>(lib, "keryx_llama_replay"),
             sym::<ReplayMultiFn>(lib, "keryx_llama_replay_multi"),
+            sym::<TraceTokensFn>(lib, "keryx_llama_trace_tokens"),
         ) else {
             return Err(failed("symbols", format!("{} is missing trace symbols", so.display()), false));
         };
@@ -496,6 +499,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             trace_read,
             replay,
             replay_multi,
+            trace_tokens,
             free,
             tensor_device,
             last_error,
@@ -744,6 +748,32 @@ pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, l
     x.truncate(x_len as usize);
     y.truncate(y_len as usize);
     Ok((x, y))
+}
+
+/// A traced evaluation of raw tokens: the batch size and leaves of every position.
+pub struct TracedTokens {
+    pub ubatch: Vec<u32>,
+    pub leaves: Vec<[u8; 32]>,
+}
+
+/// Traces `tokens` fed as a prompt, with nothing generated.
+pub fn trace_tokens(gguf: &str, gpu: usize, tokens: &[i32]) -> Result<TracedTokens, String> {
+    let slot = slot(gpu);
+    let g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_ref().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    let _native = native();
+    let rc = unsafe { (e.trace_tokens)(e.model, tokens.as_ptr(), tokens.len() as c_int) };
+    if rc != 0 {
+        return Err(engine_error(e, &format!("traced evaluation failed ({rc})")));
+    }
+    let mut n_pos: u32 = 0;
+    let mut leaves = vec![[0u8; 32]; tokens.len() * e.trace_leaves];
+    let mut ubatch = vec![0u32; tokens.len()];
+    let rc = unsafe { (e.trace_read)(e.model, leaves.as_mut_ptr() as *mut u8, leaves.len() * 32, ubatch.as_mut_ptr(), ubatch.len(), &mut n_pos) };
+    if rc != 0 || n_pos as usize != tokens.len() {
+        return Err(format!("trace read failed ({rc}), {n_pos} positions traced for {} fed", tokens.len()));
+    }
+    Ok(TracedTokens { ubatch, leaves })
 }
 
 /// Most captures one replay takes.
