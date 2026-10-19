@@ -204,6 +204,16 @@ impl State {
         matches!(*self.block, BlockSeed::PartialBlock { .. })
     }
 
+    /// `block_task::parents_key` of the template's direct parents.
+    pub fn parents_key(&self) -> Option<String> {
+        match &*self.block {
+            BlockSeed::FullBlock { block, .. } => {
+                block.header.as_ref()?.parents.first().map(|p| keryx_miner::block_task::parents_key(&p.parent_hashes))
+            }
+            _ => None,
+        }
+    }
+
     #[inline(always)]
     pub fn check_pow(&self, nonce: u64) -> bool {
         let pow = self.calculate_pow(nonce);

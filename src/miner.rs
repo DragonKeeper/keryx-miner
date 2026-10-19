@@ -424,8 +424,8 @@ impl MinerManager {
                         let daa = state.as_ref().unwrap().daa_score;
                         if keryx_miner::block_task::active(daa) && !state.as_ref().unwrap().is_pool_share() {
                             let s = state.as_ref().unwrap();
-                            let task = keryx_miner::pom_gpu::current_tier(worker_device_id, daa).zip(keryx_miner::pom_gpu::mining_model_id(worker_device_id))
-                                .and_then(|(tier, model_id)| keryx_miner::block_task::task_for(worker_device_id, &model_id, tier, daa));
+                            let task = keryx_miner::pom_gpu::current_tier(worker_device_id, daa).zip(keryx_miner::pom_gpu::mining_model_id(worker_device_id)).zip(s.parents_key())
+                                .and_then(|((tier, model_id), parents)| keryx_miner::block_task::task_for(worker_device_id, &model_id, tier, daa, &parents));
                             match task {
                                 Some(t) if task_state.as_ref().is_some_and(|ts| ts.0 == s.id && ts.1 == t.root()) => {}
                                 Some(t) => match s.with_task_root(&t.root()) {

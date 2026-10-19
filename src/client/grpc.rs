@@ -913,23 +913,24 @@ impl KeryxdHandler {
         }
     }
 
-    /// Records the seed block of the block task window of a template, once per window.
+    /// Records the seed block of the block task window of a template, once per window and parent set.
     async fn resolve_task_seed(&mut self, header: &crate::proto::RpcBlockHeader) {
         use keryx_verifiable_inference::block_task::{window, window_start};
         if !keryx_miner::block_task::active(header.daa_score) {
             return;
         }
         let Some(w) = window(header.daa_score) else { return };
-        if keryx_miner::block_task::seed(w).is_some() {
+        let Some(parents) = header.parents.first().map(|p| p.parent_hashes.clone()) else { return };
+        let key = keryx_miner::block_task::parents_key(&parents);
+        if keryx_miner::block_task::seed(w, &key).is_some() {
             return;
         }
-        let Some(parents) = header.parents.first().map(|p| p.parent_hashes.clone()) else { return };
         if self.task_chain.len() > 4096 {
             self.task_chain.clear();
         }
         let lookup = task_window_seed(&self.client, &parents, window_start(w), &mut self.task_chain);
         match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
-            Ok(Some(seed)) => keryx_miner::block_task::set_seed(w, seed),
+            Ok(Some(seed)) => keryx_miner::block_task::set_seed(w, &key, seed),
             Ok(None) => warn!("Block task: no seed block found for window {}", w),
             Err(_) => warn!("Block task: seed lookup for window {} timed out", w),
         }

@@ -22,49 +22,58 @@ impl DeviceTask {
     }
 }
 
-static SEEDS: Mutex<BTreeMap<u64, [u8; 32]>> = Mutex::new(BTreeMap::new());
-static TASKS: Mutex<BTreeMap<(u32, u64), Arc<DeviceTask>>> = Mutex::new(BTreeMap::new());
-static FAILED: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
+static SEEDS: Mutex<BTreeMap<(u64, String), [u8; 32]>> = Mutex::new(BTreeMap::new());
+static TASKS: Mutex<BTreeMap<(u32, [u8; 32]), Arc<DeviceTask>>> = Mutex::new(BTreeMap::new());
+static FAILED: Mutex<BTreeMap<u32, [u8; 32]>> = Mutex::new(BTreeMap::new());
+
+/// Max windows whose seeds are kept.
+const SEED_WINDOWS: u64 = 4;
 
 /// Whether a block at `daa` carries the task.
 pub fn active(daa: u64) -> bool {
     daa >= crate::pom::block_task_activation_daa()
 }
 
-/// Records the seed block of window `w`.
-pub fn set_seed(w: u64, seed: [u8; 32]) {
+/// Key of a template's direct parents. Two templates of one window may sit on different selected
+/// chains, and so on different seeds.
+pub fn parents_key(parents: &[String]) -> String {
+    let mut p: Vec<String> = parents.iter().map(|h| h.to_ascii_lowercase()).collect();
+    p.sort_unstable();
+    p.join(",")
+}
+
+/// Records the seed block of window `w` for a template over `parents`.
+pub fn set_seed(w: u64, parents: &str, seed: [u8; 32]) {
     let mut s = SEEDS.lock().unwrap_or_else(|p| p.into_inner());
-    s.insert(w, seed);
-    while s.len() > 4 {
-        s.pop_first();
-    }
+    s.insert((w, parents.to_string()), seed);
+    s.retain(|&(sw, _), _| sw + SEED_WINDOWS > w);
 }
 
-pub fn seed(w: u64) -> Option<[u8; 32]> {
-    SEEDS.lock().unwrap_or_else(|p| p.into_inner()).get(&w).copied()
+pub fn seed(w: u64, parents: &str) -> Option<[u8; 32]> {
+    SEEDS.lock().unwrap_or_else(|p| p.into_inner()).get(&(w, parents.to_string())).copied()
 }
 
-/// The task of `device` (mining `model_id` at `tier`) for the window of a block at `daa`, traced on
-/// first use. `None` while the window seed is unknown or the task cannot be traced.
-pub fn task_for(device: u32, model_id: &[u8; 32], tier: u8, daa: u64) -> Option<Arc<DeviceTask>> {
+/// The task of `device` (mining `model_id` at `tier`) for a block at `daa` over `parents`, traced on
+/// first use of its seed. `None` while the seed is unknown or the task cannot be traced.
+pub fn task_for(device: u32, model_id: &[u8; 32], tier: u8, daa: u64, parents: &str) -> Option<Arc<DeviceTask>> {
     let w = window(daa)?;
-    if let Some(t) = TASKS.lock().unwrap_or_else(|p| p.into_inner()).get(&(device, w)) {
+    let seed = seed(w, parents)?;
+    if let Some(t) = TASKS.lock().unwrap_or_else(|p| p.into_inner()).get(&(device, seed)) {
         if t.model_id == *model_id && t.tier == tier {
             return Some(Arc::clone(t));
         }
     }
-    let seed = seed(w)?;
-    if FAILED.lock().unwrap_or_else(|p| p.into_inner()).get(&device) == Some(&w) {
+    if FAILED.lock().unwrap_or_else(|p| p.into_inner()).get(&device) == Some(&seed) {
         return None;
     }
     let Some(trace) = crate::llm::run_block_task(model_id, tier, &seed) else {
-        log::warn!("Block task: gpu{} cannot trace the task of window {} — not mining this window", device, w);
-        FAILED.lock().unwrap_or_else(|p| p.into_inner()).insert(device, w);
+        log::warn!("Block task: gpu{} cannot trace the task of window {} — not mining on this seed", device, w);
+        FAILED.lock().unwrap_or_else(|p| p.into_inner()).insert(device, seed);
         return None;
     };
     let task = Arc::new(DeviceTask { window: w, seed, model_id: *model_id, tier, trace });
     let mut tasks = TASKS.lock().unwrap_or_else(|p| p.into_inner());
-    tasks.retain(|&(d, tw), _| d != device || tw + 1 >= w);
-    tasks.insert((device, w), Arc::clone(&task));
+    tasks.retain(|&(d, _), t| d != device || t.window + 1 >= w);
+    tasks.insert((device, seed), Arc::clone(&task));
     Some(task)
 }
