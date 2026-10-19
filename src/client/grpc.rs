@@ -1417,10 +1417,26 @@ impl KeryxdHandler {
                             warn!("Inference: escrow key gone — private AiResponse skipped");
                             return true;
                         };
-                        keryx_inference::seal_response(&root_key, &request_hash, &pubkey, result.as_bytes())
+                        let plain = match trace.as_ref().filter(|t| t.trace.record.stage == keryx_miner::trace::STAGE_CHAIN) {
+                            Some(t) => {
+                                let ids: Vec<u32> = t.trace.tokens[t.trace.record.n_prompt as usize..].iter().map(|&v| v as u32).collect();
+                                keryx_verifiable_inference::answer::encode(result.as_bytes(), &ids)
+                            }
+                            None => result.clone().into_bytes(),
+                        };
+                        keryx_inference::seal_response(&root_key, &request_hash, &pubkey, &plain)
                     }
                     PrivateRequest::Unreadable => result.clone().into_bytes(),
                 };
+                let cap = if keryx_miner::trace::chain_active(self.last_known_daa) {
+                    keryx_inference::MAX_AI_RESPONSE_PRIVATE_BODY_LEN
+                } else {
+                    keryx_inference::MAX_AI_RESPONSE_PRIVATE_BODY_LEN_H14
+                };
+                if body.len() > cap {
+                    warn!("Inference: sealed answer of {} B exceeds the {} B body limit — AiResponse skipped", body.len(), cap);
+                    return true;
+                }
                 if self.last_known_daa >= keryx_miner::pom::private_inference_activation_daa() {
                     let cid = crate::ipfs::sha256_multihash(&body);
                     self.submit_ai_response(request_hash, &result, cid, Some(body), trace).await;
