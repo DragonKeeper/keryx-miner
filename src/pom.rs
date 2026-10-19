@@ -1533,6 +1533,9 @@ pub fn is_testnet() -> bool {
 
 /// Picks the gate value for the selected network (`--testnet`).
 #[inline(always)]
+/// Testnet H15 gate. MUST equal the node's `TESTNET_H15_ACTIVATION_DAA`.
+const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+
 fn gate(mainnet: u64, testnet: u64) -> u64 {
     if is_testnet() {
         testnet
@@ -1628,7 +1631,7 @@ pub fn pom_v4_activation_daa() -> u64 {
 /// Block task gate: headers carry `task_root`, hashed into the pre-PoW and block hashes.
 /// MUST equal the node's `block_task_activation`.
 pub fn block_task_activation_daa() -> u64 {
-    gate(u64::MAX, u64::MAX)
+    gate(u64::MAX, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// H10 gate: walk-seed switch at/after this score. MUST equal the node's `h10_activation`.
@@ -1648,30 +1651,30 @@ pub fn reward_routing_activation_daa() -> u64 {
 /// before it the sealed body goes to IPFS and the response stays body-less. MUST equal the
 /// node's `private_inference_activation`.
 pub fn private_inference_activation_daa() -> u64 {
-    gate(121_985_000, 6_000)
+    gate(121_985_000, 1)
 }
 
 /// Verifiable-inference gate. At/after this score an AiResponse carries its trace commitment
 /// and the miner opens the points drawn on it. MUST equal the node's
 /// `verifiable_inference_activation`.
 pub fn verifiable_inference_activation_daa() -> u64 {
-    gate(u64::MAX, 200_000)
+    gate(u64::MAX, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// Node `trace_prefix_activation`: responses accepted from this DAA are opened against the
 /// prefix-bound manifests, with the request-bound prefix point.
 pub fn trace_prefix_activation_daa() -> u64 {
-    gate(u64::MAX, 215_000)
+    gate(u64::MAX, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// DAA from which every traced response is audited (mirror of the node's `trace_audit_activation`).
 pub fn trace_audit_activation_daa() -> u64 {
-    gate(u64::MAX, 240_000)
+    gate(u64::MAX, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// Node `trace_chain_activation`: responses accepted from this DAA commit the stage-2 trace.
 pub fn trace_chain_activation_daa() -> u64 {
-    gate(u64::MAX, u64::MAX)
+    gate(u64::MAX, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
