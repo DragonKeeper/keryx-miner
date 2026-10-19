@@ -1531,11 +1531,11 @@ pub fn is_testnet() -> bool {
     TESTNET_GATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Picks the gate value for the selected network (`--testnet`).
-#[inline(always)]
 /// Testnet H15 gate. MUST equal the node's `TESTNET_H15_ACTIVATION_DAA`.
 const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
 
+/// Picks the gate value for the selected network (`--testnet`).
+#[inline(always)]
 fn gate(mainnet: u64, testnet: u64) -> u64 {
     if is_testnet() {
         testnet
