@@ -599,7 +599,13 @@ fn ensure_full_context(e: &mut Engine, gpu: usize) -> Result<(), String> {
     }
     crate::pom_gpu::release_pad(gpu as u32);
     let _native = native();
-    let got = unsafe { (e.ctx_acquire)(e.model, e.n_ctx) };
+    let mut got = unsafe { (e.ctx_acquire)(e.model, e.n_ctx) };
+    if got < 0 {
+        if let Some(floor) = crate::models::spec_for_gguf(&e.gguf).map(|m| m.ctx_floor as c_int).filter(|f| *f < e.n_ctx) {
+            log::warn!("llama engine: {}-token context did not fit on GPU {} — retrying at the {}-token floor", e.n_ctx, gpu, floor);
+            got = unsafe { (e.ctx_acquire)(e.model, floor) };
+        }
+    }
     e.ctx_now = got.max(0);
     if got < 0 {
         return Err(engine_error(e, "context allocation failed"));

@@ -2255,6 +2255,17 @@ mod v3_kernel_tests {
         assert!(host_pads().contains_key(&(pad_seed, n_pad)));
         let restored = miner.mine(&PPH, TIMESTAMP, &target_v5, start, n, true, true, true, true, true, true, false, false, Some((pad_seed, n_pad))).unwrap();
         assert_eq!(restored, Some(want_v5), "pad restored from host memory differs");
+
+        let mut miner = miner;
+        assert!(miner.kernel.ncf_enabled, "the production kernel was not the one checked above");
+        miner.kernel.ncf_enabled = false;
+        let tc = miner.mine(&PPH, TIMESTAMP, &target_v5, start, n, true, true, true, true, true, true, false, false, Some((pad_seed, n_pad))).unwrap();
+        assert_eq!(tc, Some(want_v5), "tensor-core v5 walk differs from the host reference");
+        miner.kernel.tc_enabled = false;
+        let plain = miner.mine(&PPH, TIMESTAMP, &target_v5, start, n, true, true, true, true, true, true, false, false, Some((pad_seed, n_pad))).unwrap();
+        assert_eq!(plain, Some(want_v5), "plain v5 walk differs from the host reference");
+        let plain_v4 = miner.mine(&PPH, TIMESTAMP, &target_v4, start, n, true, true, true, true, true, true, false, false, None).unwrap();
+        assert_eq!(plain_v4, Some(want_v4), "plain v4 walk differs from the host reference");
     }
 
     #[test]
