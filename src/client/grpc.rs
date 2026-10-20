@@ -124,6 +124,9 @@ const CHAIN_LOG_TAIL: usize = 512;
 /// Rejections of an opening the node does not await before it is dropped.
 const OPENING_NOT_AWAITED_MAX_ATTEMPTS: u32 = 5;
 
+/// Built opening bodies kept per response, one per seed block.
+const BUILT_OPENINGS_KEPT: usize = 4;
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use log::{error, info, warn};
@@ -178,6 +181,8 @@ struct PendingTrace {
     draw: Option<TraceDraw>,
     /// Opening already built and submitted for this response.
     opening: Option<keryx_miner::trace_store::StoredOpening>,
+    /// Unsigned opening bodies already built, by seed block.
+    built: Vec<(String, Vec<u8>)>,
 }
 
 /// The draw of an accepted response once its seed block is on the chain.
@@ -937,7 +942,23 @@ impl KeryxdHandler {
     }
 
     /// Starts the replay of the audited response closest to its deadline, when the GPU is free.
+    /// A response whose opening was already built for its current seed block is submitted
+    /// without a replay.
     async fn try_start_replay(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
+        let ready: Vec<(String, String, Vec<u8>)> = self
+            .pending_traces
+            .iter_mut()
+            .filter_map(|(txid, p)| {
+                let d = p.draw.as_mut().filter(|d| d.audited && !d.opened)?;
+                let body = p.built.iter().find(|(h, _)| *h == d.seed_hash)?.1.clone();
+                d.opened = true;
+                Some((txid.clone(), d.seed_hash.clone(), body))
+            })
+            .collect();
+        for (txid, seed_hash, body) in ready {
+            info!("Trace: response {} audited at chain block {} — opening already built", txid, seed_hash);
+            self.submit_opening(&txid, &seed_hash, body).await;
+        }
         if self.inference_busy() || self.publish_rx.is_some() || !self.ai_request_queue.is_empty() || keryx_miner::llm::probe_in_flight() {
             return Ok(());
         }
@@ -988,22 +1009,35 @@ impl KeryxdHandler {
             warn!("Trace: no opening built for response {}", job.response_txid);
             return true;
         };
-        let Some(p) = self.pending_traces.get(&job.response_txid) else { return true };
-        let Some(d) = p.draw.as_ref().filter(|d| d.seed_hash == job.seed_hash) else {
-            info!("Trace: seed block of response {} left the chain during the replay — opening dropped", job.response_txid);
+        let Some(p) = self.pending_traces.get_mut(&job.response_txid) else { return true };
+        p.built.retain(|(h, _)| *h != job.seed_hash);
+        if p.built.len() >= BUILT_OPENINGS_KEPT {
+            p.built.remove(0);
+        }
+        p.built.push((job.seed_hash.clone(), body.clone()));
+        if !p.draw.as_ref().is_some_and(|d| d.seed_hash == job.seed_hash) {
+            info!("Trace: seed block of response {} left the chain during the replay — opening kept for its return", job.response_txid);
             return true;
-        };
+        }
+        self.submit_opening(&job.response_txid, &job.seed_hash, body).await;
+        true
+    }
+
+    /// Signs and submits the opening `body` of response `response_txid`, built for `seed_hash`,
+    /// the seed block of its current draw.
+    async fn submit_opening(&mut self, response_txid: &str, seed_hash: &str, body: Vec<u8>) {
+        let Some(d) = self.pending_traces.get(response_txid).and_then(|p| p.draw.as_ref()) else { return };
         let deadline_daa = d.deadline_daa;
         let body = if d.seed_daa >= keryx_miner::pom::trace_seed_bind_activation_daa() {
-            let Some(b) = hash32(&job.seed_hash).and_then(|h| keryx_verifiable_inference::opening::seeded(&body, &h)) else {
-                warn!("Trace: cannot name seed block {} in the opening of response {}", job.seed_hash, job.response_txid);
-                return true;
+            let Some(b) = hash32(seed_hash).and_then(|h| keryx_verifiable_inference::opening::seeded(&body, &h)) else {
+                warn!("Trace: cannot name seed block {} in the opening of response {}", seed_hash, response_txid);
+                return;
             };
             b
         } else {
             body
         };
-        let Some(payload) = self.escrow_watcher.as_ref().map(|w| w.sign_opening(&body)) else { return true };
+        let Some(payload) = self.escrow_watcher.as_ref().map(|w| w.sign_opening(&body)) else { return };
         let rpc_tx = crate::proto::RpcTransaction {
             version: 0,
             inputs: vec![],
@@ -1016,30 +1050,29 @@ impl KeryxdHandler {
             verbose_data: None,
         };
         if let Some(txid) = Self::compute_rpc_txid(&rpc_tx) {
-            info!("Trace: submitting the opening of response {} ({} B)", job.response_txid, body.len());
+            info!("Trace: submitting the opening of response {} ({} B)", response_txid, body.len());
             self.opening_inflight.insert(
                 txid,
                 OpeningInflight {
                     tx: rpc_tx.clone(),
-                    response_txid: job.response_txid.clone(),
+                    response_txid: response_txid.to_string(),
                     deadline_daa,
                     attempts: 1,
                     last: std::time::Instant::now(),
                 },
             );
         }
-        if let Some(p) = self.pending_traces.get_mut(&job.response_txid) {
+        if let Some(p) = self.pending_traces.get_mut(response_txid) {
             p.opening = Some(keryx_miner::trace_store::StoredOpening {
-                seed_hash: job.seed_hash.clone(),
+                seed_hash: seed_hash.to_string(),
                 deadline_daa,
                 payload: rpc_tx.payload.clone(),
             });
         }
-        self.persist_trace(&job.response_txid);
+        self.persist_trace(response_txid);
         if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
             warn!("Trace: failed to send the opening tx: {}", e);
         }
-        true
     }
 
     /// Resubmits in-flight openings the mempool has not accepted yet.
@@ -1138,6 +1171,7 @@ impl KeryxdHandler {
                     accepted_hash: t.accepted_hash,
                     draw: None,
                     opening: t.opening,
+                    built: Vec::new(),
                 },
             );
         }
@@ -1547,6 +1581,7 @@ impl KeryxdHandler {
                     accepted_hash: None,
                     draw: None,
                     opening: None,
+                    built: Vec::new(),
                 };
                 self.pending_traces.insert(txid.clone(), pending);
                 self.persist_trace(&txid);
@@ -1905,6 +1940,9 @@ impl KeryxdHandler {
                                 None => {
                                     self.opening_inflight.remove(&txid);
                                     info!("Trace: opening accepted by the mempool");
+                                }
+                                Some(e) if e.contains("an opening for response") => {
+                                    info!("Trace: another opening of this response is in the mempool — retrying");
                                 }
                                 Some(e) if e.contains("already") => {
                                     self.opening_inflight.remove(&txid);
