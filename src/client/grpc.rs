@@ -239,6 +239,37 @@ fn seed_block_after<'a>(log: &'a VecDeque<ChainEntry>, accepted: &str) -> Option
     None
 }
 
+/// Puts `added`, the chain after `start` in chain order, right behind `start` in `log`, moving the
+/// blocks already logged elsewhere and keeping their DAA scores. Returns the placed blocks whose
+/// DAA score is unknown; nothing is placed while `start` is not logged.
+fn place_chain_after(log: &mut VecDeque<ChainEntry>, start: &str, added: Vec<String>) -> Vec<String> {
+    let Some(pos) = log.iter().position(|e| e.hash == start) else { return Vec::new() };
+    let added_set: std::collections::HashSet<&str> = added.iter().map(String::as_str).collect();
+    let mut known: std::collections::HashMap<String, Option<u64>> = std::collections::HashMap::new();
+    let mut kept: VecDeque<ChainEntry> = VecDeque::with_capacity(log.len() + added.len());
+    let mut at = 0;
+    for (i, e) in std::mem::take(log).into_iter().enumerate() {
+        if added_set.contains(e.hash.as_str()) {
+            known.insert(e.hash, e.daa);
+            continue;
+        }
+        kept.push_back(e);
+        if i == pos {
+            at = kept.len();
+        }
+    }
+    let mut unknown = Vec::new();
+    for (k, hash) in added.into_iter().enumerate() {
+        let daa = known.remove(&hash).flatten();
+        if daa.is_none() {
+            unknown.push(hash.clone());
+        }
+        kept.insert(at + k, ChainEntry { hash, daa });
+    }
+    *log = kept;
+    unknown
+}
+
 /// Private-inference state of a queued request; `None` for a plaintext request.
 #[derive(Clone, Copy)]
 enum PrivateRequest {
@@ -312,6 +343,9 @@ pub struct KeryxdHandler {
     /// Chain blocks to fetch after a restart, from the accepting block of each restored trace.
     chain_restore_queue: VecDeque<String>,
     chain_restore_pending: std::collections::HashSet<String>,
+    /// Accepting blocks whose chain is asked for after a restart, one request at a time; their
+    /// traces are not drawn before the answer.
+    chain_restore_starts: VecDeque<String>,
 
     /// In-flight replay building an opening.
     replay_rx: Option<ReplayJob>,
@@ -515,6 +549,7 @@ impl KeryxdHandler {
             trace_store,
             chain_restore_queue: VecDeque::new(),
             chain_restore_pending: std::collections::HashSet::new(),
+            chain_restore_starts: VecDeque::new(),
             replay_rx: None,
             opening_inflight: restored_openings,
             publish_rx: None,
@@ -1190,15 +1225,39 @@ impl KeryxdHandler {
             .filter(|p| p.draw.is_none())
             .filter_map(|p| p.accepted_hash.clone())
             .collect();
+        let idle = self.chain_restore_starts.is_empty();
         for hash in accepted {
+            if self.chain_restore_starts.contains(&hash) {
+                continue;
+            }
             if !self.chain_log.iter().any(|e| e.hash == hash) {
                 self.chain_log.push_back(ChainEntry { hash: hash.clone(), daa: None });
                 self.chain_restore_queue.push_back(hash.clone());
             }
-            info!("Trace: rebuilding the chain from block {} for a restored response", hash);
-            self.client_send(crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage { start_hash: hash }).await?;
+            self.chain_restore_starts.push_back(hash);
+        }
+        if idle {
+            self.request_next_chain_restore().await?;
         }
         self.chain_restore_pump().await
+    }
+
+    /// Asks the node for the chain after the next restored accepting block.
+    async fn request_next_chain_restore(&mut self) -> Result<(), Error> {
+        let Some(hash) = self.chain_restore_starts.front().cloned() else { return Ok(()) };
+        info!("Trace: rebuilding the chain from block {} for a restored response", hash);
+        self.client_send(crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage { start_hash: hash }).await?;
+        Ok(())
+    }
+
+    /// Places the chain the node returned after restored accepting block `start` right behind it
+    /// in the chain log.
+    fn place_restored_chain(&mut self, start: &str, removed: &[String], added: Vec<String>) {
+        if !removed.is_empty() {
+            self.on_chain_blocks_removed(removed);
+        }
+        let unknown = place_chain_after(&mut self.chain_log, start, added);
+        self.chain_restore_queue.extend(unknown);
     }
 
     /// Fetches the queued chain blocks a few at a time until every restored trace is drawn.
@@ -1261,6 +1320,9 @@ impl KeryxdHandler {
                 continue;
             }
             let Some(accepted) = p.accepted_hash.as_deref() else { continue };
+            if self.chain_restore_starts.iter().any(|h| h == accepted) {
+                continue;
+            }
             let Some((seed_hash, daa, accepted_daa)) = seed_block_after(&self.chain_log, accepted) else { continue };
             let (Some(txid_bytes), Some(seed_block)) = (hash32(txid), hash32(seed_hash)) else { continue };
             let seed = keryx_miner::trace::trace_seed(&seed_block, &txid_bytes);
@@ -2064,16 +2126,13 @@ impl KeryxdHandler {
                 }
             }
             Payload::GetVirtualSelectedParentChainFromBlockResponse(msg) => {
-                if let Some(e) = msg.error {
-                    warn!("Trace: chain rebuild failed: {}", e.message);
-                    return Ok(());
+                let Some(start) = self.chain_restore_starts.pop_front() else { return Ok(()) };
+                match msg.error {
+                    Some(e) => warn!("Trace: chain rebuild from block {} failed: {}", start, e.message),
+                    None => self.place_restored_chain(&start, &msg.removed_chain_block_hashes, msg.added_chain_block_hashes),
                 }
-                for hash in msg.added_chain_block_hashes {
-                    if !self.chain_log.iter().any(|e| e.hash == hash) {
-                        self.chain_log.push_back(ChainEntry { hash: hash.clone(), daa: None });
-                        self.chain_restore_queue.push_back(hash);
-                    }
-                }
+                self.resolve_traces();
+                self.request_next_chain_restore().await?;
                 self.chain_restore_pump().await?;
             }
             msg => info!("got unknown msg: {:?}", msg),
@@ -2223,5 +2282,27 @@ mod tests {
         assert_eq!(seed_block_after(&log, "zz"), None);
         log[0].daa = None;
         assert_eq!(seed_block_after(&log, "a"), None, "the accepting block needs its own DAA");
+    }
+
+    #[test]
+    fn restored_chain_is_placed_behind_its_start() {
+        use super::{place_chain_after, seed_block_after, ChainEntry};
+        let entry = |hash: &str, daa: Option<u64>| ChainEntry { hash: hash.to_string(), daa };
+        let delay = keryx_miner::trace::TRACE_SEED_DELAY_DAA;
+        // Accepting blocks of two restored responses, logged in no chain order.
+        let mut log: std::collections::VecDeque<ChainEntry> = [entry("b", Some(1_000)), entry("z", Some(1_000 + delay + 30))].into();
+        assert_eq!(seed_block_after(&log, "b"), Some(("z", 1_000 + delay + 30, 1_000)), "an unordered log draws the wrong seed block");
+
+        let unknown = place_chain_after(&mut log, "b", vec!["c".into(), "d".into(), "z".into()]);
+        assert_eq!(unknown, vec!["c".to_string(), "d".to_string()]);
+        let order: Vec<&str> = log.iter().map(|e| e.hash.as_str()).collect();
+        assert_eq!(order, ["b", "c", "d", "z"]);
+        assert_eq!(log[3].daa, Some(1_000 + delay + 30), "a moved block keeps its DAA");
+        log[1].daa = Some(1_000 + delay - 1);
+        log[2].daa = Some(1_000 + delay + 1);
+        assert_eq!(seed_block_after(&log, "b"), Some(("d", 1_000 + delay + 1, 1_000)));
+
+        assert!(place_chain_after(&mut log, "unknown", vec!["x".into()]).is_empty());
+        assert_eq!(log.len(), 4);
     }
 }
