@@ -994,6 +994,15 @@ impl KeryxdHandler {
             return true;
         };
         let deadline_daa = d.deadline_daa;
+        let body = if d.seed_daa >= keryx_miner::pom::trace_seed_bind_activation_daa() {
+            let Some(b) = hash32(&job.seed_hash).and_then(|h| keryx_verifiable_inference::opening::seeded(&body, &h)) else {
+                warn!("Trace: cannot name seed block {} in the opening of response {}", job.seed_hash, job.response_txid);
+                return true;
+            };
+            b
+        } else {
+            body
+        };
         let Some(payload) = self.escrow_watcher.as_ref().map(|w| w.sign_opening(&body)) else { return true };
         let rpc_tx = crate::proto::RpcTransaction {
             version: 0,

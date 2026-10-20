@@ -1677,6 +1677,11 @@ pub fn trace_chain_activation_daa() -> u64 {
     gate(u64::MAX, TESTNET_H15_ACTIVATION_DAA)
 }
 
+/// Node `trace_seed_bind_activation`: openings of draws seeded from this DAA name their seed block.
+pub fn trace_seed_bind_activation_daa() -> u64 {
+    gate(u64::MAX, TESTNET_H15_ACTIVATION_DAA)
+}
+
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
 /// A tier POSITION shifts across eras (a lineup insertion renumbers the models below it) while
 /// the model's index bytes are identical — keying by position would strand a built index at a
