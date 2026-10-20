@@ -287,9 +287,20 @@ impl State {
             } else {
                 pom::pom_block_seed_v4(&pph, timestamp, nonce)
             };
-            let (v4, final_state) = pom_v4::build_proof_v4(tier, seed_v4, index)
+            let (v4, walk_v4) = pom_v4::build_proof_v4(tier, seed_v4, index)
                 .map_err(|e| info!("PoM v4 proof build failed: {e}"))
                 .ok()?;
+            let pad = if self.daa_score >= pom::pom_v5_activation_daa() {
+                let model_id = keryx_miner::pom_gpu::mining_model_id(device_id)?;
+                let n = keryx_miner::pom_v5::POM_V5_PAD_ENTRIES_H14.get(tier as usize).copied().filter(|n| *n > 0)?;
+                Some((keryx_miner::pom_v5::v5_pad_seed(tier, &model_id, &index.r_t), n))
+            } else {
+                None
+            };
+            let final_state = match pad {
+                Some((pad_seed, n)) => keryx_miner::pom_v5::v5_final_state(seed_v4, &v4, n, |i| keryx_miner::pom_v5::v5_pad_entry(&pad_seed, i)),
+                None => walk_v4,
+            };
             let pow_value = pom::pom_pow_value(final_state, &pph, true);
             if !pom::le_leq(&pow_value, &self.target.to_le_bytes()) {
                 info!("PoM v4 candidate rejected: canonical host walk does not meet target");
@@ -298,7 +309,7 @@ impl State {
             let checked = pom_v4::verify_proof_v4(seed_v4, &v4, &index.r_t, index.n_chunks)
                 .map_err(|e| info!("PoM v4 self-check failed: {e}"))
                 .ok()?;
-            if checked != final_state {
+            if checked != walk_v4 {
                 info!("PoM v4 proof discarded: self-check final_state mismatch");
                 return None;
             }

@@ -37,6 +37,9 @@ const POM_V4_KERNEL_NAME: &str = "pom_mine_v4";
 const POM_V4_SHARED_BYTES: u32 = 2048;
 const POM_V4_CHASE_KERNEL_NAME: &str = "pom_mine_v4_chase";
 const POM_SEED_H10_KERNEL_NAME: &str = "pom_seed_h10_batch";
+const POM_V5_PAD_FILL_KERNEL_NAME: &str = "pom_v5_pad_fill";
+/// Pad entries filled per launch.
+const POM_V5_FILL_SLICE: u64 = 1 << 20;
 const POM_V4_TC_KERNEL_NAME: &str = "pom_mine_v4_tc";
 /// Must match V4_TC_WARPS / V4_TC_PIPE in cuda/pom_mine.cu.
 const V4_TC_WARPS: u64 = 4;
@@ -220,6 +223,8 @@ struct LoadedPomKernel {
     ncf_enabled: bool,
     /// H10/H14 seed pre-pass; required whenever the walk runs with an H10 seed.
     function_seed_h10: Option<sys::CUfunction>,
+    /// v5 context pad fill; required once the v5 walk is active.
+    function_v5_pad_fill: Option<sys::CUfunction>,
 }
 
 impl Drop for LoadedPomKernel {
@@ -254,7 +259,9 @@ impl LoadedPomKernel {
             unsafe { result::module::get_function(module, CString::new(POM_V4_NCF_KERNEL_NAME).unwrap()) }.ok();
         let function_seed_h10 =
             unsafe { result::module::get_function(module, CString::new(POM_SEED_H10_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false, function_seed_h10 })
+        let function_v5_pad_fill =
+            unsafe { result::module::get_function(module, CString::new(POM_V5_PAD_FILL_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false, function_seed_h10, function_v5_pad_fill })
     }
 
     fn from_ptx(_label: &'static str, ptx: &'static str) -> Result<Self> {
@@ -271,7 +278,9 @@ impl LoadedPomKernel {
             unsafe { result::module::get_function(module, CString::new(POM_V4_NCF_KERNEL_NAME).unwrap()) }.ok();
         let function_seed_h10 =
             unsafe { result::module::get_function(module, CString::new(POM_SEED_H10_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false, function_seed_h10 })
+        let function_v5_pad_fill =
+            unsafe { result::module::get_function(module, CString::new(POM_V5_PAD_FILL_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false, function_seed_h10, function_v5_pad_fill })
     }
 
     fn launch(
@@ -455,6 +464,7 @@ impl LoadedPomKernel {
         let t_max = [u64::MAX; 4];
         let (start, batch) = (0u64, 1u64);
         let seed_h10: u32 = 0;
+        let no_pad: u64 = 0;
         let v5_buf = stream.clone_htod(&[0u64; 25])?;
         let winner = stream.clone_htod(&[u64::MAX])?;
         let (bases_ptr, _bg) = bases_dev.device_ptr(stream);
@@ -467,7 +477,7 @@ impl LoadedPomKernel {
             block_dim: ((V4_NCF_WARPS * 32) as u32, 1, 1),
             shared_mem_bytes: (V4_NCF_WARPS as u32) * POM_V4_NCF_SHARED_PER_WARP,
         };
-        let mut params: [*mut c_void; 26] = [
+        let mut params: [*mut c_void; 28] = [
             (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
             (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
             (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void),
@@ -482,6 +492,7 @@ impl LoadedPomKernel {
             (&inv_n as *const _ as *mut c_void),
             (&winner_ptr as *const _ as *mut c_void),
             (&v5_ptr as *const _ as *mut c_void), (&seed_h10 as *const _ as *mut c_void),
+            (&no_pad as *const _ as *mut c_void), (&no_pad as *const _ as *mut c_void),
         ];
         unsafe { result::launch_kernel(walk, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
         stream.synchronize()?;
@@ -491,7 +502,7 @@ impl LoadedPomKernel {
 
     /// v4 (re-walk) grind: one block of 32 threads per nonce over `[start, start + batch)`.
     #[allow(clippy::too_many_arguments)]
-    fn launch_v4(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h10_state: Option<&[u64; 25]>) -> Result<Option<u64>> {
+    fn launch_v4(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h10_state: Option<&[u64; 25]>, pad_ptr: u64, n_pad: u64) -> Result<Option<u64>> {
         let t = words4(target_le);
         let k = crate::pom_v4::POM_V4_K as u32;
         let scratch = v4_scratch(stream, batch as usize)?;
@@ -535,7 +546,7 @@ impl LoadedPomKernel {
                 block_dim: ((V4_NCF_WARPS * 32) as u32, 1, 1),
                 shared_mem_bytes: (V4_NCF_WARPS as u32) * POM_V4_NCF_SHARED_PER_WARP,
             };
-            let mut params: [*mut c_void; 26] = [
+            let mut params: [*mut c_void; 28] = [
                 (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
                 (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
                 (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void),
@@ -550,6 +561,7 @@ impl LoadedPomKernel {
                 (&inv_n as *const _ as *mut c_void),
                 (&winner_ptr as *const _ as *mut c_void),
                 (&v5_ptr as *const _ as *mut c_void), (&seed_h10 as *const _ as *mut c_void),
+                (&pad_ptr as *const _ as *mut c_void), (&n_pad as *const _ as *mut c_void),
             ];
             unsafe { result::launch_kernel(walk, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
             stream.synchronize()?;
@@ -585,7 +597,7 @@ impl LoadedPomKernel {
                 block_dim: ((V4_TC_WARPS * 32) as u32, 1, 1),
                 shared_mem_bytes: (V4_TC_WARPS as u32) * POM_V4_TC_SHARED_PER_WARP,
             };
-            let mut walk_params: [*mut c_void; 23] = [
+            let mut walk_params: [*mut c_void; 25] = [
                 (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
                 (&t_count as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
                 (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void),
@@ -598,6 +610,7 @@ impl LoadedPomKernel {
                 (&start as *const _ as *mut c_void), (&batch as *const _ as *mut c_void),
                 (&offsets_ptr as *const _ as *mut c_void), (&winner_ptr as *const _ as *mut c_void),
                 (&v5_ptr as *const _ as *mut c_void), (&seed_h10 as *const _ as *mut c_void),
+                (&pad_ptr as *const _ as *mut c_void), (&n_pad as *const _ as *mut c_void),
             ];
             unsafe { result::launch_kernel(walk, walk_cfg.grid_dim, walk_cfg.block_dim, walk_cfg.shared_mem_bytes, stream.cu_stream(), &mut walk_params) }?;
             stream.synchronize()?;
@@ -607,7 +620,7 @@ impl LoadedPomKernel {
 
         let function = self.function_v4.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no pom_mine_v4 entry"))?;
         let cfg = LaunchConfig { grid_dim: (batch as u32, 1, 1), block_dim: (crate::pom_v4::POM_V4_D as u32, 1, 1), shared_mem_bytes: POM_V4_SHARED_BYTES };
-        let mut params: [*mut c_void; 23] = [
+        let mut params: [*mut c_void; 25] = [
             (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
             (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
             (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void), (&p_words[2] as *const _ as *mut c_void), (&p_words[3] as *const _ as *mut c_void),
@@ -616,6 +629,7 @@ impl LoadedPomKernel {
             (&t[0] as *const _ as *mut c_void), (&t[1] as *const _ as *mut c_void), (&t[2] as *const _ as *mut c_void), (&t[3] as *const _ as *mut c_void),
             (&start as *const _ as *mut c_void), (&batch as *const _ as *mut c_void), (&winner_ptr as *const _ as *mut c_void),
             (&v5_ptr as *const _ as *mut c_void), (&seed_h10 as *const _ as *mut c_void),
+            (&pad_ptr as *const _ as *mut c_void), (&n_pad as *const _ as *mut c_void),
         ];
         unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
         stream.synchronize()?;
@@ -924,6 +938,8 @@ pub struct PomGpuMiner {
     t_count: u32,
     n_total_chunks: u64,
     _uploads: Vec<CudaSlice<u8>>, // tensors we uploaded ourselves, kept alive for the gather
+    /// v5 context pad of the mined tier: (pad seed, entries, device buffer of 8 words per entry).
+    pad: Mutex<Option<([u8; 32], u64, CudaSlice<u32>)>>,
 }
 
 impl PomGpuMiner {
@@ -977,6 +993,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             _uploads: uploads,
+            pad: Mutex::new(None),
         })
     }
 
@@ -1097,6 +1114,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             _uploads: uploads,
+            pad: Mutex::new(None),
         })
     }
 
@@ -1104,12 +1122,40 @@ impl PomGpuMiner {
         self.n_total_chunks
     }
 
+    /// Allocates and fills the v5 context pad of `n` entries seeded by `pad_seed`.
+    fn fill_pad(&self, pad_seed: &[u8; 32], n: u64) -> Result<CudaSlice<u32>> {
+        let fill = self.kernel.function_v5_pad_fill.ok_or_else(|| anyhow!("PoM GPU: no pom_v5_pad_fill entry"))?;
+        let t0 = std::time::Instant::now();
+        let buf = self.stream.alloc_zeros::<u32>((n * 8) as usize)?;
+        let w = crate::pom_v5::v5_pad_seed_words(pad_seed);
+        let rounds = crate::pom_v5::POM_V5_P_ROUNDS;
+        {
+            let (ptr, _g) = buf.device_ptr(&self.stream);
+            let mut first = 0u64;
+            while first < n {
+                let count = POM_V5_FILL_SLICE.min(n - first);
+                let cfg = LaunchConfig { grid_dim: (((count + 255) / 256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                let mut params: [*mut c_void; 8] = [
+                    (&ptr as *const _ as *mut c_void), (&first as *const _ as *mut c_void), (&count as *const _ as *mut c_void),
+                    (&w[0] as *const _ as *mut c_void), (&w[1] as *const _ as *mut c_void),
+                    (&w[2] as *const _ as *mut c_void), (&w[3] as *const _ as *mut c_void),
+                    (&rounds as *const _ as *mut c_void),
+                ];
+                unsafe { result::launch_kernel(fill, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, self.stream.cu_stream(), &mut params) }?;
+                self.stream.synchronize()?;
+                first += count;
+            }
+        }
+        info!("PoM v5: context pad of {} entries ({} MiB) filled in {:.1} s", n, n * 32 / (1 << 20), t0.elapsed().as_secs_f64());
+        Ok(buf)
+    }
+
     /// Search nonces in `[start, start + batch)`. Returns the lowest nonce whose `pom_pow_value`
     /// is `<= target_le`, or None. `target_le` is the header's compact target as 32 LE bytes.
     /// `h3` salts the pph words host-side (POM_H3_PPH_SALT); `h5_1` swaps the SEED words to the
     /// v2 salt (POM_H5_1_PPH_SALT) while the pow words stay H3 — the kernel is era-agnostic,
     /// it folds whatever word sets it receives.
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool) -> Result<Option<u64>> {
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool, pad: Option<([u8; 32], u64)>) -> Result<Option<u64>> {
         // Worker threads rotate; make sure this device's context is current before raw launches.
         self.ctx.bind_to_thread()?;
         if v4 {
@@ -1121,7 +1167,23 @@ impl PomGpuMiner {
             }
             let seed_pph = if seed_h14 { crate::pom::seed_h14_pph(pre_pow_hash) } else { *pre_pow_hash };
             let h10_state = seed_h10.then(|| crate::pom::pom_seed_h10_state(&seed_pph, timestamp));
-            return self.kernel.launch_v4(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &p_words, &s_words, timestamp, target_le, start, batch, h10_state.as_ref());
+            let mut guard = self.pad.lock().unwrap();
+            if let Some((seed, n)) = pad {
+                if guard.as_ref().is_none_or(|(s, m, _)| *s != seed || *m != n) {
+                    *guard = None;
+                    *guard = Some((seed, n, self.fill_pad(&seed, n)?));
+                }
+            }
+            let held = pad.and(guard.as_ref());
+            let n_pad = held.map_or(0, |(_, n, _)| *n);
+            let (pad_ptr, _pg) = match held {
+                Some((_, _, buf)) => {
+                    let (ptr, g) = buf.device_ptr(&self.stream);
+                    (ptr as u64, Some(g))
+                }
+                None => (0u64, None),
+            };
+            return self.kernel.launch_v4(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &p_words, &s_words, timestamp, target_le, start, batch, h10_state.as_ref(), pad_ptr, n_pad);
         }
         let p_words = crate::pom::pph_words_for_era(pre_pow_hash, h3);
         let s_words = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
@@ -1287,7 +1349,7 @@ pub fn is_loading() -> bool {
 
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 #[allow(clippy::too_many_arguments)]
-pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool) -> Option<u64> {
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool, pad: Option<([u8; 32], u64)>) -> Option<u64> {
     if inference_paused() {
         return None;
     }
@@ -1295,7 +1357,7 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    match miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3, v4, seed_h10, seed_h14) {
+    match miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3, v4, seed_h10, seed_h14, pad) {
         Ok(found) => found,
         Err(e) => {
             let message = e.to_string();
@@ -2074,6 +2136,7 @@ impl PomGpuMiner {
             t_count: bases.len() as u32,
             n_total_chunks,
             _uploads: uploads,
+            pad: Mutex::new(None),
         })
     }
 }
@@ -2118,6 +2181,45 @@ mod v3_kernel_tests {
         assert_eq!(final_state, pom_v3::fold64(&root), "GPU blake3 tree differs from the host");
     }
 
+    /// Lowest pow value over `n` nonces from `start`, as (nonce, pow), per `final_state_of`.
+    fn best_nonce(start: u64, n: u64, final_state_of: impl Fn(u64) -> u64) -> (u64, [u8; 32]) {
+        let mut best = (start, [0xFFu8; 32]);
+        for nonce in start..start + n {
+            let pv = crate::pom::pom_pow_value(final_state_of(nonce), &PPH, true);
+            if !crate::pom::le_leq(&best.1, &pv) {
+                best = (nonce, pv);
+            }
+        }
+        best
+    }
+
+    #[test]
+    #[ignore]
+    fn v5_kernel_matches_host_reference() {
+        use crate::{pom_v4, pom_v5};
+        let blob = pom_v3::lockstep_blob();
+        let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
+        let index = crate::pom::index_from_ram(blob);
+        let pad_seed = pom_v5::v5_pad_seed(1, &[3; 32], &index.r_t);
+        let n_pad = 50_000u64;
+        let (start, n) = (5_000u64, 64u64);
+        let v4_fs = |nonce: u64| pom_v4::build_proof_v4(1, crate::pom::pom_block_seed_v4(&PPH, TIMESTAMP, nonce), &index).unwrap().1;
+        let v5_fs = |nonce: u64| {
+            let seed = crate::pom::pom_block_seed_v4(&PPH, TIMESTAMP, nonce);
+            let (proof, _) = pom_v4::build_proof_v4(1, seed, &index).unwrap();
+            pom_v5::v5_final_state(seed, &proof, n_pad, |i| pom_v5::v5_pad_entry(&pad_seed, i))
+        };
+
+        let (want_v4, target_v4) = best_nonce(start, n, v4_fs);
+        let got_v4 = miner.mine(&PPH, TIMESTAMP, &target_v4, start, n, true, true, true, true, true, true, false, false, None).unwrap();
+        assert_eq!(got_v4, Some(want_v4), "GPU v4 walk differs from the host reference");
+
+        let (want_v5, target_v5) = best_nonce(start, n, v5_fs);
+        assert_ne!(target_v5, target_v4);
+        let got_v5 = miner.mine(&PPH, TIMESTAMP, &target_v5, start, n, true, true, true, true, true, true, false, false, Some((pad_seed, n_pad))).unwrap();
+        assert_eq!(got_v5, Some(want_v5), "GPU v5 walk differs from the host reference");
+    }
+
     #[test]
     #[ignore]
     fn v3_grind_end_to_end() {
@@ -2125,7 +2227,7 @@ mod v3_kernel_tests {
         let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
         // Trivial target: every nonce wins, atomicMin returns the batch base.
         let target = [0xFFu8; 32];
-        let found = miner.mine(&PPH, TIMESTAMP, &target, 1000, 8, true, true, true, true, true, false, false, false).unwrap().unwrap();
+        let found = miner.mine(&PPH, TIMESTAMP, &target, 1000, 8, true, true, true, true, true, false, false, false, None).unwrap().unwrap();
         assert_eq!(found, 1000);
 
         let (states, snippets, final_state) = miner.dump_v3(&PPH, TIMESTAMP, found, true, true, true).unwrap();

@@ -66,6 +66,23 @@ fn mark_fatal_gpu_fault(device: &str, message: &str) {
     }
 }
 
+static NO_PAD_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Seed and entry count of the v5 context pad of the tier `device_id` mines at `daa`.
+fn pom_v5_pad(device_id: u32, daa: u64) -> Option<([u8; 32], u64)> {
+    let tier = keryx_miner::pom_gpu::current_tier(device_id, daa)?;
+    let model_id = keryx_miner::pom_gpu::mining_model_id(device_id)?;
+    let index = keryx_miner::pom::active_index_for_model(&model_id)?;
+    let n = keryx_miner::pom_v5::POM_V5_PAD_ENTRIES_H14.get(tier as usize).copied().unwrap_or(0);
+    if n == 0 {
+        if !NO_PAD_WARNED.swap(true, Ordering::AcqRel) {
+            warn!("PoM v5: tier {} has no context pad — this tier cannot be mined", tier);
+        }
+        return None;
+    }
+    Some((keryx_miner::pom_v5::v5_pad_seed(tier, &model_id, &index.r_t), n))
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C-unwind" fn signal_panic(_signal: nix::libc::c_int) {
     // MUST be `extern "C-unwind"`: a plain `extern "C"` handler turns this panic into a
@@ -502,7 +519,13 @@ impl MinerManager {
                             pom_v4_batch = keryx_miner::pom_gpu::v4_batch_for_device(worker_device_id);
                         }
                         let batch = if v4 { pom_v4_batch.unwrap_or(POM_V4_BATCH_UNSIZED) } else if v3 { POM_V3_BATCH } else { POM_BATCH };
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10, h14);
+                        let v5 = v4 && daa >= keryx_miner::pom::pom_v5_activation_daa();
+                        let pad = if v5 { pom_v5_pad(worker_device_id, daa) } else { None };
+                        if v5 && pad.is_none() {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
+                        }
+                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10, h14, pad);
                         if keryx_miner::pom_gpu::fatal_gpu_fault() {
                             mark_fatal_gpu_fault(&device_id, "sticky CUDA runtime fault while mining");
                             return Err("fatal CUDA fault during PoM mining".into());

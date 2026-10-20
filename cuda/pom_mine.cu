@@ -399,6 +399,54 @@ static_assert(V4_D == 32, "PoM v4 requires D=32");
 #define V4_OFFSET_FIRST_SALT 0x6D1CCF96AC4D76F9ULL
 #define V4_OFFSET_STEP_SALT  0x89050E78D34609EFULL
 
+// PoM v5: n_pad == 0 runs the v4 walk.
+#define V5_P_STRIDE 4u
+#define V5_P_SALT   0x08503190C199C415ULL
+
+__device__ __forceinline__ unsigned long long v5_pad_index(
+    const unsigned int row[8], unsigned long long seed, unsigned int step, unsigned long long n_pad) {
+    unsigned long long h = 0;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) h ^= (unsigned long long)row[2 * k] | ((unsigned long long)row[2 * k + 1] << 32);
+    return mix64(seed ^ h ^ (unsigned long long)step * V5_P_SALT) % n_pad;
+}
+
+// v5 pad read on a shared-memory state.
+__device__ __forceinline__ void v5_pad_step_shared(
+    unsigned int* s_state, const unsigned int* pad, unsigned long long n_pad,
+    unsigned long long seed, unsigned int step, unsigned int x) {
+    if (n_pad == 0ULL || (step % V5_P_STRIDE) != 0u) return;
+    const unsigned int r = (step / V5_P_STRIDE) % 32u;
+    const unsigned long long idx = v5_pad_index(s_state + r * 8u, seed, step, n_pad);
+    __syncwarp();
+    if (x < 8u) s_state[r * 8u + x] ^= __ldg(&pad[idx * 8ULL + x]);
+    __syncwarp();
+}
+
+__device__ __forceinline__ unsigned long long v5_rotl(unsigned long long v, int r) { return (v << r) | (v >> (64 - r)); }
+
+// Fills pad entries [first, first + count).
+extern "C" __global__ void pom_v5_pad_fill(
+    unsigned int* pad, unsigned long long first, unsigned long long count,
+    unsigned long long w0, unsigned long long w1, unsigned long long w2, unsigned long long w3,
+    unsigned int rounds) {
+    const unsigned long long t = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= count) return;
+    const unsigned long long i = first + t;
+    unsigned long long a = w0, b = w1 ^ i, c = w2, d = w3;
+    for (unsigned int r = 0; r < rounds; r++) {
+        a += b; d ^= a; d = v5_rotl(d, 32);
+        c += d; b ^= c; b = v5_rotl(b, 24);
+        a += b; d ^= a; d = v5_rotl(d, 16);
+        c += d; b ^= c; b = v5_rotl(b, 63);
+    }
+    unsigned int* o = pad + i * 8ULL;
+    o[0] = (unsigned int)a; o[1] = (unsigned int)(a >> 32);
+    o[2] = (unsigned int)b; o[3] = (unsigned int)(b >> 32);
+    o[4] = (unsigned int)c; o[5] = (unsigned int)(c >> 32);
+    o[6] = (unsigned int)d; o[7] = (unsigned int)(d >> 32);
+}
+
 // H10/H14 seeds for a whole batch, one thread per nonce; seeds[i] belongs to nonce_base + i.
 extern "C" __global__ void pom_seed_h10_batch(
     unsigned long long nonce_base, unsigned long long n_nonces,
@@ -446,7 +494,8 @@ __device__ __forceinline__ void b3_hash_row32(const unsigned int row[8], unsigne
 // fold64(v4_state_root(S_K)); valid on thread 0 only.
 __device__ __forceinline__ unsigned long long v4_walk_block(
     const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
-    unsigned long long n_tiles, unsigned int K, unsigned long long seed, unsigned int* s_tile) {
+    unsigned long long n_tiles, unsigned int K, unsigned long long seed, unsigned int* s_tile,
+    const unsigned int* pad, unsigned long long n_pad) {
     const unsigned int x = threadIdx.x;   // state row, 0..31
 
     // S_0: mix64 keystream per row.
@@ -490,6 +539,11 @@ __device__ __forceinline__ unsigned long long v4_walk_block(
         }
         #pragma unroll
         for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = new4[k4];
+        if (n_pad != 0ULL && (step % V5_P_STRIDE) == 0u && x == (step / V5_P_STRIDE) % 32u) {
+            const unsigned long long idx = v5_pad_index(row4, seed, step, n_pad);
+            #pragma unroll
+            for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] ^= __ldg(&pad[idx * 8ULL + k4]);
+        }
         __syncwarp();
     }
 
@@ -516,7 +570,8 @@ extern "C" __global__ void pom_mine_v4(
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
     unsigned long long* winner,
-    const unsigned long long* h10_seeds, unsigned int seed_h10) {
+    const unsigned long long* h10_seeds, unsigned int seed_h10,
+    const unsigned int* pad, unsigned long long n_pad) {
     extern __shared__ unsigned int s_shared[];
     if ((unsigned long long)blockIdx.x >= n_nonces) return;
     const unsigned long long nonce = nonce_base + blockIdx.x;
@@ -524,7 +579,7 @@ extern "C" __global__ void pom_mine_v4(
         ? pom_seed_v4(seed_h10, h10_seeds, blockIdx.x, nonce, time_, s0, s1, s2, s3)
         : 0ULL;
     seed = __shfl_sync(0xFFFFFFFFu, seed, 0);
-    const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared);
+    const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared, pad, n_pad);
     if (threadIdx.x == 0) {
         unsigned long long pv[4];
         pom_pow_fold(fin, p0, p1, p2, p3, pv);
@@ -647,7 +702,8 @@ extern "C" __global__ void pom_mine_v4_tc(
     unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
     unsigned long long nonce_base, unsigned long long n_nonces,
     const unsigned int* offsets, unsigned long long* winner,
-    const unsigned long long* h10_seeds, unsigned int seed_h10) {
+    const unsigned long long* h10_seeds, unsigned int seed_h10,
+    const unsigned int* pad, unsigned long long n_pad) {
     extern __shared__ unsigned int s_shared[];
     const unsigned int w = threadIdx.x >> 5;
     const unsigned long long i = (unsigned long long)blockIdx.x * V4_TC_WARPS + w;
@@ -685,6 +741,7 @@ extern "C" __global__ void pom_mine_v4_tc(
         }
         asm volatile("cp.async.commit_group;");
         v4_imma_step(s_state, cur, step, x);
+        v5_pad_step_shared(s_state, pad, n_pad, seed, step, x);
     }
     asm volatile("cp.async.wait_group 0;");
     __syncwarp();
@@ -719,7 +776,7 @@ extern "C" __global__ void pom_mine_v4_tc(
     unsigned long long,
     unsigned long long, unsigned long long, unsigned long long, unsigned long long,
     unsigned long long, unsigned long long, const unsigned int*, unsigned long long*,
-    const unsigned long long*, unsigned int) {}
+    const unsigned long long*, unsigned int, const unsigned int*, unsigned long long) {}
 #endif
 
 // Chaseless v4 tensor-core solver: one warp per nonce derives the NEXT tile offset from the
@@ -763,7 +820,8 @@ extern "C" __global__ void pom_mine_v4_ncf(
     unsigned long long nonce_base, unsigned long long n_nonces,
     const unsigned short* lut, unsigned int lut_sh, unsigned long long inv_n,
     unsigned long long* winner,
-    const unsigned long long* h10_seeds, unsigned int seed_h10) {
+    const unsigned long long* h10_seeds, unsigned int seed_h10,
+    const unsigned int* pad, unsigned long long n_pad) {
     extern __shared__ unsigned int s_shared[];
     const unsigned int w = threadIdx.x >> 5;
     const unsigned int x = threadIdx.x & 31u;
@@ -809,6 +867,7 @@ extern "C" __global__ void pom_mine_v4_ncf(
         }
         asm volatile("cp.async.commit_group;");
         v4_imma_step(s_state, cur, step, x);
+        v5_pad_step_shared(s_state, pad, n_pad, seed, step, x);
     }
     asm volatile("cp.async.wait_group 0;");
     __syncwarp();
@@ -845,5 +904,5 @@ extern "C" __global__ void pom_mine_v4_ncf(
     unsigned long long, unsigned long long,
     const unsigned short*, unsigned int, unsigned long long,
     unsigned long long*,
-    const unsigned long long*, unsigned int) {}
+    const unsigned long long*, unsigned int, const unsigned int*, unsigned long long) {}
 #endif
