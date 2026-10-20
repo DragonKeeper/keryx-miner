@@ -78,6 +78,12 @@ pub struct GpuKernelInfo {
 /// Per-device v4 tile-offset buffer, reused across batches (the chase overwrites every word).
 /// Ported from the ocminer (suprnova) fork.
 static V4_OFFSETS: OnceLock<Mutex<HashMap<usize, Arc<CudaSlice<u32>>>>> = OnceLock::new();
+/// Host copies of the filled context pads, by (pad seed, entries), shared by every device.
+static HOST_PADS: OnceLock<Mutex<HashMap<([u8; 32], u64), Arc<Vec<u32>>>>> = OnceLock::new();
+
+fn host_pads() -> std::sync::MutexGuard<'static, HashMap<([u8; 32], u64), Arc<Vec<u32>>>> {
+    HOST_PADS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner())
+}
 
 fn v4_offsets_buf(stream: &Arc<CudaStream>, len: usize) -> Result<Arc<CudaSlice<u32>>> {
     let m = V4_OFFSETS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1122,10 +1128,18 @@ impl PomGpuMiner {
         self.n_total_chunks
     }
 
-    /// Allocates and fills the v5 context pad of `n` entries seeded by `pad_seed`.
+    /// Allocates the v5 context pad of `n` entries seeded by `pad_seed`: copied from the host
+    /// copy when one exists, else filled on the device and copied to the host.
     fn fill_pad(&self, pad_seed: &[u8; 32], n: u64) -> Result<CudaSlice<u32>> {
-        let fill = self.kernel.function_v5_pad_fill.ok_or_else(|| anyhow!("PoM GPU: no pom_v5_pad_fill entry"))?;
         let t0 = std::time::Instant::now();
+        let host = host_pads().get(&(*pad_seed, n)).cloned();
+        if let Some(host) = host {
+            let buf = self.stream.clone_htod(host.as_slice())?;
+            self.stream.synchronize()?;
+            info!("PoM v5: context pad restored from host memory in {:.2} s", t0.elapsed().as_secs_f64());
+            return Ok(buf);
+        }
+        let fill = self.kernel.function_v5_pad_fill.ok_or_else(|| anyhow!("PoM GPU: no pom_v5_pad_fill entry"))?;
         let buf = self.stream.alloc_zeros::<u32>((n * 8) as usize)?;
         let w = crate::pom_v5::v5_pad_seed_words(pad_seed);
         let rounds = crate::pom_v5::POM_V5_P_ROUNDS;
@@ -1147,6 +1161,8 @@ impl PomGpuMiner {
             }
         }
         info!("PoM v5: context pad of {} entries ({} MiB) filled in {:.1} s", n, n * 32 / (1 << 20), t0.elapsed().as_secs_f64());
+        let host: Vec<u32> = self.stream.clone_dtoh(&buf)?;
+        host_pads().entry((*pad_seed, n)).or_insert_with(|| Arc::new(host));
         Ok(buf)
     }
 
@@ -1347,6 +1363,19 @@ pub fn is_loading() -> bool {
     LOADING.load(Ordering::Relaxed) > 0
 }
 
+/// Frees the context pad of `device_id`; the next v5 search refills it.
+pub fn release_pad(device_id: u32) {
+    let miner = match miners().lock() {
+        Ok(g) => g.get(&device_id).cloned(),
+        Err(_) => None,
+    };
+    if let Some(m) = miner {
+        if m.pad.lock().map(|mut p| p.take().is_some()).unwrap_or(false) {
+            info!("PoM v5: context pad released on GPU {}", device_id);
+        }
+    }
+}
+
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 #[allow(clippy::too_many_arguments)]
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool, pad: Option<([u8; 32], u64)>) -> Option<u64> {
@@ -1357,6 +1386,9 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
+    if pad.is_some() {
+        crate::llama_engine::use_task_context(device_id as usize);
+    }
     match miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3, v4, seed_h10, seed_h14, pad) {
         Ok(found) => found,
         Err(e) => {
@@ -2218,6 +2250,11 @@ mod v3_kernel_tests {
         assert_ne!(target_v5, target_v4);
         let got_v5 = miner.mine(&PPH, TIMESTAMP, &target_v5, start, n, true, true, true, true, true, true, false, false, Some((pad_seed, n_pad))).unwrap();
         assert_eq!(got_v5, Some(want_v5), "GPU v5 walk differs from the host reference");
+
+        *miner.pad.lock().unwrap() = None;
+        assert!(host_pads().contains_key(&(pad_seed, n_pad)));
+        let restored = miner.mine(&PPH, TIMESTAMP, &target_v5, start, n, true, true, true, true, true, true, false, false, Some((pad_seed, n_pad))).unwrap();
+        assert_eq!(restored, Some(want_v5), "pad restored from host memory differs");
     }
 
     #[test]

@@ -26,6 +26,7 @@ type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
+type CtxAcquireFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
 type ProbeDeviceFn = unsafe extern "C" fn(c_int) -> c_int;
 type GenTracedFn = unsafe extern "C" fn(
@@ -78,7 +79,9 @@ type ReplayMultiFn = unsafe extern "C" fn(
     *mut u32,
 ) -> c_int;
 
-const ABI: c_int = 7;
+const ABI: c_int = 8;
+/// Context kept for the block task while the context pad is resident.
+const TASK_CONTEXT_TOKENS: c_int = 64;
 /// Largest captured leaf the engine hands back.
 const CAPTURE_CAP: usize = 4 << 20;
 
@@ -139,6 +142,7 @@ struct Engine {
     replay: ReplayFn,
     replay_multi: ReplayMultiFn,
     trace_tokens: TraceTokensFn,
+    ctx_acquire: CtxAcquireFn,
     free: FreeFn,
     tensor_device: Option<TensorDeviceFn>,
     last_error: Option<ErrorFn>,
@@ -146,6 +150,8 @@ struct Engine {
     attempt: u64,
     /// Context window the engine allocated, in tokens.
     n_ctx: c_int,
+    /// Context currently allocated, in tokens (0: none).
+    ctx_now: c_int,
     /// Leaves per traced position, 0 until the trace is configured.
     trace_leaves: usize,
     /// BLAKE3 of the configured trace manifest.
@@ -437,6 +443,9 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
         ) else {
             return Err(failed("symbols", format!("{} is missing trace symbols", so.display()), false));
         };
+        let Some(ctx_acquire) = sym::<CtxAcquireFn>(lib, "keryx_llama_context_acquire") else {
+            return Err(failed("symbols", format!("{} is missing context symbols", so.display()), false));
+        };
         let last_error = sym::<ErrorFn>(lib, "keryx_llama_last_error");
         let tensor_device = sym::<TensorDeviceFn>(lib, "keryx_llama_tensor_device");
         let cg = match CString::new(gguf) {
@@ -500,12 +509,14 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             replay,
             replay_multi,
             trace_tokens,
+            ctx_acquire,
             free,
             tensor_device,
             last_error,
             gguf: gguf.to_string(),
             attempt,
             n_ctx,
+            ctx_now: n_ctx,
             trace_leaves: 0,
             trace_manifest: [0u8; 32],
         });
@@ -581,10 +592,57 @@ pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
 }
 
 /// Generate inference text with the engine on `gpu`, which must host `gguf`.
+/// Brings back the load-size context, releasing the context pad of `gpu` first.
+fn ensure_full_context(e: &mut Engine, gpu: usize) -> Result<(), String> {
+    if e.ctx_now == e.n_ctx {
+        return Ok(());
+    }
+    crate::pom_gpu::release_pad(gpu as u32);
+    let _native = native();
+    let got = unsafe { (e.ctx_acquire)(e.model, e.n_ctx) };
+    e.ctx_now = got.max(0);
+    if got < 0 {
+        return Err(engine_error(e, "context allocation failed"));
+    }
+    log::info!("llama engine: {}-token context restored on GPU {}", got, gpu);
+    Ok(())
+}
+
+fn ensure_any_context(e: &mut Engine) -> Result<(), String> {
+    if e.ctx_now > 0 {
+        return Ok(());
+    }
+    let _native = native();
+    let got = unsafe { (e.ctx_acquire)(e.model, TASK_CONTEXT_TOKENS) };
+    e.ctx_now = got.max(0);
+    if got < 0 {
+        return Err(engine_error(e, "context allocation failed"));
+    }
+    Ok(())
+}
+
+/// Shrinks the engine context of `gpu` to the block-task size; a no-op when it already is.
+pub fn use_task_context(gpu: usize) {
+    let slot = slot(gpu);
+    let Ok(mut g) = slot.lock() else { return };
+    let Some(e) = g.as_mut() else { return };
+    if e.ctx_now == TASK_CONTEXT_TOKENS {
+        return;
+    }
+    let _native = native();
+    let got = unsafe { (e.ctx_acquire)(e.model, TASK_CONTEXT_TOKENS) };
+    e.ctx_now = got.max(0);
+    if got < 0 {
+        log::warn!("llama engine: {}", engine_error(e, "block-task context allocation failed"));
+    }
+}
+
 pub fn generate(gguf: &str, gpu: usize, prompt: &str, max_tokens: usize) -> Result<String, GenError> {
     let slot = slot(gpu);
-    let g = slot.lock().map_err(|_| GenError::Unavailable)?;
-    let e = g.as_ref().filter(|e| e.gguf == gguf).ok_or(GenError::Unavailable)?;
+    let mut g = slot.lock().map_err(|_| GenError::Unavailable)?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf).ok_or(GenError::Unavailable)?;
+    ensure_full_context(e, gpu).map_err(GenError::Failed)?;
+    let e = &*e;
     let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
     let mut buf = vec![0u8; 64 * 1024];
     let _native = native();
@@ -653,8 +711,10 @@ pub fn generate_traced(
     answer_bytes_per_position: u32,
 ) -> Result<TracedGeneration, GenError> {
     let slot = slot(gpu);
-    let g = slot.lock().map_err(|_| GenError::Unavailable)?;
-    let e = g.as_ref().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or(GenError::Unavailable)?;
+    let mut g = slot.lock().map_err(|_| GenError::Unavailable)?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or(GenError::Unavailable)?;
+    ensure_full_context(e, gpu).map_err(GenError::Failed)?;
+    let e = &*e;
     let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
     let rest = CString::new(prefix.as_ref().map_or("", |p| p.rest)).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
     let (prefix_ptr, n_prefix, head_tokens) = match &prefix {
@@ -719,8 +779,10 @@ pub fn generate_traced(
 /// Replays a traced response up to `pos` and returns the bytes of leaves `leaf_x` and `leaf_y` there.
 pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, leaf_x: u32, leaf_y: u32) -> Result<(Vec<u8>, Vec<u8>), String> {
     let slot = slot(gpu);
-    let g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
-    let e = g.as_ref().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    ensure_full_context(e, gpu)?;
+    let e = &*e;
     let mut x = vec![0u8; CAPTURE_CAP];
     let mut y = vec![0u8; CAPTURE_CAP];
     let (mut x_len, mut y_len): (u32, u32) = (0, 0);
@@ -759,8 +821,10 @@ pub struct TracedTokens {
 /// Traces `tokens` fed as a prompt, with nothing generated.
 pub fn trace_tokens(gguf: &str, gpu: usize, tokens: &[i32]) -> Result<TracedTokens, String> {
     let slot = slot(gpu);
-    let g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
-    let e = g.as_ref().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    ensure_any_context(e)?;
+    let e = &*e;
     let _native = native();
     let rc = unsafe { (e.trace_tokens)(e.model, tokens.as_ptr(), tokens.len() as c_int) };
     if rc != 0 {
@@ -786,8 +850,10 @@ pub fn replay_multi(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, caps:
         return Err("invalid replay request".to_string());
     }
     let slot = slot(gpu);
-    let g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
-    let e = g.as_ref().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
+    ensure_full_context(e, gpu)?;
+    let e = &*e;
     let pos: Vec<u32> = caps.iter().map(|c| c.0).collect();
     let leaf: Vec<u32> = caps.iter().map(|c| c.1).collect();
     let mut out = vec![0u8; caps.len() * slot_bytes];

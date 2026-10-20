@@ -343,7 +343,22 @@ struct KeryxLlama {
     std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
     std::mutex gen_lock;
     std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
+    llama_context_params cparams{}; // parameters the context was created with at load
+    std::string kv;
 };
+
+static std::string keryx_ctx_info(KeryxLlama* h) {
+    if (!h->ctx) return "no context";
+    return "n_ctx=" + std::to_string(llama_n_ctx(h->ctx)) + " kv=" + h->kv +
+           " flash_attn=" + llama_flash_attn_type_name(h->cparams.flash_attn_type) +
+           " n_batch=" + std::to_string(llama_n_batch(h->ctx)) + " n_ubatch=" + std::to_string(llama_n_ubatch(h->ctx));
+}
+
+static bool keryx_has_ctx(KeryxLlama* h) {
+    if (h->ctx) return true;
+    keryx_set_error("context", "the engine has no context");
+    return false;
+}
 
 // llama.cpp/ggml emit a large INFO-level dump on every model load (full tensor list, per-layer
 // device assignment, kv-cache map, sched-reserve…). The miner's own Rust logging already covers
@@ -412,7 +427,7 @@ static int keryx_trace_reset(KeryxLlama* h) {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 7; }
+KERYX_EXPORT int keryx_llama_abi() { return 8; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -499,9 +514,8 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
 
     auto* h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl; h->trace = trace; h->gpu = gpu;
-    h->ctx_info = "n_ctx=" + std::to_string(llama_n_ctx(ctx)) + " kv=" + kv +
-                  " flash_attn=" + llama_flash_attn_type_name(cp.flash_attn_type) +
-                  " n_batch=" + std::to_string(llama_n_batch(ctx)) + " n_ubatch=" + std::to_string(llama_n_ubatch(ctx));
+    h->cparams = cp; h->kv = kv;
+    h->ctx_info = keryx_ctx_info(h);
     if (trace) keryx_trace_meta(gpu, gguf_path, h->ctx_info, trace);
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
@@ -509,6 +523,38 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
 }
 
 KERYX_EXPORT size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
+
+// Replaces the context with one of `n_ctx` tokens (the load size when <= 0); the model and its
+// weights stay. Returns the context size, or -1 with no context left.
+KERYX_EXPORT int keryx_llama_context_acquire(KeryxLlama* h, int n_ctx) {
+    if (!h) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    llama_context_params cp = h->cparams;
+    if (n_ctx > 0) cp.n_ctx = (uint32_t)n_ctx;
+    cp.n_batch = std::min(2048u, cp.n_ctx);
+    cp.n_ubatch = std::min(512u, cp.n_batch);
+    if (h->ctx && llama_n_ctx(h->ctx) == cp.n_ctx) return (int)cp.n_ctx;
+    if (h->ctx) {
+        llama_free(h->ctx);
+        h->ctx = nullptr;
+    }
+    h->ctx = llama_init_from_model(h->model, cp);
+    h->ctx_info = keryx_ctx_info(h);
+    if (!h->ctx) {
+        keryx_set_error("context", "llama_init_from_model failed for a " + std::to_string(cp.n_ctx) + "-token context");
+        return -1;
+    }
+    return (int)llama_n_ctx(h->ctx);
+}
+
+// Frees the context (KV cache and compute buffers); the model and its weights stay.
+KERYX_EXPORT void keryx_llama_context_release(KeryxLlama* h) {
+    if (!h) return;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    if (h->ctx) llama_free(h->ctx);
+    h->ctx = nullptr;
+    h->ctx_info = keryx_ctx_info(h);
+}
 
 // Context parameters the engine ended up with, for the miner log.
 KERYX_EXPORT const char* keryx_llama_context_info(KeryxLlama* h) { return h ? h->ctx_info.c_str() : ""; }
@@ -561,6 +607,7 @@ KERYX_EXPORT int keryx_llama_tensor_device(KeryxLlama* h, size_t i) {
 KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
     if (!h || !prompt || !out || cap < 2) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
+    if (!keryx_has_ctx(h)) return -2;
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 
     std::vector<llama_token> toks(strlen(prompt) + 16);
@@ -610,6 +657,7 @@ KERYX_EXPORT int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, 
     if (!h || !prompt || !out || cap < 2 || !tokens || tokens_cap < 1 || !n_prompt_out || !n_fed_out) return -1;
     if (n_prefix > 0 && (!prefix || !rest)) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
+    if (!keryx_has_ctx(h)) return -2;
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 
     std::vector<llama_token> toks(strlen(prompt) + 16);
@@ -703,6 +751,7 @@ KERYX_EXPORT int keryx_llama_trace_tokens(KeryxLlama* h, const int32_t* tokens, 
 #else
     if (!h || !h->traced || !tokens || n_tokens <= 0) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
+    if (!keryx_has_ctx(h)) return -2;
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(h->model));
     for (int i = 0; i < n_tokens; i++) {
         if (tokens[i] < 0 || tokens[i] >= n_vocab) return -1;
@@ -724,6 +773,7 @@ KERYX_EXPORT int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest
 #else
     if (!h || !manifest) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
+    if (max_pos <= 0 && !keryx_has_ctx(h)) return -2;
     const uint32_t mp = max_pos > 0 ? (uint32_t)max_pos : (uint32_t)llama_n_ctx(h->ctx);
     const int rc = ggml_cuda_q8c_configure(h->gpu, manifest, manifest_len, mp);
     h->traced = rc == 0;
@@ -776,6 +826,7 @@ static int keryx_replay_to(KeryxLlama* h, const int32_t* tokens, int n_prompt, u
 }
 
 static int keryx_replay_begin(KeryxLlama* h, int n_tokens) {
+    if (!keryx_has_ctx(h)) return -2;
     if (n_tokens > (int)llama_n_ctx(h->ctx)) return -2;
     llama_memory_clear(llama_get_memory(h->ctx), true);
     llama_sampler_reset(h->smpl);
