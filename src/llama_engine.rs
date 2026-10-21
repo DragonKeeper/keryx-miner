@@ -152,6 +152,8 @@ struct Engine {
     n_ctx: c_int,
     /// Context currently allocated, in tokens (0: none).
     ctx_now: c_int,
+    /// The current context is the load-size one (or its floor fallback).
+    ctx_full: bool,
     /// Leaves per traced position, 0 until the trace is configured.
     trace_leaves: usize,
     /// BLAKE3 of the configured trace manifest.
@@ -517,6 +519,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             attempt,
             n_ctx,
             ctx_now: n_ctx,
+            ctx_full: true,
             trace_leaves: 0,
             trace_manifest: [0u8; 32],
         });
@@ -594,7 +597,7 @@ pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
 /// Generate inference text with the engine on `gpu`, which must host `gguf`.
 /// Brings back the load-size context, releasing the context pad of `gpu` first.
 fn ensure_full_context(e: &mut Engine, gpu: usize) -> Result<(), String> {
-    if e.ctx_now == e.n_ctx {
+    if e.ctx_full && e.ctx_now > 0 {
         return Ok(());
     }
     crate::pom_gpu::release_pad(gpu as u32);
@@ -607,6 +610,7 @@ fn ensure_full_context(e: &mut Engine, gpu: usize) -> Result<(), String> {
         }
     }
     e.ctx_now = got.max(0);
+    e.ctx_full = got >= 0;
     if got < 0 {
         return Err(engine_error(e, "context allocation failed"));
     }
@@ -614,17 +618,21 @@ fn ensure_full_context(e: &mut Engine, gpu: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_any_context(e: &mut Engine) -> Result<(), String> {
-    if e.ctx_now > 0 {
+/// A context covering `n_pos` positions: the block-task one when it is enough, else the full one.
+fn ensure_context_for(e: &mut Engine, gpu: usize, n_pos: usize) -> Result<(), String> {
+    if e.ctx_now > 0 && e.ctx_now as usize >= n_pos {
         return Ok(());
     }
-    let _native = native();
-    let got = unsafe { (e.ctx_acquire)(e.model, TASK_CONTEXT_TOKENS) };
-    e.ctx_now = got.max(0);
-    if got < 0 {
-        return Err(engine_error(e, "context allocation failed"));
+    if n_pos <= TASK_CONTEXT_TOKENS as usize {
+        let _native = native();
+        let got = unsafe { (e.ctx_acquire)(e.model, TASK_CONTEXT_TOKENS) };
+        e.ctx_now = got.max(0);
+        e.ctx_full = false;
+        if got >= 0 && got as usize >= n_pos {
+            return Ok(());
+        }
     }
-    Ok(())
+    ensure_full_context(e, gpu)
 }
 
 /// Shrinks the engine context of `gpu` to the block-task size; a no-op when it already is.
@@ -632,12 +640,13 @@ pub fn use_task_context(gpu: usize) {
     let slot = slot(gpu);
     let Ok(mut g) = slot.lock() else { return };
     let Some(e) = g.as_mut() else { return };
-    if e.ctx_now == TASK_CONTEXT_TOKENS {
+    if !e.ctx_full && e.ctx_now > 0 {
         return;
     }
     let _native = native();
     let got = unsafe { (e.ctx_acquire)(e.model, TASK_CONTEXT_TOKENS) };
     e.ctx_now = got.max(0);
+    e.ctx_full = false;
     if got < 0 {
         log::warn!("llama engine: {}", engine_error(e, "block-task context allocation failed"));
     }
@@ -787,7 +796,7 @@ pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, l
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
-    ensure_full_context(e, gpu)?;
+    ensure_context_for(e, gpu, tokens.len())?;
     let e = &*e;
     let mut x = vec![0u8; CAPTURE_CAP];
     let mut y = vec![0u8; CAPTURE_CAP];
@@ -829,7 +838,7 @@ pub fn trace_tokens(gguf: &str, gpu: usize, tokens: &[i32]) -> Result<TracedToke
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
-    ensure_any_context(e)?;
+    ensure_context_for(e, gpu, tokens.len())?;
     let e = &*e;
     let _native = native();
     let rc = unsafe { (e.trace_tokens)(e.model, tokens.as_ptr(), tokens.len() as c_int) };
@@ -858,7 +867,7 @@ pub fn replay_multi(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, caps:
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
-    ensure_full_context(e, gpu)?;
+    ensure_context_for(e, gpu, tokens.len())?;
     let e = &*e;
     let pos: Vec<u32> = caps.iter().map(|c| c.0).collect();
     let leaf: Vec<u32> = caps.iter().map(|c| c.1).collect();

@@ -1208,7 +1208,21 @@ impl PomGpuMiner {
         info!("PoM v5: context pad of {} entries ({} MiB) filled in {:.1} s", n, n * 32 / (1 << 20), t0.elapsed().as_secs_f64());
         let host: Vec<u32> = self.stream.clone_dtoh(&buf)?;
         host_pads().entry((*pad_seed, n)).or_insert_with(|| Arc::new(host));
+        self.evict_host_pads((*pad_seed, n));
         Ok(buf)
+    }
+
+    /// Drops the host pad copies no other device's pad uses, keeping `keep`.
+    fn evict_host_pads(&self, keep: ([u8; 32], u64)) {
+        let Ok(all) = miners().lock() else { return };
+        let mut live = HashSet::from([keep]);
+        for m in all.values().filter(|m| !std::ptr::eq(Arc::as_ptr(m), self)) {
+            let Ok(p) = m.pad.try_lock() else { return };
+            if let Some(s) = p.as_ref() {
+                live.insert((s.seed, s.tiles * crate::pom_v5::POM_V5_TILE_ENTRIES));
+            }
+        }
+        host_pads().retain(|k, _| live.contains(k));
     }
 
     /// Search nonces in `[start, start + batch)`. Returns the lowest nonce whose `pom_pow_value`
@@ -1412,7 +1426,9 @@ pub fn release_pad(device_id: u32) {
         Err(_) => None,
     };
     if let Some(m) = miner {
+        let _ = m.ctx.bind_to_thread();
         if m.pad.lock().map(|mut p| p.take().is_some()).unwrap_or(false) {
+            let _ = m.stream.synchronize();
             info!("PoM v5: context pad released on GPU {}", device_id);
         }
     }
