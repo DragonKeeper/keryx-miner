@@ -1091,7 +1091,7 @@ impl KeryxdHandler {
     async fn submit_opening(&mut self, response_txid: &str, seed_hash: &str, body: Vec<u8>) {
         let Some(d) = self.pending_traces.get(response_txid).and_then(|p| p.draw.as_ref()) else { return };
         let deadline_daa = d.deadline_daa;
-        let body = if d.seed_daa >= keryx_miner::pom::trace_seed_bind_activation_daa() {
+        let body = if self.last_known_daa.max(d.seed_daa) >= keryx_miner::pom::trace_seed_bind_activation_daa() {
             let Some(b) = hash32(seed_hash).and_then(|h| keryx_verifiable_inference::opening::seeded(&body, &h)) else {
                 warn!("Trace: cannot name seed block {} in the opening of response {}", seed_hash, response_txid);
                 return;
