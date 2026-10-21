@@ -68,12 +68,12 @@ fn mark_fatal_gpu_fault(device: &str, message: &str) {
 
 static NO_PAD_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// Seed and entry count of the v5 context pad of the tier `device_id` mines at `daa`.
+/// Seed and tile count of the v5 context pad of the tier `device_id` mines at `daa`.
 fn pom_v5_pad(device_id: u32, daa: u64) -> Option<([u8; 32], u64)> {
     let tier = keryx_miner::pom_gpu::current_tier(device_id, daa)?;
     let model_id = keryx_miner::pom_gpu::mining_model_id(device_id)?;
     let index = keryx_miner::pom::active_index_for_model(&model_id)?;
-    let n = keryx_miner::pom_v5::POM_V5_PAD_ENTRIES_H14.get(tier as usize).copied().unwrap_or(0);
+    let n = keryx_miner::pom_v5::POM_V5_PAD_TILES_H14.get(tier as usize).copied().unwrap_or(0);
     if n == 0 {
         if !NO_PAD_WARNED.swap(true, Ordering::AcqRel) {
             warn!("PoM v5: tier {} has no context pad — this tier cannot be mined", tier);

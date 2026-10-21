@@ -1,20 +1,28 @@
-//! PoM v5 (v4 walk + context pad) — byte-exact mirror of the node's
-//! `consensus/core/src/pom_v5.rs`. Salts, rounds and the pad read MUST stay bit-identical.
+//! PoM v5 — byte-exact mirror of the node's
+//! `consensus/core/src/pom_v5.rs`. Salts, rounds and the tile space MUST stay bit-identical.
 
-use crate::pom::{blake, mix64};
-use crate::pom_v3::fold64;
-use crate::pom_v4::{v4_initial_state, v4_state_root, v4_transition, PomProofV4, POM_V4_D, POM_V4_K};
+use crate::pom::{blake, mix64, verify_merkle, WeightIndex};
+use crate::pom_v3::{fold64, snippet_fold};
+use crate::pom_v4::{
+    v4_first_offset, v4_initial_state, v4_state_root, v4_tile_subtree_root, v4_transition, PomProofV4, PomV4RangeProof, POM_V4_D, POM_V4_K,
+    POM_V4_OFFSET_STEP_SALT, POM_V4_SNIPPET_BYTES, POM_V4_TILE_BYTES, POM_V4_TILE_CHUNKS, POM_V4_TILE_SUBTREE_DEPTH,
+};
+use anyhow::{anyhow, Result};
 
-pub const POM_V5_P_STRIDE: usize = 4;
-pub const POM_V5_P_ENTRY_BYTES: usize = POM_V4_D;
-pub const POM_V5_P_ROUNDS: u32 = 61_440;
-pub const POM_V5_P_SALT: u64 = 0x0850_3190_C199_C415;
-/// Context pad entries of each H14 tier; 0 = no pad. Mirror of the node's `POM_V5_PAD_ENTRIES_H14`.
-pub const POM_V5_PAD_ENTRIES_H14: [u64; 5] = [22_511_616, 32_243_712, 34_570_240, 57_835_520, 0];
+/// Bytes of one pad entry.
+pub const POM_V5_P_ENTRY_BYTES: usize = 32;
+/// Pad entries per pad tile.
+pub const POM_V5_TILE_ENTRIES: u64 = (POM_V4_TILE_BYTES / POM_V5_P_ENTRY_BYTES) as u64;
+/// ARX rounds per pad entry.
+pub const POM_V5_P_ROUNDS: u32 = 1_920;
+/// Context pad tiles of each H14 tier; 0 = no pad. Mirror of the node's `POM_V5_PAD_TILES_H14`.
+pub const POM_V5_PAD_TILES_H14: [u64; 5] = [1_695_744, 1_885_184, 1_912_832, 4_044_800, 0];
 
 const PAD_DOMAIN: &[u8] = b"KERYX-POM-V5-PAD";
+/// IV folded into the pad seed words.
 pub const PAD_IV: [u64; 4] = [0x510e_527f_ade6_82d1, 0x9b05_688c_2b3e_6c1f, 0x1f83_d9ab_fb41_bd6b, 0x5be0_cd19_137e_2179];
 
+/// Seed of the context pad of `tier`.
 pub fn v5_pad_seed(tier: u8, model_id: &[u8; 32], r_t: &[u8; 32]) -> [u8; 32] {
     let mut buf = Vec::with_capacity(PAD_DOMAIN.len() + 1 + 64);
     buf.extend_from_slice(PAD_DOMAIN);
@@ -46,65 +54,178 @@ pub fn v5_pad_seed_words(pad_seed: &[u8; 32]) -> [u64; 4] {
     [w(0) ^ PAD_IV[0], w(1) ^ PAD_IV[1], w(2) ^ PAD_IV[2], w(3) ^ PAD_IV[3]]
 }
 
-pub fn v5_pad_entry(pad_seed: &[u8; 32], index: u64) -> [u8; POM_V5_P_ENTRY_BYTES] {
-    let s = v5_pad_seed_words(pad_seed);
-    let (mut a, mut b, mut c, mut d) = (s[0], s[1] ^ index, s[2], s[3]);
+fn pad_entry_into(words: &[u64; 4], index: u64, out: &mut [u8]) {
+    let (mut a, mut b, mut c, mut d) = (words[0], words[1] ^ index, words[2], words[3]);
     for _ in 0..POM_V5_P_ROUNDS {
         round4(&mut a, &mut b, &mut c, &mut d);
     }
-    let mut out = [0u8; POM_V5_P_ENTRY_BYTES];
     out[0..8].copy_from_slice(&a.to_le_bytes());
     out[8..16].copy_from_slice(&b.to_le_bytes());
     out[16..24].copy_from_slice(&c.to_le_bytes());
     out[24..32].copy_from_slice(&d.to_le_bytes());
+}
+
+/// Pad entry `index` of the pad seeded by `pad_seed`.
+pub fn v5_pad_entry(pad_seed: &[u8; 32], index: u64) -> [u8; POM_V5_P_ENTRY_BYTES] {
+    let mut out = [0u8; POM_V5_P_ENTRY_BYTES];
+    pad_entry_into(&v5_pad_seed_words(pad_seed), index, &mut out);
     out
 }
 
-/// State row and pad index read after the transition of `step`, when `step` is a pad step.
-pub fn v5_pad_read(seed: u64, state: &[u8], step: u32, n_pad: u64) -> Option<(usize, u64)> {
-    if step as usize % POM_V5_P_STRIDE != 0 {
-        return None;
+/// Pad tile `tile`: its entries in order.
+pub fn v5_pad_tile(pad_seed: &[u8; 32], tile: u64) -> Vec<u8> {
+    let words = v5_pad_seed_words(pad_seed);
+    let mut out = vec![0u8; POM_V4_TILE_BYTES];
+    for (k, entry) in out.chunks_exact_mut(POM_V5_P_ENTRY_BYTES).enumerate() {
+        pad_entry_into(&words, tile * POM_V5_TILE_ENTRIES + k as u64, entry);
     }
-    let row = (step as usize / POM_V5_P_STRIDE) % POM_V4_D;
-    let r = &state[row * POM_V4_D..(row + 1) * POM_V4_D];
-    let h = (0..4).fold(0u64, |h, i| h ^ u64::from_le_bytes(r[i * 8..i * 8 + 8].try_into().unwrap()));
-    Some((row, mix64(seed ^ h ^ (step as u64).wrapping_mul(POM_V5_P_SALT)) % n_pad))
+    out
 }
 
-/// `final_state` of the v5 walk over the tiles of a v4 proof, pad entries supplied by `pad`.
-pub fn v5_final_state<F: FnMut(u64) -> [u8; POM_V5_P_ENTRY_BYTES]>(seed: u64, proof: &PomProofV4, n_pad: u64, mut pad: F) -> u64 {
-    let mut state = v4_initial_state(seed);
-    for step in 1..=POM_V4_K {
-        state = v4_transition(&state, &proof.tiles[step - 1], step as u32);
-        if let Some((row, idx)) = v5_pad_read(seed, &state, step as u32, n_pad) {
-            let entry = pad(idx);
-            for (s, e) in state[row * POM_V4_D..(row + 1) * POM_V4_D].iter_mut().zip(entry.iter()) {
-                *s ^= e;
-            }
-        }
+/// Pad steps per walk.
+pub fn v5_pad_steps(weight_tiles: u64, pad_tiles: u64) -> u64 {
+    let k = POM_V4_K as u64;
+    let n = weight_tiles + pad_tiles;
+    ((k * pad_tiles + n / 2) / n).clamp(1, k - 1)
+}
+
+/// Whether step `step` (1-based) reads a pad tile.
+pub fn v5_is_pad_step(step: u64, pad_steps: u64) -> bool {
+    let k = POM_V4_K as u64;
+    (step * pad_steps) / k != ((step - 1) * pad_steps) / k
+}
+
+/// Fold of a walk state.
+pub fn v5_state_fold(state: &[u8]) -> u64 {
+    let mut h = 0u64;
+    for r in 0..POM_V4_D {
+        let w = u64::from_le_bytes(state[r * POM_V4_D..r * POM_V4_D + 8].try_into().unwrap());
+        h ^= mix64(w ^ r as u64);
     }
-    fold64(&v4_state_root(&state))
+    h
+}
+
+/// Tile offset of step 1.
+pub fn v5_first_offset(seed: u64, weight_tiles: u64) -> u64 {
+    v4_first_offset(seed, weight_tiles)
+}
+
+/// Tile offset of step `step + 1`.
+pub fn v5_next_offset(
+    seed: u64,
+    step: u64,
+    snippet: &[u8; POM_V4_SNIPPET_BYTES],
+    state_fold: u64,
+    weight_tiles: u64,
+    pad_tiles: u64,
+    pad_steps: u64,
+) -> u64 {
+    let raw = mix64(seed ^ (step + 1).wrapping_mul(POM_V4_OFFSET_STEP_SALT) ^ snippet_fold(snippet) ^ state_fold);
+    if v5_is_pad_step(step + 1, pad_steps) {
+        weight_tiles + raw % pad_tiles
+    } else {
+        raw % weight_tiles
+    }
+}
+
+/// Runs the v5 walk; returns the derived `final_state`.
+fn walk<F>(seed: u64, weight_tiles: u64, pad_tiles: u64, pad_seed: &[u8; 32], mut fetch: F) -> Result<u64>
+where
+    F: FnMut(usize, u64) -> Result<Option<Vec<u8>>>,
+{
+    if weight_tiles == 0 || pad_tiles == 0 {
+        return Err(anyhow!("no tile space for the v5 walk"));
+    }
+    let pad_steps = v5_pad_steps(weight_tiles, pad_tiles);
+    let mut state = v4_initial_state(seed);
+    let mut off = v5_first_offset(seed, weight_tiles);
+    for step in 1..=POM_V4_K {
+        let tile = match fetch(step - 1, off)? {
+            Some(t) => t,
+            None => v5_pad_tile(pad_seed, off - weight_tiles),
+        };
+        if step < POM_V4_K {
+            let snippet: [u8; POM_V4_SNIPPET_BYTES] = tile[..POM_V4_SNIPPET_BYTES].try_into().unwrap();
+            off = v5_next_offset(seed, step as u64, &snippet, v5_state_fold(&state), weight_tiles, pad_tiles, pad_steps);
+        }
+        state = v4_transition(&state, &tile, step as u32);
+    }
+    Ok(fold64(&v4_state_root(&state)))
+}
+
+/// Builds the v5 proof of `seed` and its derived `final_state`.
+pub fn build_proof_v5(tier: u8, seed: u64, index: &WeightIndex, pad_seed: &[u8; 32], pad_tiles: u64) -> Result<(PomProofV4, u64)> {
+    let weight_tiles = index.n_chunks / POM_V4_TILE_CHUNKS;
+    let mut proof = PomProofV4 { tier, tiles: Vec::with_capacity(POM_V4_K), merkle: Vec::with_capacity(POM_V4_K) };
+    let final_state = walk(seed, weight_tiles, pad_tiles, pad_seed, |_, off| {
+        if off < weight_tiles {
+            let mut t = Vec::with_capacity(POM_V4_TILE_BYTES);
+            for c in 0..POM_V4_TILE_CHUNKS {
+                t.extend_from_slice(&index.read_chunk_bytes(off * POM_V4_TILE_CHUNKS + c));
+            }
+            let path = index.merkle_path(off * POM_V4_TILE_CHUNKS)[POM_V4_TILE_SUBTREE_DEPTH as usize..].to_vec();
+            proof.tiles.push(t.clone());
+            proof.merkle.push(PomV4RangeProof { path });
+            Ok(Some(t))
+        } else {
+            proof.tiles.push(Vec::new());
+            proof.merkle.push(PomV4RangeProof { path: Vec::new() });
+            Ok(None)
+        }
+    })?;
+    Ok((proof, final_state))
+}
+
+/// Pre-submit self-check, as the node verifies: returns the derived `final_state`.
+pub fn verify_proof_v5(seed: u64, proof: &PomProofV4, r_t: &[u8; 32], n_chunks: u64, pad_seed: &[u8; 32], pad_tiles: u64) -> Result<u64> {
+    if proof.tiles.len() != POM_V4_K || proof.merkle.len() != POM_V4_K {
+        return Err(anyhow!("v5 proof wrong shape"));
+    }
+    let weight_tiles = n_chunks / POM_V4_TILE_CHUNKS;
+    walk(seed, weight_tiles, pad_tiles, pad_seed, |i, off| {
+        let step = i + 1;
+        if off < weight_tiles {
+            if proof.tiles[i].len() != POM_V4_TILE_BYTES {
+                return Err(anyhow!("v5 weight tile wrong shape at step {step}"));
+            }
+            if !verify_merkle(v4_tile_subtree_root(&proof.tiles[i]), off, &proof.merkle[i].path, r_t) {
+                return Err(anyhow!("v5 tile fails range proof at step {step}"));
+            }
+            Ok(Some(proof.tiles[i].clone()))
+        } else {
+            if !proof.tiles[i].is_empty() || !proof.merkle[i].path.is_empty() {
+                return Err(anyhow!("v5 pad position not empty at step {step}"));
+            }
+            Ok(None)
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pom_v4::POM_V4_CHUNK_BYTES;
 
     #[test]
     fn pad_matches_the_node_vectors() {
         let seed = v5_pad_seed(1, &[7; 32], &[9; 32]);
-        assert_eq!(hex::encode(seed), NODE_PAD_SEED_HEX);
-        assert_eq!(hex::encode(v5_pad_entry(&seed, 5)), NODE_PAD_ENTRY_5_HEX);
-        let state: Vec<u8> = (0..(POM_V4_D * POM_V4_D) as u32).map(|i| (i * 37 + 11) as u8).collect();
-        assert_eq!(v5_pad_read(0xABCD, &state, 12, 1_000_003), Some(NODE_PAD_READ));
-        let tiles: Vec<Vec<u8>> =
-            (0..POM_V4_K as u32).map(|t| (0..(POM_V4_D * POM_V4_D) as u32).map(|b| (t * 31 + b * 7 + 3) as u8).collect()).collect();
-        let proof = PomProofV4 { tier: 1, tiles, merkle: Vec::new() };
-        assert_eq!(v5_final_state(0x55AA, &proof, 4_099, |i| v5_pad_entry(&seed, i)), NODE_FINAL_STATE);
+        assert_eq!(hex::encode(seed), "cb678ed7a91fb53d40ad3b966d0219e92c75ead7761d6404bd533cc7ddf34f96");
+        assert_eq!(hex::encode(v5_pad_entry(&seed, 5)), "0601327f5974ca61e9a78cd447afdda4cd64050bac6ddf552ce1a165f04727e0");
+        assert_eq!(hex::encode(blake(&v5_pad_tile(&seed, 3))), "fa8d888e763b63542c23ad2a3e2ac715bf180f51f6b0c357a0399595593d55c2");
     }
 
-    const NODE_PAD_SEED_HEX: &str = "cb678ed7a91fb53d40ad3b966d0219e92c75ead7761d6404bd533cc7ddf34f96";
-    const NODE_PAD_ENTRY_5_HEX: &str = "f849c84e259e59e8fef1d78da4de56d6f9df69aad05f571404d9a6372b35911c";
-    const NODE_PAD_READ: (usize, u64) = (3, 172_680);
-    const NODE_FINAL_STATE: u64 = 10_975_683_372_132_145_722;
+    #[test]
+    fn walk_matches_the_node_vector() {
+        let mut blob = vec![0u8; 64 * POM_V4_TILE_BYTES + 3 * POM_V4_CHUNK_BYTES];
+        let mut h = 0xC0FFEEu64;
+        for b in blob.iter_mut() {
+            h = crate::pom::mix64(h);
+            *b = h as u8;
+        }
+        let index = crate::pom::index_from_ram(blob);
+        let seed = v5_pad_seed(1, &[7; 32], &[9; 32]);
+        let (proof, fs) = build_proof_v5(1, 0x55AA, &index, &seed, 61).unwrap();
+        assert_eq!(fs, 5_477_356_865_520_795_736);
+        assert_eq!(verify_proof_v5(0x55AA, &proof, &index.r_t, index.n_chunks, &seed, 61).unwrap(), fs);
+    }
 }
