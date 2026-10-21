@@ -387,6 +387,7 @@ message GetSubnetworkResponseMessage{
 // parent chain from some startHash to this kaspad's current virtual
 message GetVirtualSelectedParentChainFromBlockRequestMessage{
   string startHash = 1;
+  bool includeAcceptedTransactionIds = 2;
 }
 
 message GetVirtualSelectedParentChainFromBlockResponseMessage{
@@ -395,6 +396,9 @@ message GetVirtualSelectedParentChainFromBlockResponseMessage{
 
   // The chain blocks that were added, in low-to-high order
   repeated string addedChainBlockHashes = 3;
+
+  // The transactions accepted by each added block, when asked for.
+  repeated RpcAcceptedTransactionIds acceptedTransactionIds = 2;
 
   RPCError error = 1000;
 }

@@ -127,6 +127,12 @@ const OPENING_NOT_AWAITED_MAX_ATTEMPTS: u32 = 5;
 /// Built opening bodies kept per response, one per seed block.
 const BUILT_OPENINGS_KEPT: usize = 4;
 
+/// Failed chain rebuilds from one accepting block before its response is dropped.
+const CHAIN_RESTORE_MAX_FAILURES: u32 = 3;
+
+/// Failed replays of one draw before it is given up.
+const REPLAY_MAX_FAILURES: u32 = 2;
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use log::{error, info, warn};
@@ -196,6 +202,8 @@ struct TraceDraw {
     deadline_daa: u64,
     /// A replay was started for this seed.
     opened: bool,
+    /// Replays of this seed that built no opening.
+    replay_failures: u32,
 }
 
 /// A chain block in chain order; its DAA score arrives with the GetBlock answer.
@@ -239,11 +247,11 @@ fn seed_block_after<'a>(log: &'a VecDeque<ChainEntry>, accepted: &str) -> Option
     None
 }
 
-/// Puts `added`, the chain after `start` in chain order, right behind `start` in `log`, moving the
-/// blocks already logged elsewhere and keeping their DAA scores. Returns the placed blocks whose
-/// DAA score is unknown; nothing is placed while `start` is not logged.
+/// Puts `added`, the chain after `start` in chain order, right behind `start` in `log` (at its end
+/// when `start` is not logged), moving the blocks already logged elsewhere and keeping their DAA
+/// scores. Returns the placed blocks whose DAA score is unknown.
 fn place_chain_after(log: &mut VecDeque<ChainEntry>, start: &str, added: Vec<String>) -> Vec<String> {
-    let Some(pos) = log.iter().position(|e| e.hash == start) else { return Vec::new() };
+    let pos = log.iter().position(|e| e.hash == start).unwrap_or(usize::MAX);
     let added_set: std::collections::HashSet<&str> = added.iter().map(String::as_str).collect();
     let mut known: std::collections::HashMap<String, Option<u64>> = std::collections::HashMap::new();
     let mut kept: VecDeque<ChainEntry> = VecDeque::with_capacity(log.len() + added.len());
@@ -257,6 +265,9 @@ fn place_chain_after(log: &mut VecDeque<ChainEntry>, start: &str, added: Vec<Str
         if i == pos {
             at = kept.len();
         }
+    }
+    if pos == usize::MAX {
+        at = kept.len();
     }
     let mut unknown = Vec::new();
     for (k, hash) in added.into_iter().enumerate() {
@@ -346,6 +357,8 @@ pub struct KeryxdHandler {
     /// Accepting blocks whose chain is asked for after a restart, one request at a time; their
     /// traces are not drawn before the answer.
     chain_restore_starts: VecDeque<String>,
+    /// Failed chain rebuilds, by accepting block.
+    chain_restore_failures: std::collections::HashMap<String, u32>,
 
     /// In-flight replay building an opening.
     replay_rx: Option<ReplayJob>,
@@ -550,6 +563,7 @@ impl KeryxdHandler {
             chain_restore_queue: VecDeque::new(),
             chain_restore_pending: std::collections::HashSet::new(),
             chain_restore_starts: VecDeque::new(),
+            chain_restore_failures: std::collections::HashMap::new(),
             replay_rx: None,
             opening_inflight: restored_openings,
             publish_rx: None,
@@ -1041,7 +1055,21 @@ impl KeryxdHandler {
             Err(_) => None,
         };
         let Some(body) = body else {
-            warn!("Trace: no opening built for response {}", job.response_txid);
+            let retry = self
+                .pending_traces
+                .get_mut(&job.response_txid)
+                .and_then(|p| p.draw.as_mut())
+                .filter(|d| d.seed_hash == job.seed_hash)
+                .map(|d| {
+                    d.replay_failures += 1;
+                    d.opened = d.replay_failures > REPLAY_MAX_FAILURES;
+                    !d.opened
+                });
+            if retry == Some(true) {
+                warn!("Trace: no opening built for response {} — retrying", job.response_txid);
+            } else {
+                warn!("Trace: no opening built for response {}", job.response_txid);
+            }
             return true;
         };
         let Some(p) = self.pending_traces.get_mut(&job.response_txid) else { return true };
@@ -1246,7 +1274,11 @@ impl KeryxdHandler {
     async fn request_next_chain_restore(&mut self) -> Result<(), Error> {
         let Some(hash) = self.chain_restore_starts.front().cloned() else { return Ok(()) };
         info!("Trace: rebuilding the chain from block {} for a restored response", hash);
-        self.client_send(crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage { start_hash: hash }).await?;
+        self.client_send(crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage {
+            start_hash: hash,
+            include_accepted_transaction_ids: true,
+        })
+        .await?;
         Ok(())
     }
 
@@ -1258,6 +1290,45 @@ impl KeryxdHandler {
         }
         let unknown = place_chain_after(&mut self.chain_log, start, added);
         self.chain_restore_queue.extend(unknown);
+    }
+
+    /// Retries a failed chain rebuild from `start`; past the limit, drops the responses it
+    /// accepted.
+    fn on_chain_restore_failed(&mut self, start: String, error: &str) {
+        let failures = self.chain_restore_failures.entry(start.clone()).or_insert(0);
+        *failures += 1;
+        if *failures < CHAIN_RESTORE_MAX_FAILURES {
+            warn!("Trace: chain rebuild from block {} failed: {} — retrying", start, error);
+            self.chain_restore_starts.push_back(start);
+            return;
+        }
+        warn!("Trace: chain rebuild from block {} failed: {} — its responses are dropped", start, error);
+        self.chain_restore_failures.remove(&start);
+        let dropped: Vec<String> =
+            self.pending_traces.iter().filter(|(_, p)| p.accepted_hash.as_deref() == Some(start.as_str())).map(|(t, _)| t.clone()).collect();
+        for txid in dropped {
+            self.pending_traces.remove(&txid);
+            self.trace_store.remove(&txid);
+            self.opening_inflight.retain(|_, o| o.response_txid != txid);
+        }
+        self.chain_log.retain(|e| e.hash != start);
+    }
+
+    /// Notes the acceptances of restored responses that lost their accepting block.
+    fn note_restored_acceptances(&mut self, accepted: &[crate::proto::RpcAcceptedTransactionIds]) {
+        let mut noted: Vec<String> = Vec::new();
+        for a in accepted {
+            for txid in &a.accepted_transaction_ids {
+                if let Some(p) = self.pending_traces.get_mut(txid).filter(|p| p.accepted_hash.is_none()) {
+                    p.accepted_hash = Some(a.accepting_block_hash.clone());
+                    info!("Trace: response {} accepted by chain block {}", txid, a.accepting_block_hash);
+                    noted.push(txid.clone());
+                }
+            }
+        }
+        for txid in noted {
+            self.persist_trace(&txid);
+        }
     }
 
     /// Fetches the queued chain blocks a few at a time until every restored trace is drawn.
@@ -1278,7 +1349,7 @@ impl KeryxdHandler {
     }
 
     fn note_chain_block(&mut self, hash: &str, daa: u64) {
-        if let Some(e) = self.chain_log.iter_mut().rev().find(|e| e.hash == hash) {
+        for e in self.chain_log.iter_mut().filter(|e| e.hash == hash) {
             e.daa = Some(daa);
         }
     }
@@ -1338,6 +1409,7 @@ impl KeryxdHandler {
                     audited,
                     deadline_daa,
                     opened: p.opening.as_ref().is_some_and(|o| o.seed_hash == seed_hash),
+                    replay_failures: 0,
                 },
             ));
         }
@@ -2106,7 +2178,9 @@ impl KeryxdHandler {
                 }
                 self.on_chain_blocks_removed(&notif.removed_chain_block_hashes);
                 for hash in &notif.added_chain_block_hashes {
-                    self.chain_log.push_back(ChainEntry { hash: hash.clone(), daa: None });
+                    if !self.chain_log.iter().any(|e| &e.hash == hash) {
+                        self.chain_log.push_back(ChainEntry { hash: hash.clone(), daa: None });
+                    }
                 }
                 let mut accepted_now: Vec<String> = Vec::new();
                 for accepted in &notif.accepted_transaction_ids {
@@ -2128,8 +2202,12 @@ impl KeryxdHandler {
             Payload::GetVirtualSelectedParentChainFromBlockResponse(msg) => {
                 let Some(start) = self.chain_restore_starts.pop_front() else { return Ok(()) };
                 match msg.error {
-                    Some(e) => warn!("Trace: chain rebuild from block {} failed: {}", start, e.message),
-                    None => self.place_restored_chain(&start, &msg.removed_chain_block_hashes, msg.added_chain_block_hashes),
+                    Some(e) => self.on_chain_restore_failed(start, &e.message),
+                    None => {
+                        self.chain_restore_failures.remove(&start);
+                        self.place_restored_chain(&start, &msg.removed_chain_block_hashes, msg.added_chain_block_hashes);
+                        self.note_restored_acceptances(&msg.accepted_transaction_ids);
+                    }
                 }
                 self.resolve_traces();
                 self.request_next_chain_restore().await?;
@@ -2302,7 +2380,8 @@ mod tests {
         log[2].daa = Some(1_000 + delay + 1);
         assert_eq!(seed_block_after(&log, "b"), Some(("d", 1_000 + delay + 1, 1_000)));
 
-        assert!(place_chain_after(&mut log, "unknown", vec!["x".into()]).is_empty());
-        assert_eq!(log.len(), 4);
+        assert_eq!(place_chain_after(&mut log, "gone", vec!["d".into(), "x".into()]), vec!["x".to_string()]);
+        let order: Vec<&str> = log.iter().map(|e| e.hash.as_str()).collect();
+        assert_eq!(order, ["b", "c", "z", "d", "x"], "a chain whose start left the log goes to its end");
     }
 }
