@@ -1630,7 +1630,7 @@ pub fn pom_v4_activation_daa() -> u64 {
 
 /// Node `pom_v5_activation`: the walk also reads the tier's context pad.
 pub fn pom_v5_activation_daa() -> u64 {
-    gate(u64::MAX, u64::MAX)
+    gate(u64::MAX, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// Block task gate: headers carry `task_root`, hashed into the pre-PoW and block hashes.
