@@ -649,6 +649,8 @@ pub fn use_task_context(gpu: usize) {
     e.ctx_full = false;
     if got < 0 {
         log::warn!("llama engine: {}", engine_error(e, "block-task context allocation failed"));
+    } else {
+        log::info!("llama engine: {}-token mining context on GPU {}", got, gpu);
     }
 }
 

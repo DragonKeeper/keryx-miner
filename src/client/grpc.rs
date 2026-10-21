@@ -189,6 +189,8 @@ struct PendingTrace {
     opening: Option<keryx_miner::trace_store::StoredOpening>,
     /// Unsigned opening bodies already built, by seed block.
     built: Vec<(String, Vec<u8>)>,
+    /// Chain reorgs that reset its acceptance or draw.
+    reorgs: u32,
 }
 
 /// The draw of an accepted response once its seed block is on the chain.
@@ -984,7 +986,10 @@ impl KeryxdHandler {
         }
         let lookup = task_window_seed(&self.client, &parents, window_start(w), &mut self.task_chain);
         match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
-            Ok(Some(seed)) => keryx_miner::block_task::set_seed(w, &key, seed),
+            Ok(Some(seed)) => {
+                keryx_miner::block_task::set_seed(w, &key, seed);
+                keryx_miner::pom_gpu::log_throttled(u32::MAX, "seed", || info!("Block task: seed of window {} resolved", w));
+            }
             Ok(None) => warn!("Block task: no seed block found for window {}", w),
             Err(_) => warn!("Block task: seed lookup for window {} timed out", w),
         }
@@ -1235,6 +1240,7 @@ impl KeryxdHandler {
                     draw: None,
                     opening: t.opening,
                     built: Vec::new(),
+                    reorgs: 0,
                 },
             );
         }
@@ -1373,10 +1379,11 @@ impl KeryxdHandler {
             }
         }
         for txid in reset {
-            info!("Trace: chain reorg — the draw of response {} is reset", txid);
+            log::debug!("Trace: chain reorg — the draw of response {} is reset", txid);
             self.opening_inflight.retain(|_, o| o.response_txid != txid);
             if let Some(p) = self.pending_traces.get_mut(&txid) {
                 p.opening = None;
+                p.reorgs += 1;
             }
             self.persist_trace(&txid);
         }
@@ -1415,7 +1422,12 @@ impl KeryxdHandler {
         }
         for (txid, d) in drawn {
             if d.audited {
-                info!("Trace: response {} drawn for audit, opening due by DAA {}", txid, d.deadline_daa);
+                let reorgs = self.pending_traces.get(&txid).map_or(0, |p| p.reorgs);
+                if reorgs == 0 {
+                    info!("Trace: response {} drawn for audit, opening due by DAA {}", txid, d.deadline_daa);
+                } else {
+                    info!("Trace: response {} drawn for audit after {} chain reorgs, opening due by DAA {}", txid, reorgs, d.deadline_daa);
+                }
             }
             if let Some(p) = self.pending_traces.get_mut(&txid) {
                 p.draw = Some(d);
@@ -1716,6 +1728,7 @@ impl KeryxdHandler {
                     draw: None,
                     opening: None,
                     built: Vec::new(),
+                    reorgs: 0,
                 };
                 self.pending_traces.insert(txid.clone(), pending);
                 self.persist_trace(&txid);
@@ -1900,6 +1913,7 @@ impl KeryxdHandler {
                 // Inference is mandatory: refuse to mine if no models are ready.
                 // Covers miners with missing/truncated model files that somehow passed prefetch.
                 if keryx_miner::llm::loaded_model_ids().is_empty() {
+                    keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-no-models", || warn!("Template held: no loaded model"));
                     // Throttle to one log per ~200 templates (~every 20s at 10 BPS) to avoid spam.
                     if self.last_known_daa % 200 == 0 {
                         if keryx_miner::llm::publishing_blocked() {
@@ -1924,6 +1938,10 @@ impl KeryxdHandler {
                 // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
                 // This covers both regular AiRequest inference and node-issued challenge inference.
                 if self.inference_busy() {
+                    let (inf, chal, rep) = (self.inference_rx.is_some(), self.challenge_inference_rx.is_some(), self.replay_rx.is_some());
+                    keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-busy", || {
+                        info!("Template held: inference {} challenge {} replay {}", inf, chal, rep)
+                    });
                     self.set_opoi_pause(true);
                     miner.process_block(None).await?;
                     return Ok(());
@@ -2187,7 +2205,11 @@ impl KeryxdHandler {
                     for txid in &accepted.accepted_transaction_ids {
                         if let Some(p) = self.pending_traces.get_mut(txid).filter(|p| p.accepted_hash.is_none()) {
                             p.accepted_hash = Some(accepted.accepting_block_hash.clone());
-                            info!("Trace: response {} accepted by chain block {}", txid, accepted.accepting_block_hash);
+                            if p.reorgs == 0 {
+                                info!("Trace: response {} accepted by chain block {}", txid, accepted.accepting_block_hash);
+                            } else {
+                                log::debug!("Trace: response {} accepted by chain block {}", txid, accepted.accepting_block_hash);
+                            }
                             accepted_now.push(txid.clone());
                         }
                     }

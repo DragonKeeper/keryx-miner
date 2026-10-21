@@ -452,7 +452,21 @@ impl MinerManager {
                                         task_state = None;
                                     }
                                 },
-                                None => task_state = None,
+                                None => {
+                                    task_state = None;
+                                    let w = keryx_verifiable_inference::block_task::window(daa);
+                                    let seed_known = w.zip(s.parents_key()).is_some_and(|(w, p)| keryx_miner::block_task::seed(w, &p).is_some());
+                                    keryx_miner::pom_gpu::log_throttled(worker_device_id, "no-task", || {
+                                        info!(
+                                            "PoM[gpu{}]: no block task yet (daa {}, window {:?}, seed known {}, tier {:?})",
+                                            worker_device_id,
+                                            daa,
+                                            w,
+                                            seed_known,
+                                            keryx_miner::pom_gpu::current_tier(worker_device_id, daa)
+                                        )
+                                    });
+                                }
                             }
                             if task_state.as_ref().is_none_or(|ts| ts.0 != s.id) {
                                 if let Some(cmd) = block_channel.get_changed()? {
@@ -522,6 +536,16 @@ impl MinerManager {
                         let v5 = v4 && daa >= keryx_miner::pom::pom_v5_activation_daa();
                         let pad = if v5 { pom_v5_pad(worker_device_id, daa) } else { None };
                         if v5 && pad.is_none() {
+                            keryx_miner::pom_gpu::log_throttled(worker_device_id, "no-pad", || {
+                                let model = keryx_miner::pom_gpu::mining_model_id(worker_device_id);
+                                warn!(
+                                    "PoM[gpu{}]: no context pad (tier {:?}, model {}, index {})",
+                                    worker_device_id,
+                                    keryx_miner::pom_gpu::current_tier(worker_device_id, daa),
+                                    model.map_or("none".to_string(), |m| hex::encode(&m[..4])),
+                                    model.and_then(|m| keryx_miner::pom::active_index_for_model(&m)).is_some()
+                                )
+                            });
                             std::thread::sleep(std::time::Duration::from_millis(200));
                             continue;
                         }

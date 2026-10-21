@@ -1085,8 +1085,9 @@ impl PomGpuMiner {
         if n_total_chunks == 0 {
             return Err(anyhow!("PoM GPU: llama engine produced 0 chunks"));
         }
+        let uploaded_mib = uploads.iter().map(|u| u.len()).sum::<usize>() >> 20;
         info!(
-            "PoM llama canonical gather: {} tensors ({} zero-dup, {} host uploads, {} index uploads{}), N={} chunks",
+            "PoM llama canonical gather: {} tensors ({} zero-dup, {} host uploads, {} index uploads{}, {} MiB uploaded), N={} chunks",
             bases.len(),
             plan.zero_dup,
             plan.host_uploads,
@@ -1096,6 +1097,7 @@ impl PomGpuMiner {
             } else {
                 format!(": {}", plan.index_uploads.iter().take(4).cloned().collect::<Vec<_>>().join(", "))
             },
+            uploaded_mib,
             n_total_chunks
         );
         // BYTE GATE (consensus safety): the pool does not deep-verify every share, so a wrong
@@ -1185,7 +1187,10 @@ impl PomGpuMiner {
             return Ok(buf);
         }
         let fill = self.kernel.function_v5_pad_fill.ok_or_else(|| anyhow!("PoM GPU: no pom_v5_pad_fill entry"))?;
-        let buf = self.stream.alloc_zeros::<u32>((n * 8) as usize)?;
+        let need_mib = n * 32 >> 20;
+        let free_mib = result::mem_get_info().map_or(0, |(free, _)| free >> 20);
+        info!("PoM v5: allocating a {} MiB context pad ({} MiB free)", need_mib, free_mib);
+        let buf = self.stream.alloc_zeros::<u32>((n * 8) as usize).map_err(|e| anyhow!("context pad of {} MiB with {} MiB free: {}", need_mib, free_mib, e))?;
         let w = crate::pom_v5::v5_pad_seed_words(pad_seed);
         let rounds = crate::pom_v5::POM_V5_P_ROUNDS;
         {
@@ -1419,6 +1424,19 @@ pub fn is_loading() -> bool {
     LOADING.load(Ordering::Relaxed) > 0
 }
 
+/// Runs `log` at most once every 30 s per device and `kind`.
+pub fn log_throttled(device_id: u32, kind: &'static str, log: impl FnOnce()) {
+    static LAST: OnceLock<Mutex<HashMap<(u32, &'static str), std::time::Instant>>> = OnceLock::new();
+    let mut g = LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
+    let now = std::time::Instant::now();
+    if g.get(&(device_id, kind)).is_some_and(|t| now.duration_since(*t).as_secs() < 30) {
+        return;
+    }
+    g.insert((device_id, kind), now);
+    drop(g);
+    log();
+}
+
 /// Frees the context pad of `device_id`; the next v5 search refills it.
 pub fn release_pad(device_id: u32) {
     let miner = match miners().lock() {
@@ -1438,6 +1456,7 @@ pub fn release_pad(device_id: u32) {
 #[allow(clippy::too_many_arguments)]
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool, pad: Option<([u8; 32], u64)>) -> Option<u64> {
     if inference_paused() {
+        log_throttled(device_id, "paused", || info!("PoM[gpu{}]: mining paused while an inference runs", device_id));
         return None;
     }
     let miner = {
