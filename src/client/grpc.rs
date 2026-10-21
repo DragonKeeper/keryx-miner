@@ -127,6 +127,11 @@ const OPENING_NOT_AWAITED_MAX_ATTEMPTS: u32 = 5;
 /// Built opening bodies kept per response, one per seed block.
 const BUILT_OPENINGS_KEPT: usize = 4;
 
+/// Node silence after which a template request probes the connection.
+const NODE_SILENCE_PROBE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Node silence after which the connection is dropped and reopened.
+const NODE_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Failed chain rebuilds from one accepting block before its response is dropped.
 const CHAIN_RESTORE_MAX_FAILURES: u32 = 3;
 
@@ -407,6 +412,9 @@ pub struct KeryxdHandler {
 
     /// Last service-bond strike poll instant.
     last_strike_poll: std::time::Instant,
+    /// Last message received from the node, and last probe sent while it is silent.
+    last_message: std::time::Instant,
+    last_probe: std::time::Instant,
 
     /// Last rendered service-bond status — logged only on change.
     strike_status: Option<String>,
@@ -442,6 +450,9 @@ impl Client for KeryxdHandler {
                 msg = self.stream.message() => Some(msg?),
                 _ = tick.tick() => None,
             };
+            if maybe_msg.is_some() {
+                self.last_message = std::time::Instant::now();
+            }
             match maybe_msg {
                 Some(Some(m)) => match m.payload {
                     Some(payload) => self.handle_message(payload, miner).await?,
@@ -449,6 +460,15 @@ impl Client for KeryxdHandler {
                 },
                 Some(None) => break, // stream closed by node
                 None => {
+                    let silent = self.last_message.elapsed();
+                    if silent >= NODE_SILENCE_LIMIT {
+                        return Err(format!("no message from keryxd for {} s — reconnecting", silent.as_secs()).into());
+                    }
+                    if silent >= NODE_SILENCE_PROBE && self.last_probe.elapsed() >= NODE_SILENCE_PROBE {
+                        self.last_probe = std::time::Instant::now();
+                        warn!("No message from keryxd for {} s — probing", silent.as_secs());
+                        self.client_get_block_template().await?;
+                    }
                     // Timer tick: if a regular inference just finished, get a fresh template.
                     if (self.inference_rx.is_some() || self.publish_rx.is_some()) && self.poll_inference().await {
                         self.client_get_block_template().await?;
@@ -528,7 +548,15 @@ impl KeryxdHandler {
             }
         };
 
-        let mut client = RpcClient::connect(address).await?;
+        let endpoint: tonic::transport::Endpoint = address.try_into().map_err(Into::into)?;
+        let channel = endpoint
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+            .keep_alive_timeout(std::time::Duration::from_secs(20))
+            .keep_alive_while_idle(true)
+            .connect()
+            .await?;
+        let mut client = RpcClient::new(channel);
         // Outbound message channel to the node. ALL client->node messages share this:
         // mining (submit_block, GetBlockTemplate) AND inference traffic (per-block GetBlock,
         // escrow submit_transaction). With a capacity of 2 the inference traffic could fill the
@@ -579,6 +607,8 @@ impl KeryxdHandler {
             escrow_cert,
             service_identity,
             last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
+            last_message: std::time::Instant::now(),
+            last_probe: std::time::Instant::now(),
             strike_status: None,
             stats: None,
             misses_seen: std::collections::HashSet::new(),
@@ -1827,6 +1857,7 @@ impl KeryxdHandler {
                         if !self.inference_busy() && !self.ai_request_queue.is_empty()
                         {
                             self.set_opoi_pause(true);
+                            keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-queue-a", || info!("Template held: request queue of {} waiting to start", self.ai_request_queue.len()));
                             miner.process_block(None).await?;
                             self.try_start_inference();
                         }
@@ -1862,6 +1893,13 @@ impl KeryxdHandler {
                 None => self.report_service_strikes(&resp),
             },
             Payload::GetBlockTemplateResponse(template) => {
+                static TEMPLATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = TEMPLATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let daa = template.block.as_ref().and_then(|b| b.header.as_ref()).map_or(0, |h| h.daa_score);
+                let (synced, err) = (template.is_synced, template.error.is_some());
+                keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-count", || {
+                    info!("Templates: {} received, last at daa {} (synced {}, error {}, queue {})", n, daa, synced, err, self.ai_request_queue.len())
+                });
                 // Track DAA score for challenge_window_end computation.
                 if let Some(daa) = template.block.as_ref()
                     .and_then(|b| b.header.as_ref())
@@ -1932,6 +1970,7 @@ impl KeryxdHandler {
                 if !self.inference_busy() && !self.ai_request_queue.is_empty()
                 {
                     self.set_opoi_pause(true);
+                    keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-queue-b", || info!("Template held: request queue of {} waiting to start", self.ai_request_queue.len()));
                     miner.process_block(None).await?;
                     self.try_start_inference();
                 }
@@ -1964,7 +2003,10 @@ impl KeryxdHandler {
                         }))
                         .await?
                     }
-                    (_, false, None) => miner.process_block(None).await?,
+                    (_, false, None) => {
+                        keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-unsynced", || warn!("Template held: node reports not synced"));
+                        miner.process_block(None).await?
+                    }
                     (_, _, Some(e)) => {
                         return Err(format!("GetTemplate returned with an error: {:?}", e).into());
                     }
@@ -2022,6 +2064,7 @@ impl KeryxdHandler {
                         if !self.inference_busy() && !self.ai_request_queue.is_empty()
                         {
                             self.set_opoi_pause(true);
+                            keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-queue-a", || info!("Template held: request queue of {} waiting to start", self.ai_request_queue.len()));
                             miner.process_block(None).await?;
                             self.try_start_inference();
                         }
