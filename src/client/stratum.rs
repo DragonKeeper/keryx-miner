@@ -27,7 +27,7 @@ use crate::pow::BlockSeed::PartialBlock;
 use crate::{miner::MinerManager, Error, Uint256};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use statum_codec::NewLineJsonCodec;
 use std::sync::OnceLock;
 use tokio::sync::mpsc::{self, Sender};
@@ -432,8 +432,7 @@ impl StratumHandler {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
                                     info!("Share accepted");
                                 } else {
-                                    info!("{:?} (Last: {})", msg.clone(), self.last_stratum_id.load(Ordering::SeqCst));
-                                    warn!("Ignoring result for now");
+                                    debug!("Stratum result for a non-share request: {:?}", msg);
                                 }
                                 Ok(())
                             }

@@ -603,7 +603,8 @@ impl MinerManager {
                                     state = None;
                                 }
                             }
-                        } else if let Some(cmd) = block_channel.get_changed()? {
+                        }
+                        if let Some(cmd) = block_channel.get_changed()? {
                             state = match cmd {
                                 Some(WorkerCommand::Job(ns)) => Some(ns),
                                 Some(WorkerCommand::Close) => return Ok(()),
