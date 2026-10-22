@@ -40,6 +40,10 @@ pub enum BlockSeed {
         nonce_fixed: u64,
         hash: Option<String>,
         pom_proof: Vec<u8>,
+        /// Full template header of a v4 job; `header_hash` is then derived from it.
+        header: Option<Box<RpcBlockHeader>>,
+        /// Block task root committed in `header`, sent back with the share.
+        task_root: Option<[u8; 32]>,
     },
 }
 
@@ -156,9 +160,17 @@ impl State {
                 ref target,
                 nonce_fixed: fixed,
                 nonce_mask: mask,
+                ref header,
                 ..
             } => {
-                pre_pow_hash = Hash::new(*header_hash);
+                pre_pow_hash = match header {
+                    Some(h) => {
+                        let mut hasher = HeaderHasher::new();
+                        serialize_header(&mut hasher, h, true);
+                        hasher.finalize()
+                    }
+                    None => Hash::new(*header_hash),
+                };
                 header_timestamp = *timestamp;
                 header_target = *target;
                 daa_score = *block_daa_score;
@@ -204,14 +216,21 @@ impl State {
         matches!(*self.block, BlockSeed::PartialBlock { .. })
     }
 
+    /// Whether this job carries its full header, so that the block task applies to it.
+    pub fn has_template_header(&self) -> bool {
+        match &*self.block {
+            BlockSeed::FullBlock { .. } => true,
+            BlockSeed::PartialBlock { header, .. } => header.is_some(),
+        }
+    }
+
     /// `block_task::parents_key` of the template's direct parents.
     pub fn parents_key(&self) -> Option<String> {
-        match &*self.block {
-            BlockSeed::FullBlock { block, .. } => {
-                block.header.as_ref()?.parents.first().map(|p| keryx_miner::block_task::parents_key(&p.parent_hashes))
-            }
-            _ => None,
-        }
+        let header = match &*self.block {
+            BlockSeed::FullBlock { block, .. } => block.header.as_ref()?,
+            BlockSeed::PartialBlock { header, .. } => header.as_deref()?,
+        };
+        header.parents.first().map(|p| keryx_miner::block_task::parents_key(&p.parent_hashes))
     }
 
     #[inline(always)]
@@ -251,7 +270,15 @@ impl State {
                 block.header.as_mut().ok_or("Header is missing")?.task_root = hex::encode(root);
                 State::new(self.id, BlockSeed::FullBlock { block, device_id: device_id.clone() })
             }
-            BlockSeed::PartialBlock { .. } => Err("a pool job carries no block task".into()),
+            BlockSeed::PartialBlock { header: Some(_), .. } => {
+                let mut seed = (*self.block).clone();
+                if let BlockSeed::PartialBlock { header: Some(h), task_root, .. } = &mut seed {
+                    h.task_root = hex::encode(root);
+                    *task_root = Some(*root);
+                }
+                State::new(self.id, seed)
+            }
+            BlockSeed::PartialBlock { .. } => Err("a v3 pool job carries no block task".into()),
         }
     }
 
@@ -328,9 +355,22 @@ impl State {
                 task: None,
             };
             let mut won = self.assemble_pom_block(nonce, final_state, tier, Vec::new())?;
-            if let (Some(t), BlockSeed::FullBlock { block, .. }) = (task, &won) {
-                let hash = block.block_hash()?.to_le_bytes();
-                proof.task = Some(keryx_miner::llm::open_block_task(&t.model_id, t.tier, &t.trace, &t.seed, &hash)?);
+            match (task, &won) {
+                (Some(t), BlockSeed::FullBlock { block, .. }) => {
+                    let hash = block.block_hash()?.to_le_bytes();
+                    proof.task = Some(keryx_miner::llm::open_block_task(&t.model_id, t.tier, &t.trace, &t.seed, &hash)?);
+                }
+                (Some(t), BlockSeed::PartialBlock { header: Some(h), .. }) => {
+                    let network_target = target::u256_from_compact_target(h.bits);
+                    if pom::le_leq(&pow_value, &network_target.to_le_bytes()) {
+                        let mut header = (**h).clone();
+                        fill_pom_header(&mut header, nonce, final_state, tier);
+                        let block = RpcBlock { header: Some(header), ..Default::default() };
+                        let hash = block.block_hash()?.to_le_bytes();
+                        proof.task = Some(keryx_miner::llm::open_block_task(&t.model_id, t.tier, &t.trace, &t.seed, &hash)?);
+                    }
+                }
+                _ => {}
             }
             match &mut won {
                 BlockSeed::FullBlock { block, .. } => block.pom_proof = proof.to_wire_bytes(),
@@ -409,17 +449,7 @@ impl State {
         match &mut block_seed {
             BlockSeed::FullBlock { block, .. } => {
                 let header = block.header.as_mut().expect("We checked that a header exists on creation");
-                header.nonce = nonce;
-                // H3: the header commits to the walk's final state — fill it exactly like the
-                // nonce. The node hashes it into the block hash and pins it to the proof.
-                if header.daa_score >= pom::pom_level_activation_daa() {
-                    header.pom_final_state = final_state;
-                }
-                // H6: the header commits to the tier this walk proved. The node cross-checks it
-                // against the proof and reads it for the service-bond cohort fold.
-                if header.daa_score >= pom::pom_v3_activation_daa() {
-                    header.pom_tier = tier as u32;
-                }
+                fill_pom_header(header, nonce, final_state, tier);
                 block.pom_proof = proof_bytes; // plain bytes field (empty = none on the wire)
             }
             BlockSeed::PartialBlock { nonce: header_nonce, pom_proof, .. } => {
@@ -442,6 +472,21 @@ impl State {
 
 #[cfg(not(any(target_pointer_width = "64", target_pointer_width = "32")))]
 compile_error!("Supporting only 32/64 bits");
+
+/// Sets the fields a found PoM block commits in its header: nonce, final state and tier.
+fn fill_pom_header(header: &mut RpcBlockHeader, nonce: u64, final_state: u64, tier: u8) {
+    header.nonce = nonce;
+    // H3: the header commits to the walk's final state — fill it exactly like the
+    // nonce. The node hashes it into the block hash and pins it to the proof.
+    if header.daa_score >= pom::pom_level_activation_daa() {
+        header.pom_final_state = final_state;
+    }
+    // H6: the header commits to the tier this walk proved. The node cross-checks it
+    // against the proof and reads it for the service-bond cohort fold.
+    if header.daa_score >= pom::pom_v3_activation_daa() {
+        header.pom_tier = tier as u32;
+    }
+}
 
 #[inline(always)]
 pub fn serialize_header<H: Hasher>(hasher: &mut H, header: &RpcBlockHeader, for_pre_pow: bool) {
@@ -595,6 +640,48 @@ mod tests {
         };
         assert_eq!(digest(true), "c850d9d429ed501ce0016297999282297079f3d70c317b9b3aaf933a7868211f");
         assert_eq!(digest(false), "346345442413f856f84442a2866100362d52f7e8426d1e19c9af5c8bae988e3a");
+    }
+
+    /// A v4 pool job hashes its header like the solo template, before and after its task root.
+    #[test]
+    fn pool_v4_job_hashes_like_solo() {
+        use crate::pow::{BlockSeed, State};
+        let h = RpcBlockHeader {
+            version: 1,
+            parents: vec![RpcBlockLevelParents { parent_hashes: vec!["11".repeat(32)] }],
+            hash_merkle_root: "22".repeat(32),
+            accepted_id_merkle_root: "23".repeat(32),
+            utxo_commitment: "24".repeat(32),
+            timestamp: 1_700_000_000_000,
+            bits: 0x1e7f_ffff,
+            daa_score: u64::MAX,
+            blue_work: "0123456789abcdef".into(),
+            pruning_point: "33".repeat(32),
+            ..Default::default()
+        };
+        let solo = State::new(0, BlockSeed::FullBlock { block: Box::new(crate::proto::RpcBlock { header: Some(h.clone()), ..Default::default() }), device_id: String::new() }).unwrap();
+        let pool = State::new(
+            0,
+            BlockSeed::PartialBlock {
+                id: "1".into(),
+                header_hash: [0; 4],
+                timestamp: h.timestamp as u64,
+                daa_score: h.daa_score,
+                nonce: 0,
+                target: crate::target::u256_from_compact_target(h.bits),
+                nonce_mask: u64::MAX,
+                nonce_fixed: 0,
+                hash: None,
+                pom_proof: Vec::new(),
+                header: Some(Box::new(h)),
+                task_root: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(solo.pow_hash_header, pool.pow_hash_header);
+        let root = [0x44u8; 32];
+        assert_eq!(solo.with_task_root(&root).unwrap().pow_hash_header, pool.with_task_root(&root).unwrap().pow_hash_header);
+        assert_ne!(solo.pow_hash_header, solo.with_task_root(&root).unwrap().pow_hash_header);
     }
 
     #[test]

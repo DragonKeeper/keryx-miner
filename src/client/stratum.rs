@@ -303,8 +303,8 @@ impl StratumHandler {
         let handle = tokio::spawn(async move {
             let mut recv_stream = ReceiverStream::new(recv);
             while let Some(seed) = recv_stream.next().await {
-                let (nonce, job_id, pom_proof) = match seed {
-                    BlockSeed::PartialBlock { nonce, id, pom_proof, .. } => (nonce, id, pom_proof),
+                let (nonce, job_id, pom_proof, task_root) = match seed {
+                    BlockSeed::PartialBlock { nonce, id, pom_proof, task_root, .. } => (nonce, id, pom_proof, task_root),
                     BlockSeed::FullBlock { .. } => unreachable!(),
                 };
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
@@ -327,7 +327,24 @@ impl StratumHandler {
                     }
                 };
 
-                let line = if !pom_proof.is_empty() {
+                let line = if let (false, Some(root)) = (pom_proof.is_empty(), task_root) {
+                    StratumLine {
+                        id: Some(msg_id),
+                        payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
+                            MiningSubmit::MiningSubmitWithPomTask((
+                                miner_address.clone(),
+                                job_id,
+                                nonce_hex,
+                                opoi_tag,
+                                cid_opt.unwrap_or_default(),
+                                hex::encode(pom_proof),
+                                hex::encode(root),
+                            )),
+                        )),
+                        jsonrpc: None,
+                        error: None,
+                    }
+                } else if !pom_proof.is_empty() {
                     StratumLine {
                         id: Some(msg_id),
                         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
@@ -460,6 +477,19 @@ impl StratumHandler {
                             } else {
                                 *self.current_task_slot.lock().await = None;
                             }
+                            if keryx_miner::block_task::active(job.daa_score) {
+                                let window = keryx_verifiable_inference::block_task::window(job.daa_score);
+                                let parents = job.header.as_ref().and_then(|h| h.parents.first()).map(|p| keryx_miner::block_task::parents_key(&p.parent_hashes));
+                                match (window, parents, job.window_seed) {
+                                    (Some(w), Some(p), Some(seed)) => keryx_miner::block_task::set_seed(w, &p, seed),
+                                    _ => {
+                                        keryx_miner::pom_gpu::log_throttled(u32::MAX, "pool-no-task", || {
+                                            warn!("Block task: the pool sends jobs without a block task (header and window seed) — no block can be valid, job skipped")
+                                        });
+                                        return miner.process_block(None).await;
+                                    }
+                                }
+                            }
                             miner
                                 .process_block(Some(PartialBlock {
                                     id: job.id,
@@ -472,6 +502,8 @@ impl StratumHandler {
                                     nonce_fixed: self.nonce_fixed,
                                     hash: None,
                                     pom_proof: Vec::new(),
+                                    header: job.header.map(Box::new),
+                                    task_root: None,
                                 }))
                                 .await
                         }

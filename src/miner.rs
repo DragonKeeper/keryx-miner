@@ -439,7 +439,7 @@ impl MinerManager {
                             continue;
                         }
                         let daa = state.as_ref().unwrap().daa_score;
-                        if keryx_miner::block_task::active(daa) && !state.as_ref().unwrap().is_pool_share() {
+                        if keryx_miner::block_task::active(daa) && state.as_ref().unwrap().has_template_header() {
                             let s = state.as_ref().unwrap();
                             let task = keryx_miner::pom_gpu::current_tier(worker_device_id, daa).zip(keryx_miner::pom_gpu::mining_model_id(worker_device_id)).zip(s.parents_key())
                                 .and_then(|((tier, model_id), parents)| keryx_miner::block_task::task_for(worker_device_id, &model_id, tier, daa, &parents));
