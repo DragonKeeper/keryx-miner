@@ -372,6 +372,45 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
     }
 }
 
+/// The chat template of an audited model split around the request-bound prefix: the head the
+/// prefix tokens follow, and the rest after them. `None` for a model without a prefix slot.
+pub(crate) fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, String)> {
+    Some(match name {
+        "glm-4-9b-0414" => (
+            "[gMASK]<sop><|user|>\nRequest id:".to_string(),
+            format!("\n{}\n\n{}\n<|assistant|>\n", SYSTEM_PROMPT_NEXT, prompt),
+        ),
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" => (
+            "<|im_start|>system\nRequest id:".to_string(),
+            format!(
+                "\n{}<|im_end|>\n\
+                 <|im_start|>user\n{}<|im_end|>\n\
+                 <|im_start|>assistant\n<think>\n\n</think>\n\n",
+                SYSTEM_PROMPT_NEXT, prompt
+            ),
+        ),
+        "gemma-4-12b-abliterated" => (
+            "<|turn>system\nRequest id:".to_string(),
+            format!(
+                "\n{}<turn|>\n\
+                 <|turn>user\n{}<turn|>\n\
+                 <|turn>model\n<|channel>thought\n<channel|>",
+                SYSTEM_PROMPT_NEXT, prompt
+            ),
+        ),
+        "kimi-linear-48b" => (
+            "<|im_system|>system<|im_middle|>Request id:".to_string(),
+            format!(
+                "\n{}<|im_end|>\
+                 <|im_user|>user<|im_middle|>{}<|im_end|>\
+                 <|im_assistant|>assistant<|im_middle|>",
+                SYSTEM_PROMPT_NEXT, prompt
+            ),
+        ),
+        _ => return None,
+    })
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Register the set of models this miner currently serves (drives `ai:cap`).
@@ -837,17 +876,64 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
 /// commitment separately. A failed load/generation returns None (the response is dropped, never
 /// submitted): a miner must not be rewarded for garbage.
 pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
-    let _serving = ServingGuard::new();
-    let specs = *SUPPORTED_SPECS.read().unwrap();
-    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    run_inference(model_id, prompt, max_tokens, None).map(|g| g.text)
+}
 
-    // llama.cpp gets the raw tokens of whatever string we pass — apply the model's chat
-    // template here (template-strict models emit EOG immediately on a bare prompt).
-    let templated = format_prompt_by_name(spec.name, prompt);
+/// What a traced inference commits: tier, plaintext prompt length, request id and stage.
+#[derive(Clone, Copy)]
+struct Traced {
+    tier: u8,
+    prompt_len: u32,
+    request_hash: [u8; 32],
+    chain: bool,
+}
+
+/// A generated answer and, when the tier is audited, the trace an opening needs.
+pub struct Generated {
+    pub text: String,
+    pub trace: Option<crate::trace::ResponseTrace>,
+}
+
+/// `load_and_run_inference` with the canonical trace of `tier` captured.
+/// Traced inference for an audited tier; `prompt_len` is the request's plaintext prompt length,
+/// `chain` selects the stage-2 trace.
+pub fn load_and_run_traced_inference(
+    model_id: &[u8; 32],
+    prompt: &str,
+    max_tokens: usize,
+    tier: u8,
+    prompt_len: u32,
+    request_hash: &[u8; 32],
+    chain: bool,
+) -> Option<Generated> {
+    run_inference(model_id, prompt, max_tokens, Some(Traced { tier, prompt_len, request_hash: *request_hash, chain }))
+}
+
+/// A traced tier that cannot be served as the consensus requires stops the miner.
+fn fatal(detail: &str) -> ! {
+    log::error!("LlmEngine: {} — stopping, a traced tier cannot be served", detail);
+    std::process::exit(3)
+}
+
+/// Cuts `text` to the longest answer the request's token budget allows, on a char boundary.
+fn truncate_answer(mut text: String, max_tokens: usize) -> String {
+    let cap = keryx_verifiable_inference::shape::max_answer_len(max_tokens.min(u32::MAX as usize) as u32).min(usize::MAX as u64) as usize;
+    if text.len() > cap {
+        let mut end = cap;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+/// The engine hosting `spec`, resident on its mining GPU: `(gguf path, device)`.
+fn resident_engine(spec: &ModelSpec) -> Option<(String, u32)> {
     // Route inference to the device that MINES this model (per-GPU tier assignment): only that
     // GPU pauses PoW and the walk shares the resident weights (zero-dup). Falls back to device 0
     // (single-GPU / unassigned model).
-    let dev_id = crate::pom_gpu::device_for_model(model_id).unwrap_or(0);
+    let dev_id = crate::pom_gpu::device_for_model(&spec.model_id).unwrap_or(0);
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
 
     if !crate::llama_engine::active_for(&gguf, dev_id as usize) {
@@ -857,24 +943,210 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         log::info!("LlmEngine: loading the llama engine for '{}' (gpu{})", spec.name, dev_id);
         if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id) {
             log::error!("LlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
-            mark_model_unavailable(model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
+            mark_model_unavailable(&spec.model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
             return None;
         }
     }
+    Some((gguf, dev_id))
+}
 
-    match crate::llama_engine::generate(&gguf, dev_id as usize, &templated, max_tokens) {
-        Ok(text) if !text.trim().is_empty() => {
+/// The possession index of `spec`, the resident one or one built from the GGUF.
+fn weight_index(spec: &ModelSpec, gguf: &str) -> Option<std::sync::Arc<crate::pom::WeightIndex>> {
+    match crate::pom::active_index_for_model(&spec.model_id) {
+        Some(index) => Some(index),
+        None => match crate::pom::WeightIndex::build_from_gguf(gguf, spec.model_id) {
+            Ok(index) => Some(std::sync::Arc::new(index)),
+            Err(e) => {
+                log::warn!("LlmEngine '{}': no possession index for the opening ({})", spec.name, e);
+                None
+            }
+        },
+    }
+}
+
+/// Engines whose self-check passed, by `(gguf, device, stage)`.
+static PREFIX_CHECKED: std::sync::Mutex<std::collections::BTreeSet<(String, u32, u8)>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Traces a fixed prompt carrying a known request id on the engine hosting `spec`, replays two
+/// prefix positions and verifies their points as the node would.
+fn prefix_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8) -> Result<(), String> {
+    use crate::trace::{build_prefix_point, draw_prefix, prefix_ctx, prefix_tokens, TierManifest, TraceRecord};
+    use keryx_verifiable_inference::prefix::verify_prefix_point;
+    use keryx_verifiable_inference::verify::{ResponseCtx, TierCtx};
+    let Some(ctx) = prefix_ctx(tier) else { return Ok(()) };
+    if PREFIX_CHECKED.lock().unwrap().contains(&(gguf.to_string(), dev_id, crate::trace::STAGE_1A)) {
+        return Ok(());
+    }
+    let m = TierManifest::for_tier(tier).ok_or("no manifest")?;
+    let (head, rest) = format_prompt_parts(spec.name, "Reply with one word.").ok_or("no prefix template")?;
+    let request_hash: [u8; 32] = std::array::from_fn(|i| (i * 8 + 3) as u8);
+    let tokens = prefix_tokens(ctx, &request_hash);
+    let prefix = crate::llama_engine::PromptPrefix { tokens: &tokens, head_tokens: ctx.offset, rest: &rest };
+    let g = crate::llama_engine::generate_traced(gguf, dev_id as usize, &head, Some(prefix), 1, 0, 0).map_err(|e| format!("{e:?}"))?;
+    let (lo, hi) = (ctx.offset as usize, ctx.offset as usize + tokens.len());
+    if g.tokens.get(lo..hi) != Some(tokens.as_slice()) {
+        return Err("the fed prompt does not carry the request prefix".to_string());
+    }
+    let rec = TraceRecord::new(&m, g.n_prompt, g.ubatch, g.leaves).ok_or("incomplete trace")?;
+    let index = weight_index(spec, gguf).ok_or("no possession index")?;
+    let tier_ctx = TierCtx { r_t: index.r_t, n_chunks: index.n_chunks, m_t: m.m_t, n_entries: m.entries.len() as u64, n_products: m.n_products as u64 };
+    let resp = ResponseCtx { trace_root: rec.trace_root, n_prompt: rec.n_prompt, n_pos: rec.n_pos };
+    for seed in [[0x11u8; 32], [0x77u8; 32]] {
+        let t = draw_prefix(ctx, &seed);
+        let (x, _) = crate::llama_engine::replay(gguf, dev_id as usize, &g.tokens, g.n_prompt, t as u32, 0, 1)?;
+        if *blake3::hash(&x).as_bytes() != rec.leaf(t, 0) {
+            return Err(format!("the replay of position {t} does not reproduce the trace"));
+        }
+        let point = build_prefix_point(&m, &rec, ctx, &request_hash, t, x, &index).ok_or("no prefix point")?;
+        verify_prefix_point(&tier_ctx, ctx, &resp, &seed, &request_hash, &point).map_err(|e| format!("position {t}: {e:?}"))?;
+    }
+    PREFIX_CHECKED.lock().unwrap().insert((gguf.to_string(), dev_id, crate::trace::STAGE_1A));
+    log::info!("LlmEngine '{}': prefix self-check passed (gpu{})", spec.name, dev_id);
+    Ok(())
+}
+
+/// Replays a stage-2 response once for every leaf the draw of `seed` opens and builds the opening.
+#[allow(clippy::too_many_arguments)]
+fn open_chain(
+    gguf: &str,
+    dev_id: u32,
+    m: &crate::trace::TierManifest,
+    pctx: &keryx_verifiable_inference::prefix::PrefixCtx,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    request_hash: &[u8; 32],
+    response_txid: [u8; 32],
+    index: &crate::pom::WeightIndex,
+) -> Result<Vec<u8>, String> {
+    use crate::trace::{captures_match, chain_opening_body, draw_chain, leaf_cap, Captures};
+    let rec = &trace.record;
+    let d = draw_chain(m, pctx, rec, seed).ok_or("no stage-2 draw")?;
+    let wanted = d.captures(m.n_products as u64);
+    let slot = wanted.iter().map(|&(_, l)| leaf_cap(m, l)).max().unwrap_or(0).div_ceil(4) * 4;
+    let bytes = crate::llama_engine::replay_multi(gguf, dev_id as usize, &trace.tokens, rec.n_prompt, &wanted, slot)?;
+    let caps: Captures = wanted.into_iter().zip(bytes).collect();
+    if !captures_match(rec, &caps) {
+        return Err("the replay does not reproduce the committed trace".to_string());
+    }
+    chain_opening_body(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index).ok_or_else(|| "no stage-2 opening".to_string())
+}
+
+/// Traces a fixed prompt under the stage-2 manifest, then opens and verifies it under two seeds
+/// as the node would.
+fn chain_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8) -> Result<(), String> {
+    use crate::trace::{chain_ctx, prefix_tokens, verify_chain_opening, ResponseTrace, TierManifest, TraceRecord, STAGE_CHAIN};
+    if PREFIX_CHECKED.lock().unwrap().contains(&(gguf.to_string(), dev_id, STAGE_CHAIN)) {
+        return Ok(());
+    }
+    let m = TierManifest::for_chain(tier).ok_or("no stage-2 manifest")?;
+    let (ctx, pctx) = chain_ctx(tier).ok_or("no stage-2 context")?;
+    let (head, rest) = format_prompt_parts(spec.name, "Reply with one word.").ok_or("no prefix template")?;
+    let request_hash: [u8; 32] = std::array::from_fn(|i| (i * 8 + 3) as u8);
+    let tokens = prefix_tokens(&pctx, &request_hash);
+    let prefix = crate::llama_engine::PromptPrefix { tokens: &tokens, head_tokens: pctx.offset, rest: &rest };
+    let g = crate::llama_engine::generate_traced(gguf, dev_id as usize, &head, Some(prefix), 4, 0, 0).map_err(|e| format!("{e:?}"))?;
+    let (lo, hi) = (pctx.offset as usize, pctx.offset as usize + tokens.len());
+    if g.tokens.get(lo..hi) != Some(tokens.as_slice()) {
+        return Err("the fed prompt does not carry the request prefix".to_string());
+    }
+    let record = TraceRecord::new_chain(&m, g.n_prompt, g.ubatch, g.leaves, &g.tokens).ok_or("incomplete stage-2 trace")?;
+    let trace = ResponseTrace { record, tokens: g.tokens };
+    let index = weight_index(spec, gguf).ok_or("no possession index")?;
+    let tier_ctx = m.tier_ctx(&index);
+    for seed in [[0x11u8; 32], [0x77u8; 32]] {
+        let body = open_chain(gguf, dev_id, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], &index)?;
+        verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &request_hash, &body)?;
+    }
+    PREFIX_CHECKED.lock().unwrap().insert((gguf.to_string(), dev_id, STAGE_CHAIN));
+    log::info!("LlmEngine '{}': stage-2 self-check passed (gpu{})", spec.name, dev_id);
+    Ok(())
+}
+
+/// Arms the canonical trace of `tier` on the engine hosting `spec`, under the stage-2 manifest
+/// when `chain`; `false` when the tier is not audited or the engine cannot trace. A tier that
+/// cannot pass its self-check stops the miner.
+fn arm_trace(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, chain: bool) -> bool {
+    let manifest = if chain { crate::trace::TierManifest::raw_chain(tier) } else { crate::trace::TierManifest::raw_for_tier(tier) };
+    let Some(manifest) = manifest else { return false };
+    if !crate::llama_engine::traced_with(gguf, dev_id as usize, manifest) {
+        if let Err(e) = crate::llama_engine::trace_configure(gguf, dev_id as usize, manifest) {
+            log::warn!("LlmEngine '{}': trace unavailable ({}) — answering untraced", spec.name, e);
+            return false;
+        }
+    }
+    let checked = if chain { chain_self_check(spec, gguf, dev_id, tier) } else { prefix_self_check(spec, gguf, dev_id, tier) };
+    if let Err(e) = checked {
+        fatal(&format!("'{}' fails the {} self-check on gpu{}: {}", spec.name, if chain { "stage-2" } else { "prefix" }, dev_id, e));
+    }
+    true
+}
+
+fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: Option<Traced>) -> Option<Generated> {
+    let _serving = ServingGuard::new();
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+
+    // llama.cpp gets the raw tokens of whatever string we pass — apply the model's chat
+    // template here (template-strict models emit EOG immediately on a bare prompt).
+    let templated = format_prompt_by_name(spec.name, prompt);
+    let (gguf, dev_id) = resident_engine(spec)?;
+    let traced = traced.filter(|t| arm_trace(spec, &gguf, dev_id, t.tier, t.chain));
+
+    let outcome = if let Some(Traced { tier, prompt_len, request_hash, chain }) = traced {
+        let m = if chain { crate::trace::TierManifest::for_chain(tier)? } else { crate::trace::TierManifest::for_tier(tier)? };
+        let min_prompt = keryx_verifiable_inference::shape::min_prompt_positions(prompt_len);
+        let per_position = keryx_verifiable_inference::shape::ANSWER_BYTES_PER_POSITION;
+        let owned_ctx = if chain { crate::trace::chain_ctx(tier).map(|c| c.1) } else { crate::trace::prefix_ctx(tier).cloned() };
+        let ctx = owned_ctx.as_ref();
+        let parts = ctx.and_then(|_| format_prompt_parts(spec.name, prompt));
+        if ctx.is_some() && parts.is_none() {
+            fatal(&format!("'{}' has no prefix template", spec.name));
+        }
+        let tokens = ctx.map(|c| crate::trace::prefix_tokens(c, &request_hash));
+        let (head, prefix) = match (&parts, &tokens, ctx) {
+            (Some((head, rest)), Some(tokens), Some(c)) => {
+                (head.as_str(), Some(crate::llama_engine::PromptPrefix { tokens, head_tokens: c.offset, rest }))
+            }
+            _ => (templated.as_str(), None),
+        };
+        let generated = match crate::llama_engine::generate_traced(&gguf, dev_id as usize, head, prefix, max_tokens, min_prompt, per_position) {
+            Err(crate::llama_engine::GenError::PromptHead(detail)) => fatal(&format!("'{}': {}", spec.name, detail)),
+            other => other,
+        };
+        generated.and_then(|g| {
+            if let (Some(c), Some(tokens)) = (ctx, &tokens) {
+                let (lo, hi) = (c.offset as usize, c.offset as usize + tokens.len());
+                if g.tokens.get(lo..hi) != Some(tokens.as_slice()) {
+                    return Err(crate::llama_engine::GenError::Failed("the fed prompt does not carry the request prefix".to_string()));
+                }
+            }
+            let record = if chain {
+                crate::trace::TraceRecord::new_chain(&m, g.n_prompt, g.ubatch, g.leaves, &g.tokens)
+            } else {
+                crate::trace::TraceRecord::new(&m, g.n_prompt, g.ubatch, g.leaves)
+            };
+            if record.is_none() {
+                log::warn!("LlmEngine '{}': incomplete trace — answering without a commitment", spec.name);
+            }
+            Ok((g.text, record.map(|record| crate::trace::ResponseTrace { record, tokens: g.tokens })))
+        })
+    } else {
+        crate::llama_engine::generate(&gguf, dev_id as usize, &templated, max_tokens).map(|text| (text, None))
+    };
+
+    match outcome {
+        Ok((text, trace)) if !text.trim().is_empty() => {
             mark_model_available(model_id, "generation_success");
-            Some(text)
+            Some(Generated { text: truncate_answer(text, max_tokens), trace })
         }
         Ok(_) => {
             log::warn!("LlmEngine '{}': llama generate returned an empty answer — response dropped", spec.name);
             None
         }
         Err(crate::llama_engine::GenError::PromptTooLong(detail)) => {
-            log::warn!("LlmEngine '{}': prompt too long ({}) — answering with the fixed error text", spec.name, detail);
+            log::warn!("LlmEngine '{}': prompt too long ({}) — response dropped", spec.name, detail);
             mark_model_available(model_id, "generation_success");
-            Some(PROMPT_TOO_LONG_ANSWER.to_string())
+            None
         }
         Err(e) => {
             log::warn!("LlmEngine '{}': llama generate failed ({:?}) — response dropped", spec.name, e);
@@ -883,9 +1155,133 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     }
 }
 
-/// Answer sent when a request's prompt does not fit the model's context window.
-pub const PROMPT_TOO_LONG_ANSWER: &str =
-    "This request could not be served: the prompt is longer than the model's context window. Send a shorter message or less conversation history.";
+/// The block task trace of `tier` for the window seeded by `window_seed`, on the engine hosting
+/// `model_id`. Blocking.
+pub fn run_block_task(model_id: &[u8; 32], tier: u8, window_seed: &[u8; 32]) -> Option<crate::trace::ResponseTrace> {
+    use keryx_verifiable_inference::block_task::{task_tokens, TASK_LEN};
+    let _serving = ServingGuard::new();
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let (gguf, dev_id) = resident_engine(spec)?;
+    if !arm_trace(spec, &gguf, dev_id, tier, true) {
+        return None;
+    }
+    let m = crate::trace::TierManifest::for_chain(tier)?;
+    let (_, pctx) = crate::trace::chain_ctx(tier)?;
+    let tokens: Vec<i32> = task_tokens(&pctx.table, window_seed).into_iter().map(|t| t as i32).collect();
+    let traced = match crate::llama_engine::trace_tokens(&gguf, dev_id as usize, &tokens) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("LlmEngine '{}': block task not traced ({})", spec.name, e);
+            return None;
+        }
+    };
+    let record = crate::trace::TraceRecord::new_chain(&m, TASK_LEN, traced.ubatch, traced.leaves, &tokens);
+    if record.is_none() {
+        log::warn!("LlmEngine '{}': incomplete block task trace", spec.name);
+    }
+    Some(crate::trace::ResponseTrace { record: record?, tokens })
+}
+
+/// The task opening of the block `block_hash` from the task trace of its window, checked as the
+/// node will check it. Blocking.
+pub fn open_block_task(model_id: &[u8; 32], tier: u8, trace: &crate::trace::ResponseTrace, window_seed: &[u8; 32], block_hash: &[u8; 32]) -> Option<Vec<u8>> {
+    use keryx_verifiable_inference::block_task::{draw_seed, task_bytes, task_prefix, verify_block_task};
+    let _serving = ServingGuard::new();
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let (gguf, dev_id) = resident_engine(spec)?;
+    if !arm_trace(spec, &gguf, dev_id, tier, true) {
+        return None;
+    }
+    let index = weight_index(spec, &gguf)?;
+    let m = crate::trace::TierManifest::for_chain(tier)?;
+    let (ctx, pctx) = crate::trace::chain_ctx(tier)?;
+    let body = match open_chain(&gguf, dev_id, &m, &task_prefix(&pctx), trace, &draw_seed(block_hash), &task_bytes(window_seed), [0u8; 32], &index) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("LlmEngine '{}': block task opening failed ({})", spec.name, e);
+            return None;
+        }
+    };
+    let opening = keryx_verifiable_inference::opening::Opening::decode(&body)?;
+    if let Err(e) = verify_block_task(&m.tier_ctx(&index), &ctx, &pctx, &trace.record.trace_root, window_seed, block_hash, &opening) {
+        log::error!("LlmEngine '{}': block task opening fails its self-check ({:?})", spec.name, e);
+        return None;
+    }
+    Some(body)
+}
+
+/// Builds the opening body of an audited response on the GPU that served it: replays the
+/// response to each drawn position and proves the captured bytes against the possession index.
+/// The opening of an audited response: the drawn points and, for a response accepted under the
+/// prefix rule, its prefix point.
+pub fn open_trace(
+    model_id: &[u8; 32],
+    tier: u8,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    response_txid: [u8; 32],
+    request_hash: &[u8; 32],
+    accepted_daa: u64,
+) -> Option<Vec<u8>> {
+    use crate::trace::{build_point, build_prefix_point, draw_point, draw_prefix, opening_body, prefix_active, prefix_ctx, TierManifest, POINTS};
+    let _serving = ServingGuard::new();
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let chain = trace.record.stage == crate::trace::STAGE_CHAIN;
+    let (gguf, dev_id) = resident_engine(spec)?;
+    if !arm_trace(spec, &gguf, dev_id, tier, chain) {
+        return None;
+    }
+    let index = weight_index(spec, &gguf)?;
+    if chain {
+        let m = TierManifest::for_chain(tier)?;
+        let (_, pctx) = crate::trace::chain_ctx(tier)?;
+        return match open_chain(&gguf, dev_id, &m, &pctx, trace, seed, request_hash, response_txid, &index) {
+            Ok(body) => Some(body),
+            Err(e) => {
+                log::warn!("LlmEngine '{}': stage-2 opening failed ({})", spec.name, e);
+                None
+            }
+        };
+    }
+    let m = TierManifest::for_tier_at(tier, accepted_daa)?;
+    let rec = &trace.record;
+    let mut points = Vec::with_capacity(POINTS as usize);
+    for i in 0..POINTS {
+        let p = draw_point(&m, rec.n_prompt, rec.n_pos, seed, i)?;
+        let (x, y) = match crate::llama_engine::replay(&gguf, dev_id as usize, &trace.tokens, rec.n_prompt, p.t as u32, p.leaf_x(), p.leaf_y()) {
+            Ok(xy) => xy,
+            Err(e) => {
+                log::warn!("LlmEngine '{}': replay failed at position {} ({})", spec.name, p.t, e);
+                return None;
+            }
+        };
+        if *blake3::hash(&x).as_bytes() != rec.leaf(p.t, p.leaf_x()) || *blake3::hash(&y).as_bytes() != rec.leaf(p.t, p.leaf_y()) {
+            log::error!("LlmEngine '{}': replay of position {} does not reproduce the committed trace", spec.name, p.t);
+            return None;
+        }
+        points.push(build_point(&m, rec, &p, x, &y, &index)?);
+    }
+    let mut prefix = None;
+    if let Some(ctx) = prefix_ctx(tier).filter(|_| prefix_active(accepted_daa)) {
+        let t = draw_prefix(ctx, seed);
+        let (x, _) = match crate::llama_engine::replay(&gguf, dev_id as usize, &trace.tokens, rec.n_prompt, t as u32, 0, 1) {
+            Ok(xy) => xy,
+            Err(e) => {
+                log::warn!("LlmEngine '{}': replay failed at prefix position {} ({})", spec.name, t, e);
+                return None;
+            }
+        };
+        if *blake3::hash(&x).as_bytes() != rec.leaf(t, 0) {
+            log::error!("LlmEngine '{}': replay of prefix position {} does not reproduce the committed trace", spec.name, t);
+            return None;
+        }
+        prefix = Some(build_prefix_point(&m, rec, ctx, request_hash, t, x, &index)?);
+    }
+    opening_body(response_txid, points, prefix)
+}
 
 #[cfg(test)]
 mod tests {
@@ -907,6 +1303,89 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    /// The split template is the plain one with the request-id line inserted after the first
+    /// role line, for every audited model.
+    #[test]
+    fn prefix_parts_rebuild_the_plain_template() {
+        for name in ["qwen3.5-9b-abliterated", "glm-4-9b-0414", "gemma-4-12b-abliterated", "qwen3.8-27b", "kimi-linear-48b"] {
+            let (head, rest) = format_prompt_parts(name, "hi").unwrap();
+            assert!(head.ends_with("Request id:"), "{name}: {head:?}");
+            assert!(rest.starts_with('\n'), "{name}: {rest:?}");
+            assert_eq!(format!("{head}{rest}").replace("Request id:\n", ""), format_prompt_by_name(name, "hi"), "{name}");
+        }
+        assert!(format_prompt_parts("not-a-real-model", "hi").is_none());
+    }
+
+    /// Stage-2 traces of a real model open and verify as the node would, over many seeds.
+    /// `KERYX_TEST_MODEL_GPU0=<gguf> cargo test --release -- --ignored stage2_openings_verify --nocapture`
+    #[test]
+    #[ignore]
+    fn stage2_openings_verify() {
+        use crate::llama_engine;
+        use crate::trace::{chain_ctx, draw_chain, prefix_tokens, verify_chain_opening, ResponseTrace, TierManifest, TraceRecord};
+        let gguf = std::env::var("KERYX_TEST_MODEL_GPU0").expect("set KERYX_TEST_MODEL_GPU0");
+        let spec = crate::models::spec_for_gguf(&gguf).expect("registry model");
+        let tier = crate::models::pom_tier_index(&spec.model_id, u64::MAX).expect("tiered model");
+        let m = TierManifest::for_chain(tier).expect("stage-2 manifest");
+        let (ctx, pctx) = chain_ctx(tier).expect("stage-2 context");
+        let index = crate::pom::WeightIndex::build_from_gguf(&gguf, spec.model_id).unwrap();
+        let tier_ctx = m.tier_ctx(&index);
+        llama_engine::ensure_loaded(&gguf, 0).unwrap();
+        let nl = llama_engine::trace_configure(&gguf, 0, TierManifest::raw_chain(tier).unwrap()).unwrap();
+        assert_eq!(nl, m.n_leaves());
+        let rh: [u8; 32] = std::array::from_fn(|i| (i * 8 + 3) as u8);
+        let toks = prefix_tokens(&pctx, &rh);
+        for (label, question, max_tokens) in [("short", "Explain in two sentences why the sky is blue.", 24), ("long", &"Summarize: the quick brown fox jumps over the lazy dog. ".repeat(40), 12)] {
+            let (head, rest) = format_prompt_parts(spec.name, question).expect("prefix template");
+            let prefix = llama_engine::PromptPrefix { tokens: &toks, head_tokens: pctx.offset, rest: &rest };
+            let g = llama_engine::generate_traced(&gguf, 0, &head, Some(prefix), max_tokens, 0, 0).unwrap();
+            eprintln!("{label}: {} positions ({} prompt): {:?}", g.n_pos, g.n_prompt, g.text);
+            let record = TraceRecord::new_chain(&m, g.n_prompt, g.ubatch.clone(), g.leaves.clone(), &g.tokens).expect("complete stage-2 trace");
+            let trace = ResponseTrace { record, tokens: g.tokens.clone() };
+            let (mut sizes, mut kinds) = (Vec::new(), std::collections::BTreeMap::<String, u32>::new());
+            for counter in 0..32u64 {
+                let seed = *blake3::hash(&counter.to_le_bytes()).as_bytes();
+                let d = draw_chain(&m, &pctx, &trace.record, &seed).unwrap();
+                for (p, _) in &d.points {
+                    if let keryx_verifiable_inference::manifest::Chain::Product(pl) = m.entry(p.g_rank).chain {
+                        *kinds.entry(format!("link{}", pl.link)).or_default() += 1;
+                    }
+                }
+                *kinds.entry(format!("resid{:?}{}", d.resid.kind, if d.resid.layer + 1 == ctx.n_layers as u64 { "-last" } else { "" })).or_default() += 1;
+                let t0 = std::time::Instant::now();
+                let body = open_chain(&gguf, 0, &m, &pctx, &trace, &seed, &rh, [3u8; 32], &index).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
+                let took = t0.elapsed();
+                verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &rh, &body).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
+                eprintln!("{label} seed {counter}: verified, body {} B, replay+build {:.2?}", body.len(), took);
+                sizes.push(body.len());
+            }
+            eprintln!("{label}: max body {} B, coverage {:?}", sizes.iter().max().unwrap(), kinds);
+        }
+
+        // Block task: the window trace opens and verifies for several block hashes.
+        use keryx_verifiable_inference::block_task::{draw_seed, task_bytes, task_prefix, task_tokens, verify_block_task, TASK_LEN};
+        let window_seed = [0x5au8; 32];
+        let tokens: Vec<i32> = task_tokens(&pctx.table, &window_seed).into_iter().map(|t| t as i32).collect();
+        let t0 = std::time::Instant::now();
+        let traced = llama_engine::trace_tokens(&gguf, 0, &tokens).unwrap();
+        eprintln!("block task traced in {:.2?}", t0.elapsed());
+        let record = TraceRecord::new_chain(&m, TASK_LEN, traced.ubatch, traced.leaves, &tokens).expect("complete task trace");
+        let task = ResponseTrace { record, tokens };
+        let tp = task_prefix(&pctx);
+        for counter in 0..16u64 {
+            let block_hash = *blake3::hash(&counter.to_le_bytes()).as_bytes();
+            let t0 = std::time::Instant::now();
+            let body = open_chain(&gguf, 0, &m, &tp, &task, &draw_seed(&block_hash), &task_bytes(&window_seed), [0u8; 32], &index)
+                .unwrap_or_else(|e| panic!("task {counter}: {e}"));
+            let took = t0.elapsed();
+            let opening = keryx_verifiable_inference::opening::Opening::decode(&body).unwrap();
+            verify_block_task(&tier_ctx, &ctx, &pctx, &task.record.trace_root, &window_seed, &block_hash, &opening)
+                .unwrap_or_else(|e| panic!("task {counter}: {e:?}"));
+            eprintln!("task {counter}: verified, body {} B, replay+build {:.2?}", body.len(), took);
+        }
+        llama_engine::unload(0);
     }
 
     /// The two H6 models close the reasoning block in the generation prompt, each in its own
