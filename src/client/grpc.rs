@@ -290,10 +290,10 @@ fn place_chain_after(log: &mut VecDeque<ChainEntry>, start: &str, added: Vec<Str
 }
 
 /// Private-inference state of a queued request; `None` for a plaintext request.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum PrivateRequest {
-    /// Opened with the escrow key; the answer is sealed under this root key.
-    Opened([u8; 32]),
+    /// Opened with the escrow key; the answer is sealed under this key.
+    Opened(keryx_inference::ResponseKey),
     /// Names this miner but cannot be opened; answered with a plaintext error body.
     Unreadable,
 }
@@ -874,7 +874,7 @@ impl KeryxdHandler {
         };
         match keryx_inference::open_request(req, secret) {
             Ok(opened) => match decode_private_prompt(&opened.prompt) {
-                Some(prompt) => Some((prompt, opened.prompt.len() as u32, Some(PrivateRequest::Opened(opened.root_key)))),
+                Some(prompt) => Some((prompt, opened.prompt.len() as u32, Some(PrivateRequest::Opened(opened.response_key.clone())))),
                 None => {
                     warn!("Inference: private AiRequest opened but its compressed prompt is invalid — answering with an error body");
                     Some((String::new(), 0, Some(PrivateRequest::Unreadable)))
@@ -988,8 +988,9 @@ impl KeryxdHandler {
             let traced = self.last_known_daa >= keryx_miner::pom::verifiable_inference_activation_daa();
             let tier = traced.then(|| keryx_miner::models::pom_tier_index(&model_id, self.last_known_daa)).flatten();
             let chain = keryx_miner::trace::chain_active(self.last_known_daa);
+            let unreadable = matches!(private, Some(PrivateRequest::Unreadable));
             let job = InferenceJob { stable_id: stable_id.clone(), request_hash, private, model_id, tier, max_tokens: max_tokens as u32, rx: rx_done };
-            if matches!(private, Some(PrivateRequest::Unreadable)) {
+            if unreadable {
                 // No inference to run: the answer is the fixed error text.
                 let _ = tx_done.send(Some(keryx_miner::llm::Generated { text: UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string(), trace: None }));
                 self.inference_rx = Some(job);
@@ -1649,11 +1650,7 @@ impl KeryxdHandler {
             None => result.clone().into_bytes(),
             Some(p) => {
                 let body = match p {
-                    PrivateRequest::Opened(root_key) => {
-                        let Some(pubkey) = self.escrow_watcher.as_ref().map(|w| w.pubkey_bytes()) else {
-                            warn!("Inference: escrow key gone — private AiResponse skipped");
-                            return true;
-                        };
+                    PrivateRequest::Opened(key) => {
                         let plain = match trace.as_ref().filter(|t| t.trace.record.stage == keryx_miner::trace::STAGE_CHAIN) {
                             Some(t) => {
                                 let ids: Vec<u32> = t.trace.tokens[t.trace.record.n_prompt as usize..].iter().map(|&v| v as u32).collect();
@@ -1661,7 +1658,7 @@ impl KeryxdHandler {
                             }
                             None => result.clone().into_bytes(),
                         };
-                        keryx_inference::seal_response(&root_key, &request_hash, &pubkey, &plain)
+                        keryx_inference::seal_response(&key, &request_hash, &plain)
                     }
                     PrivateRequest::Unreadable => result.clone().into_bytes(),
                 };
@@ -2397,11 +2394,12 @@ mod tests {
         let pubkey = escrow_pubkey_of(&mine).unwrap();
         let (req, secret) = seal_request([5u8; 32], 64, 1_000, 2_000, b"q", &[pubkey]).unwrap();
         let (_, _, private) = super::KeryxdHandler::open_private_request(&req, Some(&mine)).unwrap();
-        let Some(PrivateRequest::Opened(root_key)) = private else { panic!("not opened") };
+        let Some(PrivateRequest::Opened(key)) = private else { panic!("not opened") };
         let request_hash = [9u8; 32];
-        let body = keryx_inference::seal_response(&root_key, &request_hash, &pubkey, b"answer");
-        assert_eq!(open_response(&secret.root_key, &request_hash, &pubkey, &body).unwrap(), b"answer");
-        assert!(open_response(&[0u8; 32], &request_hash, &pubkey, &body).is_err());
+        let body = keryx_inference::seal_response(&key, &request_hash, b"answer");
+        assert_eq!(open_response(&secret, &request_hash, &pubkey, &body).unwrap(), b"answer");
+        let stranger = keryx_inference::PrivateRequestSecret::from_hex(&"00".repeat(32)).unwrap();
+        assert!(open_response(&stranger, &request_hash, &pubkey, &body).is_err());
         let cid = crate::ipfs::sha256_multihash(&body);
         assert_eq!(&cid[..2], &[0x12, 0x20]);
     }
