@@ -341,6 +341,33 @@ extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
     log::log!(lvl, "{}", msg);
 }
 
+/// Minimum NVIDIA driver major version accepted for mining.
+const MIN_NVIDIA_DRIVER_MAJOR: u32 = 595;
+
+/// Installed NVIDIA driver version string (e.g. "595.71.05"), from NVML or the kernel module.
+fn nvidia_driver_version() -> Option<String> {
+    if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+        if let Ok(v) = nvml.sys_driver_version() {
+            return Some(v);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/driver/nvidia/version").ok()?;
+        return text
+            .split_whitespace()
+            .find(|w| w.split('.').count() >= 2 && w.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+            .map(str::to_string);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Major component of an NVIDIA driver version string.
+fn nvidia_driver_major(version: &str) -> Option<u32> {
+    version.split('.').next()?.trim().parse().ok()
+}
+
 /// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
 ///
 /// VRAM requirements (GGUF weights only, not counting CUDA workspace):
@@ -1230,6 +1257,22 @@ async fn run() -> Result<(), Error> {
             error!("GPU probe task panicked: {}", e);
             return Err(e.into());
         }
+    }
+    match nvidia_driver_version() {
+        Some(version) => match nvidia_driver_major(&version) {
+            Some(major) if major >= MIN_NVIDIA_DRIVER_MAJOR => info!("NVIDIA driver {}.", version),
+            Some(_) => {
+                error!(
+                    "NVIDIA driver {} is not supported: mining requires driver {} or newer.",
+                    version, MIN_NVIDIA_DRIVER_MAJOR
+                );
+                error!("HiveOS: run `nvidia-driver-update {}` then reboot.", MIN_NVIDIA_DRIVER_MAJOR);
+                error!("Other systems: install NVIDIA driver {} or newer, then restart the miner.", MIN_NVIDIA_DRIVER_MAJOR);
+                return Err("NVIDIA driver too old — cannot start mining".into());
+            }
+            None => warn!("NVIDIA driver version '{}' could not be parsed.", version),
+        },
+        None => warn!("NVIDIA driver version could not be read."),
     }
     // A library without kernels for a mining GPU passes the load probe and aborts the process on
     // the first request; check every mining GPU up front (in a child process) instead.
