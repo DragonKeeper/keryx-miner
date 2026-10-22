@@ -876,16 +876,19 @@ mod tests {
             252, 68, 196, 245, 124, 248, 247, 162, 186, 65, 10, 112, 208, 173, 73, 6, 3, 85, 185, 222, 185, 112, 18,
             52, 86, 3, 217, 208, 209, 220, 176, 222,
         ];
-        let mut buf = Buf(Vec::with_capacity(1951));
+        let mut buf = Buf(Vec::with_capacity(1983));
         serialize_header(&mut buf, &header, true);
-        assert_eq!(&expected_res[..], &buf.0);
+        // The vector's DAA sits above the block task gate: a zero task root follows the legacy fields.
+        let (legacy, task_root) = buf.0.split_at(expected_res.len());
+        assert_eq!(&expected_res[..], legacy);
+        assert_eq!(task_root, &[0u8; 32][..]);
 
         let expected_hash = Hash::from_le_bytes([
             85, 146, 211, 217, 138, 239, 47, 85, 152, 59, 58, 16, 4, 149, 129, 179, 172, 226, 174, 233, 160, 96, 202,
             54, 6, 225, 64, 142, 106, 0, 110, 137,
         ]);
         let mut hasher = HeaderHasher::new();
-        hasher.write(buf.0);
+        hasher.write(expected_res);
         assert_eq!(hasher.finalize(), expected_hash);
     }
 }
