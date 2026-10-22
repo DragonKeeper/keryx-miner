@@ -162,6 +162,7 @@ struct PendingPublish {
 
 /// An inference running for a queued request.
 struct InferenceJob {
+    stable_id: String,
     request_hash: [u8; 32],
     private: Option<PrivateRequest>,
     model_id: [u8; 32],
@@ -567,7 +568,7 @@ impl KeryxdHandler {
         let stream = client.message_stream(ReceiverStream::new(recv)).await?.into_inner();
         let pending_block_submissions = Arc::new(Mutex::new(VecDeque::new()));
         let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone(), Arc::clone(&pending_block_submissions));
-        Ok(Box::new(Self {
+        let mut handler = Box::new(Self {
             client,
             task_chain: ChainCache::new(),
             stream,
@@ -612,7 +613,23 @@ impl KeryxdHandler {
             strike_status: None,
             stats: None,
             misses_seen: std::collections::HashSet::new(),
-        }))
+        });
+        handler.restore_parked();
+        Ok(handler)
+    }
+
+    /// Takes over the request queue and in-flight inference of the previous connection.
+    fn restore_parked(&mut self) {
+        let Some(parked) = PARKED.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
+        for entry in parked.queue {
+            self.ai_seen_prefixes.insert(entry.0.clone());
+            self.ai_request_queue.push_back(entry);
+        }
+        if let Some(job) = parked.inference {
+            info!("Inference: resuming request id={} across the reconnect", job.stable_id);
+            self.ai_seen_prefixes.insert(job.stable_id.clone());
+            self.inference_rx = Some(job);
+        }
     }
 
     fn create_block_channel(
@@ -971,7 +988,7 @@ impl KeryxdHandler {
             let traced = self.last_known_daa >= keryx_miner::pom::verifiable_inference_activation_daa();
             let tier = traced.then(|| keryx_miner::models::pom_tier_index(&model_id, self.last_known_daa)).flatten();
             let chain = keryx_miner::trace::chain_active(self.last_known_daa);
-            let job = InferenceJob { request_hash, private, model_id, tier, max_tokens: max_tokens as u32, rx: rx_done };
+            let job = InferenceJob { stable_id: stable_id.clone(), request_hash, private, model_id, tier, max_tokens: max_tokens as u32, rx: rx_done };
             if matches!(private, Some(PrivateRequest::Unreadable)) {
                 // No inference to run: the answer is the fixed error text.
                 let _ = tx_done.send(Some(keryx_miner::llm::Generated { text: UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string(), trace: None }));
@@ -2053,10 +2070,8 @@ impl KeryxdHandler {
                     if self.chain_restore_pending.remove(&hash) {
                         self.chain_restore_pump().await?;
                     }
-                    was_validation = self
-                        .escrow_watcher
-                        .as_mut()
-                        .map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
+                    was_validation = block.transactions.is_empty()
+                        && self.escrow_watcher.as_mut().map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
                     if !was_validation {
                         self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                         self.backfill_note_block(&hash, block.header.as_ref());
@@ -2287,8 +2302,23 @@ impl KeryxdHandler {
 impl Drop for KeryxdHandler {
     fn drop(&mut self) {
         self.block_handle.abort();
+        let queue = std::mem::take(&mut self.ai_request_queue);
+        let inference = self.inference_rx.take();
+        if !queue.is_empty() || inference.is_some() {
+            *PARKED.lock().unwrap_or_else(|p| p.into_inner()) = Some(Parked { queue, inference });
+        }
     }
 }
+
+type QueuedRequest = (String, [u8; 32], [u8; 32], String, u32, usize, Option<PrivateRequest>);
+
+/// Request queue and in-flight inference left by a closed connection.
+struct Parked {
+    queue: VecDeque<QueuedRequest>,
+    inference: Option<InferenceJob>,
+}
+
+static PARKED: Mutex<Option<Parked>> = Mutex::new(None);
 
 /// Leading bytes of a private prompt compressed with raw DEFLATE.
 const COMPRESSED_PROMPT_MAGIC: [u8; 4] = [0x00, b'K', b'Z', 0x01];
