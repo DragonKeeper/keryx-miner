@@ -78,12 +78,8 @@ pub struct GpuKernelInfo {
 /// Per-device v4 tile-offset buffer, reused across batches (the chase overwrites every word).
 /// Ported from the ocminer (suprnova) fork.
 static V4_OFFSETS: OnceLock<Mutex<HashMap<usize, Arc<CudaSlice<u32>>>>> = OnceLock::new();
-/// Host copies of the filled context pads, by (pad seed, entries), shared by every device.
-static HOST_PADS: OnceLock<Mutex<HashMap<([u8; 32], u64), Arc<Vec<u32>>>>> = OnceLock::new();
-
-fn host_pads() -> std::sync::MutexGuard<'static, HashMap<([u8; 32], u64), Arc<Vec<u32>>>> {
-    HOST_PADS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner())
-}
+/// Prefix of the error returned when the context pad does not fit in VRAM.
+const PAD_ALLOC_ERR: &str = "context pad does not fit";
 
 fn v4_offsets_buf(stream: &Arc<CudaStream>, len: usize) -> Result<Arc<CudaSlice<u32>>> {
     let m = V4_OFFSETS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1175,22 +1171,18 @@ impl PomGpuMiner {
         })
     }
 
-    /// Allocates the v5 context pad of `n` entries seeded by `pad_seed`: copied from the host
-    /// copy when one exists, else filled on the device and copied to the host.
+    /// Allocates the v5 context pad of `n` entries seeded by `pad_seed` and fills it on the device.
     fn fill_pad(&self, pad_seed: &[u8; 32], n: u64) -> Result<CudaSlice<u32>> {
         let t0 = std::time::Instant::now();
-        let host = host_pads().get(&(*pad_seed, n)).cloned();
-        if let Some(host) = host {
-            let buf = self.stream.clone_htod(host.as_slice())?;
-            self.stream.synchronize()?;
-            info!("PoM v5: context pad restored from host memory in {:.2} s", t0.elapsed().as_secs_f64());
-            return Ok(buf);
-        }
         let fill = self.kernel.function_v5_pad_fill.ok_or_else(|| anyhow!("PoM GPU: no pom_v5_pad_fill entry"))?;
         let need_mib = n * 32 >> 20;
         let free_mib = result::mem_get_info().map_or(0, |(free, _)| free >> 20);
-        info!("PoM v5: allocating a {} MiB context pad ({} MiB free)", need_mib, free_mib);
-        let buf = self.stream.alloc_zeros::<u32>((n * 8) as usize).map_err(|e| anyhow!("context pad of {} MiB with {} MiB free: {}", need_mib, free_mib, e))?;
+        let ord = self.stream.context().ordinal() as u32;
+        log_throttled(ord, "pad-alloc", || info!("PoM v5: allocating a {} MiB context pad ({} MiB free)", need_mib, free_mib));
+        let buf = self
+            .stream
+            .alloc_zeros::<u32>((n * 8) as usize)
+            .map_err(|e| anyhow!("{}: needs {} MiB, {} MiB free ({})", PAD_ALLOC_ERR, need_mib, free_mib, e))?;
         let w = crate::pom_v5::v5_pad_seed_words(pad_seed);
         let rounds = crate::pom_v5::POM_V5_P_ROUNDS;
         {
@@ -1211,23 +1203,7 @@ impl PomGpuMiner {
             }
         }
         info!("PoM v5: context pad of {} entries ({} MiB) filled in {:.1} s", n, n * 32 / (1 << 20), t0.elapsed().as_secs_f64());
-        let host: Vec<u32> = self.stream.clone_dtoh(&buf)?;
-        host_pads().entry((*pad_seed, n)).or_insert_with(|| Arc::new(host));
-        self.evict_host_pads((*pad_seed, n));
         Ok(buf)
-    }
-
-    /// Drops the host pad copies no other device's pad uses, keeping `keep`.
-    fn evict_host_pads(&self, keep: ([u8; 32], u64)) {
-        let Ok(all) = miners().lock() else { return };
-        let mut live = HashSet::from([keep]);
-        for m in all.values().filter(|m| !std::ptr::eq(Arc::as_ptr(m), self)) {
-            let Ok(p) = m.pad.try_lock() else { return };
-            if let Some(s) = p.as_ref() {
-                live.insert((s.seed, s.tiles * crate::pom_v5::POM_V5_TILE_ENTRIES));
-            }
-        }
-        host_pads().retain(|k, _| live.contains(k));
     }
 
     /// Search nonces in `[start, start + batch)`. Returns the lowest nonce whose `pom_pow_value`
@@ -1472,6 +1448,10 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
             let message = e.to_string();
             if is_sticky_gpu_runtime_fault(&message) {
                 mark_fatal_gpu_fault(device_id, &message);
+            } else if message.starts_with(PAD_ALLOC_ERR) {
+                log_throttled(device_id, "pad", || {
+                    warn!("PoM[gpu{}]: {} — this card has too little VRAM for its tier; mine a lower tier (--force-model)", device_id, message)
+                });
             } else {
                 warn!("PoM[gpu{}]: mining call failed: {}", device_id, message);
             }
@@ -2332,9 +2312,8 @@ mod v3_kernel_tests {
         assert_eq!(got_v5, Some(want_v5), "GPU v5 walk differs from the host reference");
 
         *miner.pad.lock().unwrap() = None;
-        assert!(host_pads().contains_key(&(pad_seed, pad_tiles * pom_v5::POM_V5_TILE_ENTRIES)));
-        let restored = miner.mine(&PPH, TIMESTAMP, &target_v5, start, n, true, true, true, true, true, true, false, false, pad).unwrap();
-        assert_eq!(restored, Some(want_v5), "pad restored from host memory differs");
+        let refilled = miner.mine(&PPH, TIMESTAMP, &target_v5, start, n, true, true, true, true, true, true, false, false, pad).unwrap();
+        assert_eq!(refilled, Some(want_v5), "pad refilled after release differs");
 
         let mut miner = miner;
         assert!(miner.kernel.ncf_enabled, "the production kernel was not the one checked above");
