@@ -190,6 +190,11 @@ impl AttnDraw {
         if a.mla_rank == 0 {
             out.push(SpanPlan::new(layout.vcache(self.slot, kv)?, total, lo, hi)?);
         }
+        if path.is_empty() {
+            let (g, qi) = if a.mla_rank > 0 { (a.n_head as u64, self.qh) } else { let g = (a.n_head / a.n_head_kv) as u64; (g, self.qh - kv * g) };
+            let at = (self.t * g + qi) * 4;
+            out.push(SpanPlan::new(layout.lse(self.slot, kv)?, n_pos * g * 4, at, at + 4)?);
+        }
         Some(out)
     }
 
@@ -225,11 +230,22 @@ impl AttnDraw {
             ..Default::default()
         };
         if path.is_empty() {
-            AttnOpening { q_entry: op.q_entry.clone(), o_entry: op.o_entry.clone(), pos_path: op.pos_path.clone(), q: op.q.clone(), out: op.out.clone(), ..base }
+            AttnOpening { q_entry: op.q_entry.clone(), o_entry: op.o_entry.clone(), pos_path: op.pos_path.clone(), q: op.q.clone(), out: op.out.clone(), lse: op.lse.clone(), ..base }
         } else {
             base
         }
     }
+}
+
+/// Draw weights of the children whose partials the attention phase `body` committed, as the node
+/// computes them.
+pub fn attn_child_weights(tier: u8, rec: &TraceRecord, seed: &Hash, body: &[u8]) -> Option<Vec<u16>> {
+    use keryx_verifiable_inference::attn_blocks::{child_weights, decode_partials};
+    use keryx_verifiable_inference::opening::inner_body;
+    let m = TierManifest::for_attn(tier)?;
+    let dv = draw_attn(&m, rec, seed)?.dv;
+    let op = inner_body(body).as_deref().and_then(AttnOpening::decode)?;
+    child_weights(&decode_partials(&op.partials, dv)?)
 }
 
 /// Children of the node of `path` of the attention point of `seed`.
@@ -305,6 +321,7 @@ pub fn attn_opening(
     }
     let kcache = span(&plans[0], &spans[0], seq)?;
     let vcache = if mla { SeqSpan::default() } else { span(&plans[1], &spans[1], seq)? };
+    let lse = if path.is_empty() { span(plans.last().ok_or("no mass span")?, spans.last().ok_or("no mass capture")?, seq)? } else { SeqSpan::default() };
     let (parent, parent_path) = match (path.last(), prev) {
         (Some(&i), Some(b)) => partial_opening(b, d.dv, i as usize).ok_or("no parent partial")?,
         (None, None) => Default::default(),
@@ -332,6 +349,7 @@ pub fn attn_opening(
         parent,
         parent_path,
         partials: Vec::new(),
+        lse,
     })
 }
 

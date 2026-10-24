@@ -1724,10 +1724,15 @@ impl KeryxdHandler {
             let (Some(txid_bytes), Some(block_bytes)) = (hash32(txid), hash32(block)) else { continue };
             let phase = a.path.len();
             let Some(n) = keryx_miner::trace_seq::attn_children(p.tier, &p.trace.record, &d.seed, &a.path) else { continue };
-            let child = keryx_verifiable_inference::attn_blocks::draw_child(&keryx_miner::trace::attn_child_seed(&block_bytes, &txid_bytes, phase as u8), n);
+            let Some(weights) = a.bodies.last().and_then(|b| keryx_miner::trace_seq::attn_child_weights(p.tier, &p.trace.record, &d.seed, b)).filter(|w| w.len() as u64 == n) else {
+                warn!("Trace: response {} — no draw weights for attention phase {}", txid, phase + 1);
+                continue;
+            };
+            let child = keryx_verifiable_inference::attn_blocks::draw_weighted_child(&keryx_miner::trace::attn_child_seed(&block_bytes, &txid_bytes, phase as u8), &weights);
             a.path.push(child);
             a.child_blocks.push(Some(block.to_string()));
-            a.deadline_daa = d.deadline_daa.max(accepted_daa + keryx_miner::trace::TRACE_SEED_DELAY_DAA + keryx_miner::trace::ATTN_PHASE_WINDOW_DAA);
+            a.deadline_daa = d.deadline_daa.max(accepted_daa + keryx_miner::trace::TRACE_SEED_DELAY_DAA
+                    + keryx_miner::trace::attn_phase_window_daa(p.tier, p.max_tokens, p.trace.record.n_prompt, p.trace.record.n_pos));
             a.opened = false;
             a.failures = 0;
             info!("Trace: response {} — attention phase {} drawn child {} of {}, due by DAA {}", txid, phase + 1, child, n, a.deadline_daa);

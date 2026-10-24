@@ -1518,14 +1518,14 @@ mod tests {
         index: &crate::pom::WeightIndex,
         first: &[u8],
     ) -> Result<Vec<Vec<u8>>, String> {
-        use keryx_verifiable_inference::attn_blocks::{draw_child, partial_len};
+        use keryx_verifiable_inference::attn_blocks::{child_weights, decode_partials, draw_weighted_child};
         use keryx_verifiable_inference::opening::{inner_body, AttnOpening};
         let dv = crate::trace_seq::draw_attn(m, &trace.record, seed).ok_or("no attention draw")?.dv;
         let decode = |b: &[u8]| inner_body(b).as_deref().and_then(AttnOpening::decode).or_else(|| AttnOpening::decode(b)).ok_or("undecodable attention body");
         let (mut path, mut prev, mut bodies) = (Vec::new(), decode(first)?.partials, Vec::new());
         while !prev.is_empty() {
             let rand = *blake3::hash(&[seed.as_slice(), &[path.len() as u8]].concat()).as_bytes();
-            path.push(draw_child(&rand, (prev.len() / partial_len(dv)) as u64));
+            path.push(draw_weighted_child(&rand, &child_weights(&decode_partials(&prev, dv).ok_or("undecodable partials")?).ok_or("no draw weights")?));
             let body = open_attention(gguf, 0, m, trace, seed, [3u8; 32], index, &path, Some(&prev))?;
             prev = decode(&body)?.partials;
             bodies.push(body);

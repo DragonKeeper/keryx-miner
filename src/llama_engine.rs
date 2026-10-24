@@ -860,7 +860,7 @@ pub fn seq_configure(gguf: &str, gpu: usize, layers: &[SeqLayer], n_attn: u32, n
         key.extend_from_slice(&v.to_le_bytes());
     }
     let key = *blake3::hash(&key).as_bytes();
-    let n_leaves = if layers.is_empty() { 0 } else { 2 * seq_heads as usize * (n_attn + n_recur) as usize };
+    let n_leaves = if layers.is_empty() { 0 } else { 2 * seq_heads as usize * (n_attn + n_recur) as usize + seq_heads as usize * n_attn as usize };
     if e.seq_layout == key && e.seq_leaves == n_leaves {
         return Ok(n_leaves);
     }
