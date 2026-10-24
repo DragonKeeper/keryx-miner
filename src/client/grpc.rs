@@ -180,6 +180,10 @@ struct TraceContext {
     trace: keryx_miner::trace::ResponseTrace,
 }
 
+/// An AI request read from a transaction: raw payload, model id, prompt, plaintext prompt length,
+/// max tokens, inference reward, private state.
+type ExtractedRequest = (Vec<u8>, [u8; 32], String, u32, usize, u64, Option<PrivateRequest>);
+
 /// A traced response, kept until its draw is settled and its opening window closes.
 struct PendingTrace {
     model_id: [u8; 32],
@@ -197,6 +201,119 @@ struct PendingTrace {
     built: Vec<(String, Vec<u8>)>,
     /// Chain reorgs that reset its acceptance or draw.
     reorgs: u32,
+    /// Attention phases after the first, once the first is submitted.
+    attn: Option<AttnPhases>,
+}
+
+/// The attention phases of an audited response, phase order.
+struct AttnPhases {
+    /// Unsigned body, opening transaction, signed payload and accepting chain block of each
+    /// submitted phase (unknown for phases restored before the last).
+    bodies: Vec<Vec<u8>>,
+    txids: Vec<String>,
+    payloads: Vec<String>,
+    accepted: Vec<Option<String>>,
+    /// Child drawn after each accepted phase, and the chain block that drew it.
+    path: Vec<u64>,
+    child_blocks: Vec<Option<String>>,
+    /// Deadline of the last submitted or the next phase.
+    deadline_daa: u64,
+    /// A replay of the next phase was started for the current path.
+    opened: bool,
+    failures: u32,
+}
+
+impl AttnPhases {
+    fn new(body: Vec<u8>, txid: String, payload: String, deadline_daa: u64) -> Self {
+        Self {
+            bodies: vec![body],
+            txids: vec![txid],
+            payloads: vec![payload],
+            accepted: vec![None],
+            path: Vec::new(),
+            child_blocks: Vec::new(),
+            deadline_daa,
+            opened: false,
+            failures: 0,
+        }
+    }
+
+    fn restored(s: keryx_miner::trace_store::StoredAttn, txid: String) -> Option<Self> {
+        let last = keryx_verifiable_inference::opening::AttnOpening::decode(s.bodies.last()?)?;
+        let n = s.bodies.len();
+        if last.path.len() + 1 != n {
+            return None;
+        }
+        let mut accepted = vec![Some(String::new()); n - 1];
+        accepted.push(s.accepted_hash);
+        let mut txids = vec![String::new(); n - 1];
+        txids.push(txid);
+        let mut payloads = vec![String::new(); n - 1];
+        payloads.push(s.payload);
+        Some(Self {
+            bodies: s.bodies,
+            txids,
+            payloads,
+            accepted,
+            child_blocks: vec![None; last.path.len()],
+            path: last.path,
+            deadline_daa: s.deadline_daa,
+            opened: false,
+            failures: 0,
+        })
+    }
+
+    fn stored(&self) -> keryx_miner::trace_store::StoredAttn {
+        keryx_miner::trace_store::StoredAttn {
+            bodies: self.bodies.clone(),
+            payload: self.payloads.last().cloned().unwrap_or_default(),
+            deadline_daa: self.deadline_daa,
+            accepted_hash: self.accepted.last().cloned().flatten(),
+        }
+    }
+
+    /// Partials the last submitted phase committed; empty after the last phase.
+    fn last_partials(&self) -> Vec<u8> {
+        self.bodies.last().and_then(|b| keryx_verifiable_inference::opening::AttnOpening::decode(b)).map(|o| o.partials).unwrap_or_default()
+    }
+
+    /// Chain block that accepted the last submitted phase, when its child is still to draw.
+    fn awaiting_draw(&self) -> Option<&str> {
+        if self.path.len() + 1 != self.bodies.len() || self.last_partials().is_empty() {
+            return None;
+        }
+        self.accepted.last()?.as_deref().filter(|h| !h.is_empty())
+    }
+
+    /// Whether the next phase can be built: its child is drawn and no replay was started.
+    fn ready(&self) -> bool {
+        self.path.len() == self.bodies.len() && !self.opened
+    }
+
+    /// Undoes the phases and children that depended on `removed` chain blocks; returns the
+    /// opening transactions dropped, or `None` when nothing changed.
+    fn on_removed(&mut self, removed: &std::collections::HashSet<&str>) -> Option<Vec<String>> {
+        let gone = |h: &Option<String>| h.as_deref().is_some_and(|h| removed.contains(h));
+        let k = self.accepted.iter().position(gone);
+        let i = self.child_blocks.iter().position(gone);
+        let cut = match (k, i) {
+            (Some(k), Some(i)) => k.min(i),
+            (Some(c), None) | (None, Some(c)) => c,
+            (None, None) => return None,
+        };
+        let dropped = self.txids.split_off(cut + 1);
+        self.bodies.truncate(cut + 1);
+        self.payloads.truncate(cut + 1);
+        self.accepted.truncate(cut + 1);
+        self.path.truncate(cut);
+        self.child_blocks.truncate(cut);
+        if k == Some(cut) {
+            self.accepted[cut] = None;
+        }
+        self.opened = false;
+        self.failures = 0;
+        Some(dropped)
+    }
 }
 
 /// The draw of an accepted response once its seed block is on the chain.
@@ -224,6 +341,8 @@ struct ChainEntry {
 struct ReplayJob {
     response_txid: String,
     seed_hash: String,
+    /// Path of the attention phase it builds; `None` for the first opening.
+    path: Option<Vec<u64>>,
     rx: oneshot::Receiver<Option<Vec<u8>>>,
 }
 
@@ -317,7 +436,7 @@ pub struct KeryxdHandler {
     /// Queue of AiRequests waiting for inference.
     /// Each entry: (stable_id_hex16, request_hash, model_id, prompt, max_tokens, private state).
     /// Fed by both BlockAdded scans and block template scans.
-    ai_request_queue: VecDeque<(String, [u8; 32], [u8; 32], String, u32, usize, Option<PrivateRequest>)>,
+    ai_request_queue: VecDeque<QueuedRequest>,
 
     /// Block hashes queued for boot-time escrow-state validation, drained in slices of
     /// VALIDATION_WINDOW so thousands of GetBlock requests never saturate the HTTP/2
@@ -477,9 +596,7 @@ impl Client for KeryxdHandler {
                     // delivered as soon as the inference task completes. This is critical on
                     // sole-producer nodes where mining suspension stops NewBlockTemplate
                     // notifications and the response would otherwise never be sent.
-                    } else if self.challenge_inference_rx.is_some() {
-                        self.client_get_block_template().await?;
-                    } else if self.replay_rx.is_some() && self.poll_replay().await {
+                    } else if self.challenge_inference_rx.is_some() || (self.replay_rx.is_some() && self.poll_replay().await) {
                         self.client_get_block_template().await?;
                     }
                     if self.escrow_pubkey.is_some() && self.last_strike_poll.elapsed().as_secs() >= 60 {
@@ -686,7 +803,7 @@ impl KeryxdHandler {
             if ids.is_empty() {
                 String::new()
             } else {
-                let hex_ids: Vec<String> = ids.iter().map(|id| hex::encode(id)).collect();
+                let hex_ids: Vec<String> = ids.iter().map(hex::encode).collect();
                 format!("/ai:cap:{}", hex_ids.join(","))
             }
         };
@@ -769,7 +886,7 @@ impl KeryxdHandler {
         let escrow_secret = self.escrow_watcher.as_ref().map(|w| w.secret_bytes());
         for tx in txs {
             // (raw, model_id, prompt, plaintext prompt length, max_tokens, inference_reward, private state)
-            let extracted: Option<(Vec<u8>, [u8; 32], String, u32, usize, u64, Option<PrivateRequest>)> =
+            let extracted: Option<ExtractedRequest> =
                 if tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_REQUEST_HEX {
                     // Binary AiRequestPayload (dedicated AI subnetwork).
                     hex::decode(&tx.payload).ok().and_then(|raw| {
@@ -988,6 +1105,7 @@ impl KeryxdHandler {
             let traced = self.last_known_daa >= keryx_miner::pom::verifiable_inference_activation_daa();
             let tier = traced.then(|| keryx_miner::models::pom_tier_index(&model_id, self.last_known_daa)).flatten();
             let chain = keryx_miner::trace::chain_active(self.last_known_daa);
+            let attention = chain && keryx_miner::trace::attention_active(self.last_known_daa);
             let unreadable = matches!(private, Some(PrivateRequest::Unreadable));
             let job = InferenceJob { stable_id: stable_id.clone(), request_hash, private, model_id, tier, max_tokens: max_tokens as u32, rx: rx_done };
             if unreadable {
@@ -1004,7 +1122,7 @@ impl KeryxdHandler {
             info!("Inference: spawning LLM inference (max_tokens={}{})", max_tokens, if tier.is_some() { ", traced" } else { "" });
             tokio::task::spawn_blocking(move || {
                 let result = match tier {
-                    Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len, &request_hash, chain),
+                    Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len, &request_hash, chain, attention),
                     None => keryx_miner::llm::load_and_run_inference(&model_id, &prompt, max_tokens)
                         .map(|text| keryx_miner::llm::Generated { text, trace: None }),
                 };
@@ -1064,15 +1182,21 @@ impl KeryxdHandler {
         if self.inference_busy() || self.publish_rx.is_some() || !self.ai_request_queue.is_empty() || keryx_miner::llm::probe_in_flight() {
             return Ok(());
         }
-        let Some(txid) = self
-            .pending_traces
-            .iter()
-            .filter(|(_, p)| p.draw.as_ref().is_some_and(|d| d.audited && !d.opened))
-            .min_by_key(|(_, p)| p.draw.as_ref().map_or(u64::MAX, |d| d.deadline_daa))
-            .map(|(txid, _)| txid.clone())
-        else {
+        let first = self.pending_traces.iter().filter_map(|(txid, p)| {
+            let d = p.draw.as_ref().filter(|d| d.audited && !d.opened)?;
+            Some((d.deadline_daa, txid.clone(), None))
+        });
+        let phases = self.pending_traces.iter().filter_map(|(txid, p)| {
+            p.draw.as_ref().filter(|d| d.audited)?;
+            let a = p.attn.as_ref().filter(|a| a.ready())?;
+            Some((a.deadline_daa, txid.clone(), Some(a.path.clone())))
+        });
+        let Some((_, txid, path)) = first.chain(phases).min_by_key(|(deadline, _, _)| *deadline) else {
             return Ok(());
         };
+        if let Some(path) = path {
+            return self.start_attention_phase(miner, txid, path).await;
+        }
         let Some(txid_bytes) = hash32(&txid) else {
             self.pending_traces.remove(&txid);
             self.trace_store.remove(&txid);
@@ -1091,7 +1215,28 @@ impl KeryxdHandler {
             let body = keryx_miner::llm::open_trace(&model_id, tier, &trace, &seed, txid_bytes, &request_hash, accepted_daa);
             let _ = tx_done.send(body);
         });
-        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, rx: rx_done });
+        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: None, rx: rx_done });
+        Ok(())
+    }
+
+    /// Starts the replay that builds the attention phase of `path` of response `txid`.
+    async fn start_attention_phase(&mut self, miner: &mut MinerManager, txid: String, path: Vec<u64>) -> Result<(), Error> {
+        let Some(txid_bytes) = hash32(&txid) else { return Ok(()) };
+        let Some(p) = self.pending_traces.get_mut(&txid) else { return Ok(()) };
+        let (Some(d), Some(a)) = (p.draw.as_ref(), p.attn.as_mut()) else { return Ok(()) };
+        a.opened = true;
+        let (seed, seed_hash, prev) = (d.seed, d.seed_hash.clone(), a.last_partials());
+        let (model_id, tier, trace) = (p.model_id, p.tier, Arc::clone(&p.trace));
+        info!("Trace: response {} — replaying attention phase {}", txid, path.len());
+        self.set_opoi_pause(true);
+        miner.process_block(None).await?;
+        let (tx_done, rx_done) = oneshot::channel::<Option<Vec<u8>>>();
+        let job_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let body = keryx_miner::llm::open_attention_phase(&model_id, tier, &trace, &seed, txid_bytes, &job_path, &prev);
+            let _ = tx_done.send(body);
+        });
+        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: Some(path), rx: rx_done });
         Ok(())
     }
 
@@ -1107,6 +1252,10 @@ impl KeryxdHandler {
             }
             Err(_) => None,
         };
+        if let Some(path) = job.path {
+            self.on_attention_phase_built(&job.response_txid, &job.seed_hash, path, body).await;
+            return true;
+        }
         let Some(body) = body else {
             let retry = self
                 .pending_traces
@@ -1131,7 +1280,7 @@ impl KeryxdHandler {
             p.built.remove(0);
         }
         p.built.push((job.seed_hash.clone(), body.clone()));
-        if !p.draw.as_ref().is_some_and(|d| d.seed_hash == job.seed_hash) {
+        if p.draw.as_ref().is_none_or(|d| d.seed_hash != job.seed_hash) {
             info!("Trace: seed block of response {} left the chain during the replay — opening kept for its return", job.response_txid);
             return true;
         }
@@ -1140,21 +1289,73 @@ impl KeryxdHandler {
     }
 
     /// Signs and submits the opening `body` of response `response_txid`, built for `seed_hash`,
-    /// the seed block of its current draw.
+    /// the seed block of its current draw: one transaction per piece it bundles.
     async fn submit_opening(&mut self, response_txid: &str, seed_hash: &str, body: Vec<u8>) {
         let Some(d) = self.pending_traces.get(response_txid).and_then(|p| p.draw.as_ref()) else { return };
-        let deadline_daa = d.deadline_daa;
-        let body = if self.last_known_daa.max(d.seed_daa) >= keryx_miner::pom::trace_seed_bind_activation_daa() {
-            let Some(b) = hash32(seed_hash).and_then(|h| keryx_verifiable_inference::opening::seeded(&body, &h)) else {
+        let (deadline_daa, seed_daa) = (d.deadline_daa, d.seed_daa);
+        let Some(pieces) = keryx_miner::trace_seq::unbundle(&body) else {
+            warn!("Trace: malformed opening bundle for response {}", response_txid);
+            return;
+        };
+        let mut txs = Vec::with_capacity(pieces.len());
+        let mut phased = None;
+        for piece in pieces {
+            let Some(tx) = self.opening_tx(response_txid, seed_hash, seed_daa, &piece) else { return };
+            if keryx_verifiable_inference::opening::AttnOpening::decode(&piece).is_some_and(|o| !o.partials.is_empty()) {
+                phased = Some((piece.clone(), txs.len()));
+            }
+            txs.push((piece.len(), tx));
+        }
+        if let Some((body, i)) = phased {
+            let tx = &txs[i].1;
+            if let (Some(txid), Some(p)) = (Self::compute_rpc_txid(tx), self.pending_traces.get_mut(response_txid)) {
+                p.attn = Some(AttnPhases::new(body, txid, tx.payload.clone(), deadline_daa));
+            }
+        }
+        for (len, rpc_tx) in &txs {
+            if let Some(txid) = Self::compute_rpc_txid(rpc_tx) {
+                info!("Trace: submitting the opening of response {} ({} B)", response_txid, len);
+                self.opening_inflight.insert(
+                    txid,
+                    OpeningInflight {
+                        tx: rpc_tx.clone(),
+                        response_txid: response_txid.to_string(),
+                        deadline_daa,
+                        attempts: 1,
+                        last: std::time::Instant::now(),
+                    },
+                );
+            }
+        }
+        if let Some(p) = self.pending_traces.get_mut(response_txid) {
+            p.opening = Some(keryx_miner::trace_store::StoredOpening {
+                seed_hash: seed_hash.to_string(),
+                deadline_daa,
+                payload: txs[0].1.payload.clone(),
+                extra: txs[1..].iter().map(|(_, t)| t.payload.clone()).collect(),
+            });
+        }
+        self.persist_trace(response_txid);
+        for (_, rpc_tx) in txs {
+            if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
+                warn!("Trace: failed to send the opening tx: {}", e);
+            }
+        }
+    }
+
+    /// The signed opening transaction of `piece`, naming its seed block once that rule is active.
+    fn opening_tx(&self, response_txid: &str, seed_hash: &str, seed_daa: u64, piece: &[u8]) -> Option<crate::proto::RpcTransaction> {
+        let piece = if self.last_known_daa.max(seed_daa) >= keryx_miner::pom::trace_seed_bind_activation_daa() {
+            let Some(b) = hash32(seed_hash).and_then(|h| keryx_verifiable_inference::opening::seeded(piece, &h)) else {
                 warn!("Trace: cannot name seed block {} in the opening of response {}", seed_hash, response_txid);
-                return;
+                return None;
             };
             b
         } else {
-            body
+            piece.to_vec()
         };
-        let Some(payload) = self.escrow_watcher.as_ref().map(|w| w.sign_opening(&body)) else { return };
-        let rpc_tx = crate::proto::RpcTransaction {
+        let payload = self.escrow_watcher.as_ref().map(|w| w.sign_opening(&piece))?;
+        Some(crate::proto::RpcTransaction {
             version: 0,
             inputs: vec![],
             outputs: vec![],
@@ -1164,30 +1365,37 @@ impl KeryxdHandler {
             payload: hex::encode(payload),
             mass: 0,
             verbose_data: None,
+        })
+    }
+
+    /// Submits the attention phase of `path` of response `response_txid` once built, if its path
+    /// is still the drawn one.
+    async fn on_attention_phase_built(&mut self, response_txid: &str, seed_hash: &str, path: Vec<u64>, body: Option<Vec<u8>>) {
+        let Some(p) = self.pending_traces.get_mut(response_txid) else { return };
+        let Some(seed_daa) = p.draw.as_ref().filter(|d| d.seed_hash == seed_hash).map(|d| d.seed_daa) else { return };
+        let Some(a) = p.attn.as_mut().filter(|a| a.path == path && a.bodies.len() == path.len()) else { return };
+        let Some(body) = body else {
+            a.failures += 1;
+            a.opened = a.failures > REPLAY_MAX_FAILURES;
+            warn!("Trace: attention phase {} of response {} not built{}", path.len(), response_txid, if a.opened { "" } else { " — retrying" });
+            return;
         };
-        if let Some(txid) = Self::compute_rpc_txid(&rpc_tx) {
-            info!("Trace: submitting the opening of response {} ({} B)", response_txid, body.len());
-            self.opening_inflight.insert(
-                txid,
-                OpeningInflight {
-                    tx: rpc_tx.clone(),
-                    response_txid: response_txid.to_string(),
-                    deadline_daa,
-                    attempts: 1,
-                    last: std::time::Instant::now(),
-                },
-            );
-        }
-        if let Some(p) = self.pending_traces.get_mut(response_txid) {
-            p.opening = Some(keryx_miner::trace_store::StoredOpening {
-                seed_hash: seed_hash.to_string(),
-                deadline_daa,
-                payload: rpc_tx.payload.clone(),
-            });
-        }
+        let deadline_daa = a.deadline_daa;
+        let Some(tx) = self.opening_tx(response_txid, seed_hash, seed_daa, &body) else { return };
+        let Some(txid) = Self::compute_rpc_txid(&tx) else { return };
+        info!("Trace: submitting attention phase {} of response {} ({} B)", path.len(), response_txid, body.len());
+        let a = self.pending_traces.get_mut(response_txid).and_then(|p| p.attn.as_mut()).unwrap();
+        a.bodies.push(body);
+        a.txids.push(txid.clone());
+        a.payloads.push(tx.payload.clone());
+        a.accepted.push(None);
+        self.opening_inflight.insert(
+            txid,
+            OpeningInflight { tx: tx.clone(), response_txid: response_txid.to_string(), deadline_daa, attempts: 1, last: std::time::Instant::now() },
+        );
         self.persist_trace(response_txid);
-        if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
-            warn!("Trace: failed to send the opening tx: {}", e);
+        if let Err(e) = self.client_send(KaspadMessage::submit_transaction(tx)).await {
+            warn!("Trace: failed to send the attention phase tx: {}", e);
         }
     }
 
@@ -1226,6 +1434,7 @@ impl KeryxdHandler {
     /// Writes the on-disk copy of a pending trace.
     fn persist_trace(&self, txid: &str) {
         let Some(p) = self.pending_traces.get(txid) else { return };
+        let attn = p.attn.as_ref().map(AttnPhases::stored);
         let record = keryx_miner::trace_store::StoredTraceRef {
             version: keryx_miner::trace_store::StoredTraceRef::version(),
             response_txid: txid,
@@ -1237,6 +1446,7 @@ impl KeryxdHandler {
             accepted_hash: &p.accepted_hash,
             opening: &p.opening,
             trace: &p.trace,
+            attn: &attn,
         };
         if let Err(e) = self.trace_store.save(&record) {
             warn!("Trace: cannot persist response {}: {}", txid, e);
@@ -1250,7 +1460,12 @@ impl KeryxdHandler {
         let mut traces = std::collections::HashMap::new();
         let mut openings = std::collections::HashMap::new();
         for t in store.load_all() {
-            if let Some(o) = t.opening.as_ref() {
+            let mut resend: Vec<(&String, u64)> = t.opening.iter().flat_map(|o| std::iter::once(&o.payload).chain(o.extra.iter()).map(|p| (p, o.deadline_daa))).collect();
+            if let Some(a) = t.attn.as_ref() {
+                resend.push((&a.payload, a.deadline_daa));
+            }
+            let mut attn_txid = None;
+            for (payload, deadline_daa) in resend {
                 let rpc_tx = crate::proto::RpcTransaction {
                     version: 0,
                     inputs: vec![],
@@ -1258,23 +1473,27 @@ impl KeryxdHandler {
                     lock_time: 0,
                     subnetwork_id: keryx_inference::SUBNETWORK_ID_AI_OPENING_HEX.to_string(),
                     gas: 0,
-                    payload: o.payload.clone(),
+                    payload: payload.clone(),
                     mass: 0,
                     verbose_data: None,
                 };
                 if let Some(txid) = Self::compute_rpc_txid(&rpc_tx) {
+                    if t.attn.as_ref().is_some_and(|a| &a.payload == payload) {
+                        attn_txid = Some(txid.clone());
+                    }
                     openings.insert(
                         txid,
                         OpeningInflight {
                             tx: rpc_tx,
                             response_txid: t.response_txid.clone(),
-                            deadline_daa: o.deadline_daa,
+                            deadline_daa,
                             attempts: 1,
                             last: std::time::Instant::now() - std::time::Duration::from_secs(60),
                         },
                     );
                 }
             }
+            let attn = t.attn.zip(attn_txid).and_then(|(a, txid)| AttnPhases::restored(a, txid));
             traces.insert(
                 t.response_txid.clone(),
                 PendingTrace {
@@ -1289,6 +1508,7 @@ impl KeryxdHandler {
                     opening: t.opening,
                     built: Vec::new(),
                     reorgs: 0,
+                    attn,
                 },
             );
         }
@@ -1368,9 +1588,28 @@ impl KeryxdHandler {
         self.chain_log.retain(|e| e.hash != start);
     }
 
+    /// Notes the chain blocks accepting the last submitted attention phases; returns their
+    /// responses.
+    fn note_phase_acceptances(&mut self, accepted: &[crate::proto::RpcAcceptedTransactionIds]) -> Vec<String> {
+        let mut noted = Vec::new();
+        for a in accepted {
+            for txid in &a.accepted_transaction_ids {
+                for (response, p) in self.pending_traces.iter_mut() {
+                    let Some(ph) = p.attn.as_mut() else { continue };
+                    if ph.txids.last() == Some(txid) && ph.accepted.last().is_some_and(Option::is_none) {
+                        *ph.accepted.last_mut().unwrap() = Some(a.accepting_block_hash.clone());
+                        info!("Trace: attention phase {} of response {} accepted by chain block {}", ph.bodies.len() - 1, response, a.accepting_block_hash);
+                        noted.push(response.clone());
+                    }
+                }
+            }
+        }
+        noted
+    }
+
     /// Notes the acceptances of restored responses that lost their accepting block.
     fn note_restored_acceptances(&mut self, accepted: &[crate::proto::RpcAcceptedTransactionIds]) {
-        let mut noted: Vec<String> = Vec::new();
+        let mut noted: Vec<String> = self.note_phase_acceptances(accepted);
         for a in accepted {
             for txid in &a.accepted_transaction_ids {
                 if let Some(p) = self.pending_traces.get_mut(txid).filter(|p| p.accepted_hash.is_none()) {
@@ -1416,6 +1655,7 @@ impl KeryxdHandler {
         let removed: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
         self.chain_log.retain(|e| !removed.contains(e.hash.as_str()));
         let mut reset: Vec<String> = Vec::new();
+        let mut rephased: Vec<String> = Vec::new();
         for (txid, p) in self.pending_traces.iter_mut() {
             if p.accepted_hash.as_deref().is_some_and(|h| removed.contains(h)) {
                 p.accepted_hash = None;
@@ -1424,13 +1664,21 @@ impl KeryxdHandler {
             } else if p.draw.as_ref().is_some_and(|d| removed.contains(d.seed_hash.as_str())) {
                 p.draw = None;
                 reset.push(txid.clone());
+            } else if let Some(dropped) = p.attn.as_mut().and_then(|a| a.on_removed(&removed)) {
+                log::debug!("Trace: chain reorg — attention phases of response {} back to phase {}", txid, p.attn.as_ref().map_or(0, |a| a.bodies.len() - 1));
+                self.opening_inflight.retain(|t, _| !dropped.contains(t));
+                rephased.push(txid.clone());
             }
+        }
+        for txid in rephased {
+            self.persist_trace(&txid);
         }
         for txid in reset {
             log::debug!("Trace: chain reorg — the draw of response {} is reset", txid);
             self.opening_inflight.retain(|_, o| o.response_txid != txid);
             if let Some(p) = self.pending_traces.get_mut(&txid) {
                 p.opening = None;
+                p.attn = None;
                 p.reorgs += 1;
             }
             self.persist_trace(&txid);
@@ -1468,6 +1716,26 @@ impl KeryxdHandler {
                 },
             ));
         }
+        let mut children: Vec<String> = Vec::new();
+        for (txid, p) in self.pending_traces.iter_mut() {
+            let (Some(d), Some(a)) = (p.draw.as_ref(), p.attn.as_mut()) else { continue };
+            let Some(accepted) = a.awaiting_draw() else { continue };
+            let Some((block, _, accepted_daa)) = seed_block_after(&self.chain_log, accepted) else { continue };
+            let (Some(txid_bytes), Some(block_bytes)) = (hash32(txid), hash32(block)) else { continue };
+            let phase = a.path.len();
+            let Some(n) = keryx_miner::trace_seq::attn_children(p.tier, &p.trace.record, &d.seed, &a.path) else { continue };
+            let child = keryx_verifiable_inference::attn_blocks::draw_child(&keryx_miner::trace::attn_child_seed(&block_bytes, &txid_bytes, phase as u8), n);
+            a.path.push(child);
+            a.child_blocks.push(Some(block.to_string()));
+            a.deadline_daa = d.deadline_daa.max(accepted_daa + keryx_miner::trace::TRACE_SEED_DELAY_DAA + keryx_miner::trace::ATTN_PHASE_WINDOW_DAA);
+            a.opened = false;
+            a.failures = 0;
+            info!("Trace: response {} — attention phase {} drawn child {} of {}, due by DAA {}", txid, phase + 1, child, n, a.deadline_daa);
+            children.push(txid.clone());
+        }
+        for txid in children {
+            self.persist_trace(&txid);
+        }
         for (txid, d) in drawn {
             if d.audited {
                 let reorgs = self.pending_traces.get(&txid).map_or(0, |p| p.reorgs);
@@ -1494,7 +1762,7 @@ impl KeryxdHandler {
                 if daa > d.deadline_daa && !d.opened {
                     warn!("Trace: response {} was never opened — window closed", txid);
                 }
-                daa <= d.deadline_daa
+                daa <= d.deadline_daa.max(p.attn.as_ref().map_or(0, |a| a.deadline_daa))
             }
         });
         for txid in before.iter().filter(|t| !self.pending_traces.contains_key(*t)) {
@@ -1712,7 +1980,7 @@ impl KeryxdHandler {
         let response_length = result.split_whitespace().count() as u32;
         // The trace commitment rides after the private body only.
         let trace = trace.filter(|_| private_body.is_some());
-        let commitment = trace.as_ref().map(|t| t.trace.record.commitment());
+        let commitment = trace.as_ref().map(|t| t.trace.commitment());
         // H6 service-bond era: sign the response with the escrow key (payload V2) so it counts
         // as served for the tier cohort — an unsigned response no longer cancels a strike. The
         // era rule mirrors the node's: V2 is rejected before the gate, so v1 is kept below it.
@@ -1773,6 +2041,7 @@ impl KeryxdHandler {
                     opening: None,
                     built: Vec::new(),
                     reorgs: 0,
+                    attn: None,
                 };
                 self.pending_traces.insert(txid.clone(), pending);
                 self.persist_trace(&txid);
@@ -1967,7 +2236,7 @@ impl KeryxdHandler {
                 if keryx_miner::llm::loaded_model_ids().is_empty() {
                     keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-no-models", || warn!("Template held: no loaded model"));
                     // Throttle to one log per ~200 templates (~every 20s at 10 BPS) to avoid spam.
-                    if self.last_known_daa % 200 == 0 {
+                    if self.last_known_daa.is_multiple_of(200) {
                         if keryx_miner::llm::publishing_blocked() {
                             log::warn!("Inference: IPFS node unreachable from the public gateways — mining suspended until it is reachable again (kubo port 4001)");
                         } else {
@@ -2042,7 +2311,7 @@ impl KeryxdHandler {
                     was_validation = self
                         .escrow_watcher
                         .as_mut()
-                        .map_or(false, |w| w.on_block_validation_error(&e.message));
+                        .is_some_and(|w| w.on_block_validation_error(&e.message));
                     if let Some(h) = self.chain_restore_pending.iter().find(|h| e.message.contains(h.as_str())).cloned() {
                         self.chain_restore_pending.remove(&h);
                         self.chain_restore_pump().await?;
@@ -2059,7 +2328,7 @@ impl KeryxdHandler {
                     let hash = block.verbose_data.as_ref().map(|v| v.hash.clone()).unwrap_or_default();
                     // Chain membership from the node's live verdict: a stored-but-reorged
                     // block must purge its entries just like a missing one.
-                    let is_chain = block.verbose_data.as_ref().map_or(false, |v| v.is_chain_block);
+                    let is_chain = block.verbose_data.as_ref().is_some_and(|v| v.is_chain_block);
                     if let Some(daa) = block.header.as_ref().map(|h| h.daa_score) {
                         self.note_chain_block(&hash, daa);
                         self.resolve_traces();
@@ -2068,7 +2337,7 @@ impl KeryxdHandler {
                         self.chain_restore_pump().await?;
                     }
                     was_validation = block.transactions.is_empty()
-                        && self.escrow_watcher.as_mut().map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
+                        && self.escrow_watcher.as_mut().is_some_and(|w| w.consume_validation_ok(&hash, is_chain));
                     if !was_validation {
                         self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                         self.backfill_note_block(&hash, block.header.as_ref());
@@ -2269,6 +2538,7 @@ impl KeryxdHandler {
                         }
                     }
                 }
+                accepted_now.extend(self.note_phase_acceptances(&notif.accepted_transaction_ids));
                 for txid in accepted_now {
                     self.persist_trace(&txid);
                 }
@@ -2357,7 +2627,7 @@ mod tests {
         };
         let txs = vec![response([1u8; 32], mine), response([2u8; 32], other), response([3u8; 32], mine)];
         let ids = super::KeryxdHandler::own_answered_request_ids(&txs, &mine);
-        assert_eq!(ids, vec![hex::encode(&[1u8; 8]), hex::encode(&[3u8; 8])]);
+        assert_eq!(ids, vec![hex::encode([1u8; 8]), hex::encode([3u8; 8])]);
         assert!(super::KeryxdHandler::own_answered_request_ids(&txs, &[0xCCu8; 32]).is_empty());
     }
 
@@ -2437,6 +2707,62 @@ mod tests {
         let daa = super::query_virtual_daa("grpc://127.0.0.1:22110".to_string()).await;
         assert!(daa.is_some_and(|d| d > 0), "no DAA read from the node: {:?}", daa);
         println!("node virtual daa = {}", daa.unwrap());
+    }
+
+    fn phase_body(path: Vec<u64>, partials: usize) -> Vec<u8> {
+        keryx_verifiable_inference::opening::AttnOpening { path, partials: vec![7; partials], ..Default::default() }.encode()
+    }
+
+    /// Phase 0 accepted by `a0`, child 2 drawn by `b0`, phase 1 accepted by `a1`.
+    fn two_phases() -> super::AttnPhases {
+        let mut a = super::AttnPhases::new(phase_body(vec![], 8), "t0".into(), "p0".into(), 100);
+        assert_eq!(a.awaiting_draw(), None, "a phase awaits its acceptance before its draw");
+        a.accepted[0] = Some("a0".into());
+        assert_eq!(a.awaiting_draw(), Some("a0"));
+        assert!(!a.ready());
+        a.path.push(2);
+        a.child_blocks.push(Some("b0".into()));
+        assert!(a.ready() && a.awaiting_draw().is_none());
+        a.bodies.push(phase_body(vec![2], 8));
+        a.txids.push("t1".into());
+        a.payloads.push("p1".into());
+        a.accepted.push(Some("a1".into()));
+        a.opened = true;
+        a
+    }
+
+    #[test]
+    fn attention_phases_step_back_to_what_a_reorg_leaves() {
+        let removed = |h: &'static str| std::collections::HashSet::from([h]);
+        let mut a = two_phases();
+        assert_eq!(a.on_removed(&removed("zz")), None);
+        assert_eq!(a.on_removed(&removed("a1")), Some(vec![]));
+        assert_eq!((a.bodies.len(), a.path.clone(), a.accepted.clone(), a.opened), (2, vec![2], vec![Some("a0".into()), None], false));
+        let mut a = two_phases();
+        assert_eq!(a.on_removed(&removed("b0")), Some(vec!["t1".to_string()]));
+        assert_eq!((a.bodies.len(), a.path.len(), a.child_blocks.len(), a.awaiting_draw()), (1, 0, 0, Some("a0")));
+        let mut a = two_phases();
+        assert_eq!(a.on_removed(&std::collections::HashSet::from(["a0", "a1"])), Some(vec!["t1".to_string()]));
+        assert_eq!((a.bodies.len(), a.accepted.clone(), a.awaiting_draw()), (1, vec![None], None));
+    }
+
+    #[test]
+    fn the_last_phase_awaits_no_draw() {
+        let mut a = two_phases();
+        a.bodies[1] = phase_body(vec![2], 0);
+        assert_eq!(a.awaiting_draw(), None);
+        assert!(!a.ready());
+    }
+
+    #[test]
+    fn attention_phases_restore_from_the_store() {
+        let a = two_phases();
+        let back = super::AttnPhases::restored(a.stored(), "t1".into()).unwrap();
+        assert_eq!((back.path.clone(), back.txids.last().cloned(), back.accepted.last().cloned()), (vec![2], Some("t1".into()), Some(Some("a1".into()))));
+        assert_eq!(back.awaiting_draw(), Some("a1"));
+        let mut broken = a.stored();
+        broken.bodies[1] = phase_body(vec![2, 1], 8);
+        assert!(super::AttnPhases::restored(broken, "t1".into()).is_none());
     }
 
     #[test]

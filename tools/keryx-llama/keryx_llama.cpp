@@ -268,6 +268,16 @@ int  ggml_cuda_q8c_read(int device, uint8_t* leaves, size_t leaves_cap, uint32_t
 int  ggml_cuda_q8c_read_capture(int device, uint8_t* x, size_t x_cap, uint8_t* y, size_t y_cap, uint32_t* x_len, uint32_t* y_len);
 int  ggml_cuda_q8c_arm_captures(int device, const uint32_t* pos, const uint32_t* leaf, uint32_t n, uint32_t slot_bytes);
 int  ggml_cuda_q8c_read_captures(int device, uint8_t* out, size_t out_cap, uint32_t* lens, uint32_t n);
+// Sequence leaves (ggml-cuda/q8seq.cu, applied by tools/keryx-llama/patches).
+int  ggml_cuda_q8s_configure(int device, const uint32_t* layers, uint32_t n, uint32_t n_attn, uint32_t n_recur,
+                             uint32_t seq_heads, uint32_t interval, uint32_t max_tokens);
+void ggml_cuda_q8s_release(int device);
+int  ggml_cuda_q8s_begin_response(int device);
+int  ggml_cuda_q8s_roots(int device, uint8_t* out, size_t out_cap, uint32_t* n_leaves);
+int  ggml_cuda_q8s_arm(int device, const uint32_t* stream, const uint64_t* lo, const uint64_t* hi, uint32_t n,
+                       uint32_t max_chunks);
+int  ggml_cuda_q8s_read_captures(int device, uint8_t* bytes, size_t bytes_cap, uint64_t* lens, uint8_t* cvs,
+                                 size_t cvs_cap, uint32_t* n_cvs, uint32_t n);
 }
 #endif
 
@@ -340,6 +350,7 @@ struct KeryxLlama {
     KeryxTrace*    trace = nullptr;
     int            gpu   = 0;
     bool           traced = false;
+    bool           sequenced = false;
     std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
     std::mutex gen_lock;
     std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
@@ -420,6 +431,7 @@ static int keryx_trace_reset(KeryxLlama* h) {
     (void)h;
     return 0;
 #else
+    if (h->sequenced && ggml_cuda_q8s_begin_response(h->gpu) != 0) return -1;
     return h->traced ? ggml_cuda_q8c_begin_response(h->gpu) : 0;
 #endif
 }
@@ -427,7 +439,7 @@ static int keryx_trace_reset(KeryxLlama* h) {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 8; }
+KERYX_EXPORT int keryx_llama_abi() { return 9; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -830,6 +842,7 @@ static int keryx_replay_begin(KeryxLlama* h, int n_tokens) {
     if (n_tokens > (int)llama_n_ctx(h->ctx)) return -2;
     llama_memory_clear(llama_get_memory(h->ctx), true);
     llama_sampler_reset(h->smpl);
+    if (h->sequenced && ggml_cuda_q8s_begin_response(h->gpu) != 0) return -5;
     return ggml_cuda_q8c_begin_response(h->gpu) != 0 ? -5 : 0;
 }
 #endif
@@ -881,6 +894,69 @@ KERYX_EXPORT int keryx_llama_replay_multi(KeryxLlama* h, const int32_t* tokens, 
     rc = keryx_replay_to(h, tokens, n_prompt, last);
     if (rc != 0) return rc;
     return ggml_cuda_q8c_read_captures(h->gpu, out, out_cap, lens, n);
+#endif
+}
+
+// Enables the sequence leaves on the engine's GPU: `layers` holds `n` rows of (layer, kind, slot,
+// heads, head_dim), `interval` positions between recurrent state checkpoints; `n` = 0 disables
+// them. Returns 0 on success.
+KERYX_EXPORT int keryx_llama_seq_configure(KeryxLlama* h, const uint32_t* layers, uint32_t n, uint32_t n_attn,
+                                           uint32_t n_recur, uint32_t seq_heads, uint32_t interval) {
+#ifdef __APPLE__
+    (void)h; (void)layers; (void)n; (void)n_attn; (void)n_recur; (void)seq_heads; (void)interval;
+    return -1;
+#else
+    if (!h || (n > 0 && !layers)) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    if (n == 0) {
+        if (h->sequenced) ggml_cuda_q8s_release(h->gpu);
+        h->sequenced = false;
+        return 0;
+    }
+    if (!keryx_has_ctx(h)) return -2;
+    const int rc = ggml_cuda_q8s_configure(h->gpu, layers, n, n_attn, n_recur, seq_heads, interval, llama_n_ubatch(h->ctx));
+    h->sequenced = rc == 0;
+    if (rc != 0) keryx_set_error("trace", "sequence leaf configuration failed (" + std::to_string(rc) + ")");
+    return rc;
+#endif
+}
+
+// Sequence leaf hashes of the last traced run (`n_leaves` × 32 bytes). Returns 0 on success.
+KERYX_EXPORT int keryx_llama_seq_roots(KeryxLlama* h, uint8_t* out, size_t out_cap, uint32_t* n_leaves) {
+#ifdef __APPLE__
+    (void)h; (void)out; (void)out_cap; (void)n_leaves;
+    return -1;
+#else
+    if (!h || !h->sequenced || !out || !n_leaves) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    return ggml_cuda_q8s_roots(h->gpu, out, out_cap, n_leaves);
+#endif
+}
+
+// Replays a traced response to its end and copies bytes `[lo[k], hi[k])` of sequence leaf
+// `stream[k]` end to end into `bytes` (`lens[k]` each), with the chunk chaining values of each leaf
+// (`n_cvs[k]` × 32 bytes) into `cvs`. Same return codes as keryx_llama_replay.
+KERYX_EXPORT int keryx_llama_seq_replay(KeryxLlama* h, const int32_t* tokens, int n_tokens, int n_prompt,
+                                        const uint32_t* stream, const uint64_t* lo, const uint64_t* hi, uint32_t n,
+                                        uint32_t max_chunks, uint8_t* bytes, size_t bytes_cap, uint64_t* lens,
+                                        uint8_t* cvs, size_t cvs_cap, uint32_t* n_cvs) {
+#ifdef __APPLE__
+    (void)h; (void)tokens; (void)n_tokens; (void)n_prompt; (void)stream; (void)lo; (void)hi; (void)n; (void)max_chunks;
+    (void)bytes; (void)bytes_cap; (void)lens; (void)cvs; (void)cvs_cap; (void)n_cvs;
+    return -1;
+#else
+    if (!h || !h->traced || !h->sequenced || !tokens || n_prompt <= 0 || n_tokens < n_prompt || !stream || !lo || !hi
+        || n == 0 || !bytes || !lens || !cvs || !n_cvs) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    if (ggml_cuda_q8s_arm(h->gpu, stream, lo, hi, n, max_chunks) != 0) return -5;
+    int rc = keryx_replay_begin(h, n_tokens);
+    if (rc != 0) return rc;
+    rc = keryx_replay_to(h, tokens, n_prompt, (uint32_t)n_tokens - 1);
+    if (rc != 0) return rc;
+    uint32_t n_leaves = 0;
+    std::vector<uint8_t> roots((size_t)2 * 1024 * 1024);
+    if (ggml_cuda_q8s_roots(h->gpu, roots.data(), roots.size(), &n_leaves) != 0) return -5;
+    return ggml_cuda_q8s_read_captures(h->gpu, bytes, bytes_cap, lens, cvs, cvs_cap, n_cvs, n) != 0 ? -6 : 0;
 #endif
 }
 
@@ -936,6 +1012,7 @@ KERYX_EXPORT int keryx_llama_probe_device(int gpu) {
 KERYX_EXPORT void keryx_llama_free(KeryxLlama* h) {
 #ifndef __APPLE__
     if (h && h->traced) ggml_cuda_q8c_release(h->gpu);
+    if (h && h->sequenced) ggml_cuda_q8s_release(h->gpu);
 #endif
     if (!h) return;
     if (h->smpl) llama_sampler_free(h->smpl);

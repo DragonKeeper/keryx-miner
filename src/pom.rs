@@ -22,7 +22,7 @@ pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::fs::FileExt;
-        return file.read_exact_at(buf, offset);
+        file.read_exact_at(buf, offset)
     }
     #[cfg(target_family = "windows")]
     {
@@ -1638,7 +1638,13 @@ pub fn pom_v5_activation_daa() -> u64 {
 /// Block task gate: headers carry `task_root`, hashed into the pre-PoW and block hashes.
 /// MUST equal the node's `block_task_activation`.
 pub fn block_task_activation_daa() -> u64 {
-    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    u64::MAX
+}
+
+/// Node `attention_activation`: traces commit sequence leaves and audits open attention and
+/// recurrent points from this DAA.
+pub fn attention_activation_daa() -> u64 {
+    u64::MAX
 }
 
 /// H10 gate: walk-seed switch at/after this score. MUST equal the node's `h10_activation`.
@@ -2313,7 +2319,6 @@ mod h15_gate_tests {
         assert!(!is_testnet());
         for g in [
             pom_v5_activation_daa(),
-            block_task_activation_daa(),
             verifiable_inference_activation_daa(),
             trace_prefix_activation_daa(),
             trace_audit_activation_daa(),
@@ -2324,5 +2329,6 @@ mod h15_gate_tests {
         }
         assert_eq!(H15_ACTIVATION_DAA, 140_115_000);
         assert!(private_inference_activation_daa() < H15_ACTIVATION_DAA);
+        assert_eq!(block_task_activation_daa(), u64::MAX);
     }
 }

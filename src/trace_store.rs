@@ -6,7 +6,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const STORE_VERSION: u32 = 2;
+const STORE_VERSION: u32 = 4;
+/// Records written before attention phases: read and kept, without them.
+const V3_VERSION: u32 = 3;
+/// Records written before sequence leaves: read and kept, without them.
+const LEGACY_VERSION: u32 = 2;
 const FILE_EXT: &str = "trace";
 
 /// The opening already built for a response: resent as is after a restart.
@@ -16,6 +20,27 @@ pub struct StoredOpening {
     pub deadline_daa: u64,
     /// Hex payload of the signed opening transaction.
     pub payload: String,
+    /// Hex payloads of the other pieces of the opening, one transaction each.
+    pub extra: Vec<String>,
+}
+
+/// Attention phases after the first, once the first is submitted.
+#[derive(Clone, Debug, Default, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct StoredAttn {
+    /// Unsigned body of each submitted phase, phase order.
+    pub bodies: Vec<Vec<u8>>,
+    /// Hex payload of the signed transaction of the last submitted phase.
+    pub payload: String,
+    pub deadline_daa: u64,
+    /// Chain block that accepted the last submitted phase.
+    pub accepted_hash: Option<String>,
+}
+
+#[derive(BorshDeserialize)]
+struct LegacyStoredOpening {
+    seed_hash: String,
+    deadline_daa: u64,
+    payload: String,
 }
 
 #[derive(BorshDeserialize)]
@@ -30,6 +55,90 @@ pub struct StoredTrace {
     pub accepted_hash: Option<String>,
     pub opening: Option<StoredOpening>,
     pub trace: crate::trace::ResponseTrace,
+    pub attn: Option<StoredAttn>,
+}
+
+#[derive(BorshDeserialize)]
+struct V3StoredTrace {
+    version: u32,
+    response_txid: String,
+    model_id: [u8; 32],
+    tier: u8,
+    request_hash: [u8; 32],
+    max_tokens: u32,
+    submitted_daa: u64,
+    accepted_hash: Option<String>,
+    opening: Option<StoredOpening>,
+    trace: crate::trace::ResponseTrace,
+}
+
+impl From<V3StoredTrace> for StoredTrace {
+    fn from(t: V3StoredTrace) -> Self {
+        Self {
+            version: STORE_VERSION,
+            response_txid: t.response_txid,
+            model_id: t.model_id,
+            tier: t.tier,
+            request_hash: t.request_hash,
+            max_tokens: t.max_tokens,
+            submitted_daa: t.submitted_daa,
+            accepted_hash: t.accepted_hash,
+            opening: t.opening,
+            trace: t.trace,
+            attn: None,
+        }
+    }
+}
+
+#[derive(BorshDeserialize)]
+struct LegacyTrace {
+    record: crate::trace::TraceRecord,
+    tokens: Vec<i32>,
+}
+
+#[derive(BorshDeserialize)]
+struct LegacyStoredTrace {
+    version: u32,
+    response_txid: String,
+    model_id: [u8; 32],
+    tier: u8,
+    request_hash: [u8; 32],
+    max_tokens: u32,
+    submitted_daa: u64,
+    accepted_hash: Option<String>,
+    opening: Option<LegacyStoredOpening>,
+    trace: LegacyTrace,
+}
+
+impl From<LegacyStoredTrace> for StoredTrace {
+    fn from(t: LegacyStoredTrace) -> Self {
+        Self {
+            version: STORE_VERSION,
+            response_txid: t.response_txid,
+            model_id: t.model_id,
+            tier: t.tier,
+            request_hash: t.request_hash,
+            max_tokens: t.max_tokens,
+            submitted_daa: t.submitted_daa,
+            accepted_hash: t.accepted_hash,
+            opening: t.opening.map(|o| StoredOpening { seed_hash: o.seed_hash, deadline_daa: o.deadline_daa, payload: o.payload, extra: Vec::new() }),
+            trace: crate::trace::ResponseTrace { record: t.trace.record, tokens: t.trace.tokens, seq: None },
+            attn: None,
+        }
+    }
+}
+
+fn decode(b: &[u8]) -> Result<StoredTrace, String> {
+    match StoredTrace::try_from_slice(b) {
+        Ok(t) => Ok(t),
+        Err(e) => match V3StoredTrace::try_from_slice(b) {
+            Ok(t) if t.version == V3_VERSION => Ok(t.into()),
+            _ => match LegacyStoredTrace::try_from_slice(b) {
+                Ok(t) if t.version == LEGACY_VERSION => Ok(t.into()),
+                _ => Err(e.to_string()),
+            },
+        },
+    }
 }
 
 /// [`StoredTrace`] by reference, for writing.
@@ -45,6 +154,7 @@ pub struct StoredTraceRef<'a> {
     pub accepted_hash: &'a Option<String>,
     pub opening: &'a Option<StoredOpening>,
     pub trace: &'a crate::trace::ResponseTrace,
+    pub attn: &'a Option<StoredAttn>,
 }
 
 impl<'a> StoredTraceRef<'a> {
@@ -98,7 +208,7 @@ impl TraceStore {
             if path.extension().and_then(|e| e.to_str()) != Some(FILE_EXT) {
                 continue;
             }
-            match fs::read(&path).map_err(|e| e.to_string()).and_then(|b| StoredTrace::try_from_slice(&b).map_err(|e| e.to_string())) {
+            match fs::read(&path).map_err(|e| e.to_string()).and_then(|b| decode(&b)) {
                 Ok(t) if t.version == STORE_VERSION => out.push(t),
                 Ok(t) => {
                     log::warn!("Trace: stored record {} has version {} — dropped", path.display(), t.version);
@@ -124,7 +234,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let store = TraceStore { dir: dir.clone() };
         let trace = crate::trace::ResponseTrace::test_sample();
-        let opening = Some(StoredOpening { seed_hash: "ab".into(), deadline_daa: 42, payload: "00ff".into() });
+        let opening = Some(StoredOpening { seed_hash: "ab".into(), deadline_daa: 42, payload: "00ff".into(), extra: vec!["11".into()] });
+        let attn = Some(StoredAttn { bodies: vec![vec![5, 0, 1], vec![5, 2]], payload: "beef".into(), deadline_daa: 3_400, accepted_hash: Some("f00d".into()) });
         let rec = StoredTraceRef {
             version: StoredTraceRef::version(),
             response_txid: "deadbeef",
@@ -136,6 +247,7 @@ mod tests {
             accepted_hash: &Some("cafe".into()),
             opening: &opening,
             trace: &trace,
+            attn: &attn,
         };
         store.save(&rec).unwrap();
         let loaded = store.load_all();
@@ -147,8 +259,99 @@ mod tests {
         assert_eq!(t.opening.as_ref().unwrap().deadline_daa, 42);
         assert_eq!(t.trace.tokens, trace.tokens);
         assert_eq!(t.trace.record.trace_root, trace.record.trace_root);
+        assert_eq!(t.attn, attn);
         store.remove("deadbeef");
         assert!(store.load_all().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn records_keep_their_sequence_leaves_and_legacy_records_still_load() {
+        #[derive(BorshSerialize)]
+        struct LegacyRef<'a> {
+            version: u32,
+            response_txid: &'a str,
+            model_id: [u8; 32],
+            tier: u8,
+            request_hash: [u8; 32],
+            max_tokens: u32,
+            submitted_daa: u64,
+            accepted_hash: Option<String>,
+            opening: Option<(String, u64, String)>,
+            record: &'a crate::trace::TraceRecord,
+            tokens: &'a Vec<i32>,
+        }
+        let dir = std::env::temp_dir().join(format!("keryx-trace-store-seq-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = TraceStore { dir: dir.clone() };
+        let mut trace = crate::trace::ResponseTrace::test_sample();
+        trace.seq = crate::trace::SeqTrace::new(vec![[3u8; 32], [4u8; 32], [5u8; 32]]);
+        let rec = StoredTraceRef {
+            version: StoredTraceRef::version(),
+            response_txid: "aa",
+            model_id: &[1u8; 32],
+            tier: 0,
+            request_hash: &[2u8; 32],
+            max_tokens: 16,
+            submitted_daa: 1,
+            accepted_hash: &None,
+            opening: &None,
+            trace: &trace,
+            attn: &None,
+        };
+        store.save(&rec).unwrap();
+        #[derive(BorshSerialize)]
+        struct V3Ref<'a> {
+            version: u32,
+            response_txid: &'a str,
+            model_id: [u8; 32],
+            tier: u8,
+            request_hash: [u8; 32],
+            max_tokens: u32,
+            submitted_daa: u64,
+            accepted_hash: Option<String>,
+            opening: Option<StoredOpening>,
+            trace: &'a crate::trace::ResponseTrace,
+        }
+        let v3 = V3Ref {
+            version: V3_VERSION,
+            response_txid: "cc",
+            model_id: [1u8; 32],
+            tier: 2,
+            request_hash: [2u8; 32],
+            max_tokens: 16,
+            submitted_daa: 1,
+            accepted_hash: Some("ee".into()),
+            opening: None,
+            trace: &trace,
+        };
+        fs::write(store.path("cc"), borsh::to_vec(&v3).unwrap()).unwrap();
+        let legacy = LegacyRef {
+            version: LEGACY_VERSION,
+            response_txid: "bb",
+            model_id: [1u8; 32],
+            tier: 1,
+            request_hash: [2u8; 32],
+            max_tokens: 16,
+            submitted_daa: 1,
+            accepted_hash: None,
+            opening: Some(("cd".into(), 9, "beef".into())),
+            record: &trace.record,
+            tokens: &trace.tokens,
+        };
+        fs::write(store.path("bb"), borsh::to_vec(&legacy).unwrap()).unwrap();
+        let mut loaded = store.load_all();
+        loaded.sort_by(|a, b| a.response_txid.cmp(&b.response_txid));
+        assert_eq!(loaded.len(), 3);
+        assert_eq!((loaded[2].version, loaded[2].tier, loaded[2].attn.is_none()), (STORE_VERSION, 2, true));
+        assert_eq!(loaded[2].trace.seq.as_ref().map(|s| s.root), trace.seq.as_ref().map(|s| s.root));
+        let seq = loaded[0].trace.seq.as_ref().unwrap();
+        assert_eq!((seq.leaves.len(), seq.root), (3, trace.seq.as_ref().unwrap().root));
+        assert_ne!(loaded[0].trace.commitment().trace_root, loaded[0].trace.record.trace_root);
+        assert!(loaded[1].trace.seq.is_none() && loaded[1].version == STORE_VERSION);
+        let o = loaded[1].opening.as_ref().unwrap();
+        assert_eq!((o.payload.as_str(), o.deadline_daa, o.extra.len()), ("beef", 9, 0));
+        assert_eq!(loaded[1].trace.commitment().trace_root, trace.record.trace_root);
         let _ = fs::remove_dir_all(&dir);
     }
 }

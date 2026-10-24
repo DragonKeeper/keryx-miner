@@ -153,14 +153,31 @@ const CHAIN_MANIFESTS: [&[u8]; 5] = [
     include_bytes!("../assets/trace-manifests/chain-tier4.bin"),
 ];
 
+/// Serialized manifests under the attention rule (attention and recurrent descriptors), in tier
+/// order. MUST equal the node's `TRACE_ATTN_H_NEXT` manifests.
+const ATTN_MANIFESTS: [&[u8]; 5] = [
+    include_bytes!("../assets/trace-manifests/attn-tier0.bin"),
+    include_bytes!("../assets/trace-manifests/attn-tier1.bin"),
+    include_bytes!("../assets/trace-manifests/attn-tier2.bin"),
+    include_bytes!("../assets/trace-manifests/attn-tier3.bin"),
+    include_bytes!("../assets/trace-manifests/attn-tier4.bin"),
+];
+
+/// Attention layers, recurrent layers and sequence heads of each manifest under the attention
+/// rule. MUST equal the node's `TRACE_ATTN_H_NEXT`.
+const ATTN_SEQ: [(u32, u32, u32); 5] = [(8, 24, 32), (40, 0, 2), (48, 0, 8), (16, 48, 48), (7, 20, 32)];
+
+/// Positions between recurrent state checkpoints when a manifest has no recurrent layer.
+const DEFAULT_INTERVAL: u32 = 48;
+
 /// Stage-2 chain context of each tier, with the prefix embedding and norm entries of its
 /// manifest. MUST equal the node's `TRACE_CHAINS_H15`.
 const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; 5] = [
-    Some((ChainCtx { n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0 }, 249, 250)),
-    Some((ChainCtx { n_layers: 40, layer_base: 523, embd_entry: 361, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 0 }, 361, 362)),
-    Some((ChainCtx { n_layers: 48, layer_base: 523, embd_entry: 329, eps: 9.999999974752427e-07, embd_scale: 61.967735290527344, trim_last: false, n_used: 0 }, 329, 330)),
-    Some((ChainCtx { n_layers: 64, layer_base: 627, embd_entry: 497, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0 }, 497, 498)),
-    Some((ChainCtx { n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8 }, 395, 396)),
+    Some((ChainCtx { n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 249, 250)),
+    Some((ChainCtx { n_layers: 40, layer_base: 523, embd_entry: 361, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 361, 362)),
+    Some((ChainCtx { n_layers: 48, layer_base: 523, embd_entry: 329, eps: 9.999999974752427e-07, embd_scale: 61.967735290527344, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 329, 330)),
+    Some((ChainCtx { n_layers: 64, layer_base: 627, embd_entry: 497, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 497, 498)),
+    Some((ChainCtx { n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 395, 396)),
 ];
 
 /// Entries of the stage-2 manifest of `tier` and its product count.
@@ -197,6 +214,12 @@ pub fn prefix_active(accepted_daa: u64) -> bool {
 /// Whether a response generated at `daa` commits the stage-2 trace.
 pub fn chain_active(daa: u64) -> bool {
     daa >= crate::pom::trace_chain_activation_daa()
+}
+
+/// Whether a response generated at `daa` commits sequence leaves and is opened under the
+/// attention rule.
+pub fn attention_active(daa: u64) -> bool {
+    daa >= crate::pom::attention_activation_daa()
 }
 
 /// Whether every traced response accepted at `accepted_daa` is audited.
@@ -239,6 +262,44 @@ impl TierManifest {
 
     pub fn raw_chain(tier: u8) -> Option<&'static [u8]> {
         CHAIN_MANIFESTS.get(tier as usize).copied()
+    }
+
+    /// The manifest of `tier` under the attention rule, with its chain context.
+    pub fn for_attn(tier: u8) -> Option<Self> {
+        let (mut ctx, _) = chain_ctx(tier)?;
+        (ctx.n_attn, ctx.n_recur, ctx.seq_heads) = *ATTN_SEQ.get(tier as usize)?;
+        let m = Self::parse(Self::raw_attn(tier)?)?;
+        Some(Self { chain: Some(ctx), ..m })
+    }
+
+    pub fn raw_attn(tier: u8) -> Option<&'static [u8]> {
+        ATTN_MANIFESTS.get(tier as usize).copied()
+    }
+
+    /// Sequence layout for the engine: one `(layer, kind, slot, heads, head_dim)` row per
+    /// attention or recurrent layer.
+    pub fn seq_layers(&self) -> Vec<crate::llama_engine::SeqLayer> {
+        let mut out = Vec::new();
+        for (e, _) in &self.entries {
+            let Chain::Layer(ll) = e.chain else { continue };
+            if let Some(a) = ll.attn {
+                out.push([ll.layer, if a.mla_rank > 0 { 2 } else { 1 }, a.slot, a.n_head_kv, a.head_dim]);
+            } else if let Some(r) = ll.recur {
+                out.push([ll.layer, if r.kind == manifest::RECUR_KDA { 4 } else { 3 }, r.slot, r.n_v_heads, r.head_dim]);
+            }
+        }
+        out
+    }
+
+    /// Positions between the recurrent state checkpoints of this manifest.
+    pub fn seq_interval(&self) -> u32 {
+        self.entries
+            .iter()
+            .find_map(|(e, _)| match e.chain {
+                Chain::Layer(ll) => ll.recur.map(|r| r.interval),
+                _ => None,
+            })
+            .unwrap_or(DEFAULT_INTERVAL)
     }
 
     /// The embedded manifest of `tier`, `None` when the tier is not audited.
@@ -338,7 +399,7 @@ impl TraceRecord {
             }
             pos[nl - 1] = meta_leaf(t as u32, ubatch[t]);
         }
-        if leaves.iter().any(|h| *h == [0u8; 32]) {
+        if leaves.contains(&[0u8; 32]) {
             return None;
         }
         let pos_roots: Vec<Hash> = (0..n_pos).map(|t| b3_root(&leaves[t * nl..(t + 1) * nl])).collect();
@@ -383,7 +444,7 @@ impl TraceRecord {
             }
             pos[nl - 1] = *blake3::hash(&chain::meta(t as u32, ubatch[t], tokens[t] as u32)).as_bytes();
         }
-        if leaves.iter().any(|h| *h == [0u8; 32]) {
+        if leaves.contains(&[0u8; 32]) {
             return None;
         }
         let pos_roots: Vec<Hash> = (0..n_pos).map(|t| b3_root(&leaves[t * nl..(t + 1) * nl])).collect();
@@ -397,7 +458,12 @@ impl TraceRecord {
         TraceCommitment { trace_root: self.trace_root, n_prompt: self.n_prompt, n_pos: self.n_pos, stage: self.stage, tokens_root: self.tokens_root }
     }
 
-    fn response_ctx(&self) -> ResponseCtx {
+    /// Path of position `t` in the position tree.
+    pub fn pos_path(&self, t: u64) -> Vec<Hash> {
+        b3_path(&self.pos_roots, t as usize)
+    }
+
+    pub(crate) fn response_ctx(&self) -> ResponseCtx {
         ResponseCtx { trace_root: self.trace_root, n_prompt: self.n_prompt, n_pos: self.n_pos }
     }
 
@@ -426,15 +492,59 @@ pub fn audited(seed: &Hash) -> bool {
     draw::audited(seed)
 }
 
+/// Window to open the next attention phase once its child is drawn; matches the node.
+pub const ATTN_PHASE_WINDOW_DAA: u64 = 3_000;
+const ATTN_CHILD_DOMAIN: &[u8] = b"KeryxAttnChildV1";
+
+/// Seed of the child drawn after attention phase `phase` of a response, as the node draws it.
+pub fn attn_child_seed(seed_block_hash: &[u8; 32], response_txid: &[u8; 32], phase: u8) -> Hash {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(ATTN_CHILD_DOMAIN);
+    hasher.update(seed_block_hash);
+    hasher.update(response_txid);
+    hasher.update(&[phase]);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(hasher.finalize().as_bytes());
+    seed
+}
+
+/// Sequence leaves of a response: their hashes and the root of their tree.
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
+pub struct SeqTrace {
+    pub leaves: Vec<Hash>,
+    pub root: Hash,
+}
+
+impl SeqTrace {
+    pub fn new(leaves: Vec<Hash>) -> Option<Self> {
+        if leaves.is_empty() {
+            return None;
+        }
+        let root = b3_root(&leaves);
+        Some(Self { leaves, root })
+    }
+}
+
 /// What the miner keeps of a traced response to open it later.
 #[derive(BorshSerialize, BorshDeserialize)]
 pub struct ResponseTrace {
     pub record: TraceRecord,
     /// Prompt then generated tokens, as fed to the engine.
     pub tokens: Vec<i32>,
+    /// Sequence leaves, under the attention rule.
+    pub seq: Option<SeqTrace>,
 }
 
 impl ResponseTrace {
+    /// The commitment a response carries: the position root alone, or with the sequence root.
+    pub fn commitment(&self) -> TraceCommitment {
+        let mut c = self.record.commitment();
+        if let Some(s) = &self.seq {
+            c.trace_root = keryx_verifiable_inference::seq::trace_root(&self.record.trace_root, &s.root);
+        }
+        c
+    }
+
     /// A small synthetic trace for store tests.
     #[cfg(test)]
     pub fn test_sample() -> Self {
@@ -449,7 +559,7 @@ impl ResponseTrace {
             pos_roots: (0..3u8).map(|i| [0x10 + i; 32]).collect(),
             trace_root: [0xaa; 32],
         };
-        Self { record, tokens: vec![5, 6, 7] }
+        Self { record, tokens: vec![5, 6, 7], seq: None }
     }
 }
 
@@ -667,7 +777,7 @@ pub fn build_prefix_point(m: &TierManifest, rec: &TraceRecord, ctx: &PrefixCtx, 
 
 /// Encoded opening body, `None` above the consensus size cap.
 pub fn opening_body(response_txid: [u8; 32], points: Vec<Point>, prefix: Option<PrefixPoint>) -> Option<Vec<u8>> {
-    let body = Opening { response_txid, points, prefix, links: Vec::new(), experts: Vec::new(), resid: None }.encode();
+    let body = Opening { response_txid, points, prefix, links: Vec::new(), experts: Vec::new(), resid: None, roots: None }.encode();
     (body.len() <= opening::MAX_BODY_LEN).then_some(body)
 }
 
@@ -737,7 +847,7 @@ pub fn draw_chain(m: &TierManifest, pctx: &PrefixCtx, rec: &TraceRecord, seed: &
     }
     let d = draw::point(seed, chain::RESID_POINT);
     let sel = d[1] % (2 * n_layers);
-    let (layer, kind) = (sel / 2, if sel % 2 == 0 { Resid::Attn } else { Resid::Out });
+    let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
     let t = chain::resid_position(&ctx, &rec.response_ctx(), layer, d[0]).ok()?;
     let ll = match m.entry(ctx.layer_base as u64 + layer).chain {
         Chain::Layer(ll) if ll.layer as u64 == layer => ll,
@@ -775,7 +885,6 @@ impl ChainDraw {
         add(r.t, 2 * r.rank as u32 + 1);
         if let Some(moe) = &r.moe {
             add(r.t, 2 * moe.down_exps + 1);
-            add(r.t, 2 * moe.gate_exps);
             add(r.t, chain::router_leaf(np, self.n_layers, r.layer) as u32);
         }
         out
@@ -793,13 +902,13 @@ pub fn leaf_cap(m: &TierManifest, leaf: u32) -> usize {
             (_, 1) => 1,
             _ => m.chain.map_or(1, |c| c.n_used as u64).max(1),
         };
-        let bytes = if leaf % 2 == 0 { e.k.div_ceil(512) * 512 / 32 * 36 } else { 4 * e.m + 4 };
+        let bytes = if leaf.is_multiple_of(2) { e.k.div_ceil(512) * 512 / 32 * 36 } else { 4 * e.m + 4 };
         return (bytes * n) as usize;
     }
     m.entries.iter().take(np).map(|(e, _)| 4 * e.m.max(e.k) as usize).max().unwrap_or(0)
 }
 
-fn bytes_range(m: &TierManifest, index: &WeightIndex, entry: u64, offset: u64, len: u64) -> Option<(EntryOpening, ChunkRange)> {
+pub(crate) fn bytes_range(m: &TierManifest, index: &WeightIndex, entry: u64, offset: u64, len: u64) -> Option<(EntryOpening, ChunkRange)> {
     let e = m.entry(entry);
     if len == 0 {
         return None;
@@ -820,11 +929,11 @@ fn norm_fragment(m: &TierManifest, index: &WeightIndex, entry: u64, seed: &Hash,
     bytes_range(m, index, entry, 4 * b0 * 32, 4 * (n * 32).min(k - b0 * 32))
 }
 
-fn leaf_bytes(rec: &TraceRecord, t: u64, leaf: u32, bytes: &[u8]) -> LeafBytes {
+pub(crate) fn leaf_bytes(rec: &TraceRecord, t: u64, leaf: u32, bytes: &[u8]) -> LeafBytes {
     LeafBytes { bytes: bytes.to_vec(), leaf_path: b3_path(rec.leaves_at(t), leaf as usize) }
 }
 
-fn leaf_chunk(rec: &TraceRecord, t: u64, leaf: u32, b: &[u8], c: u64) -> Option<LeafChunk> {
+pub(crate) fn leaf_chunk(rec: &TraceRecord, t: u64, leaf: u32, b: &[u8], c: u64) -> Option<LeafChunk> {
     let (chunk, chunk_path) = chunk_with_path(b, c as usize)?;
     Some(LeafChunk { total_len: b.len() as u32, index: c as u32, chunk, chunk_path, leaf_path: b3_path(rec.leaves_at(t), leaf as usize) })
 }
@@ -948,7 +1057,7 @@ pub fn chain_opening_body(
         let slots = (0..n_used).map(|sl| leaf_chunk(rec, r.t, down_leaf, down_y, sl * per_slot + r.c)).collect::<Option<Vec<_>>>()?;
         let router_leaf = chain::router_leaf(np, ctx.n_layers as u64, r.layer) as u32;
         let row = draw::point(seed, chain::RESID_POINT)[3] % n_exp;
-        let gate_leaf = 2 * moe.gate_exps;
+        let attn_leaf = chain::resid_leaf(np, r.layer, Resid::Attn) as u32;
         ResidAdd::Moe(Box::new(MoeAdd {
             scores: leaf_bytes(rec, r.t, router_leaf, cap(r.t, router_leaf)?),
             bias: bytes_range(m, index, moe.probs_bias as u64, 0, 4 * n_exp)?,
@@ -956,8 +1065,8 @@ pub fn chain_opening_body(
             slots,
             shexp: leaf_chunk(rec, r.t, y_leaf, y, r.c)?,
             router_row: bytes_range(m, index, moe.router as u64, row * 4 * dim, 4 * dim)?,
-            gate: m.entry_opening(moe.gate_exps as u64),
-            gate_x: leaf_bytes(rec, r.t, gate_leaf, cap(r.t, gate_leaf)?),
+            resid: leaf_bytes(rec, r.t, attn_leaf, cap(r.t, attn_leaf)?),
+            norm: bytes_range(m, index, moe.ffn_norm as u64, 0, 4 * dim)?,
         }))
     } else if post == manifest::NONE {
         ResidAdd::Chunk(leaf_chunk(rec, r.t, y_leaf, y, r.c)?)
@@ -980,7 +1089,7 @@ pub fn chain_opening_body(
     };
     let n = points.len();
     debug_assert_eq!(experts.len(), n);
-    let body = Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: Some(resid) }.encode();
+    let body = Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: Some(resid), roots: None }.encode();
     (body.len() <= opening::MAX_BODY_LEN).then_some(body)
 }
 
@@ -1012,6 +1121,35 @@ pub fn opening_signature_message(body: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_child_seed_matches_the_node() {
+        let seed = attn_child_seed(&[1u8; 32], &[2u8; 32], 1);
+        assert_eq!(hex::encode(seed), "347b8cd184f5fdf5d3ef1828b99bb28d859b019df6b09ece1ec8167ea62e534b");
+    }
+
+    #[test]
+    fn attention_manifests_match_the_node() {
+        let roots = [
+            "1310239c0304560afbc6ac95fc542ea6ef4b257725af7c11885689bd61bf19c2",
+            "3bbe87ed68f0eb59e2b21be9996ff328d56447dfbe5b8b2e98cca6872427cb66",
+            "0bf8505d055517e996744319017647752ab1a5bfc6a393b36d667414d48fbe69",
+            "3bcdcaefa65ed44d90457f19571f8e29314c15429da4440db26efd8fcaf0d72f",
+            "25cde7355cfd5edea8259928aab14849739c931ba442a5e6d4e4710a05980644",
+        ];
+        for (tier, root) in roots.iter().enumerate() {
+            let m = TierManifest::for_attn(tier as u8).unwrap();
+            let hex: String = m.m_t.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(&hex, root, "tier {tier}");
+            let c = m.chain.unwrap();
+            let layers = m.seq_layers();
+            assert_eq!(layers.len() as u32, c.n_attn + c.n_recur, "tier {tier}");
+            assert!(layers.iter().all(|l| l[3] > 0 && l[3] <= c.seq_heads && l[4] % 32 == 0));
+            let attn = layers.iter().filter(|l| l[1] <= 2).count() as u32;
+            assert_eq!(attn, c.n_attn);
+            assert_eq!(m.seq_interval(), 48);
+        }
+    }
     use keryx_verifiable_inference::merkle::{rt_range_proof, rt_verify_range};
     use keryx_verifiable_inference::verify::{verify_point, ResponseCtx, TierCtx};
 
@@ -1213,10 +1351,10 @@ mod tests {
                     experts += p.experts as u32;
                     heads += (m.entry(p.rank).role == manifest::ROLE_HEADS) as u32;
                 }
-                if let Some(mo) = &r.moe {
+                if r.moe.is_some() {
                     assert_eq!(r.kind, Resid::Out);
                     assert!(caps.contains(&(r.t as u32, chain::router_leaf(np, ctx.n_layers as u64, r.layer) as u32)));
-                    assert!(caps.contains(&(r.t as u32, 2 * mo.gate_exps)));
+                    assert!(caps.contains(&(r.t as u32, chain::resid_leaf(np, r.layer, Resid::Attn) as u32)));
                     moe += 1;
                 }
             }
