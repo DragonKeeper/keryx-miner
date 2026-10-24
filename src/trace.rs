@@ -1140,12 +1140,29 @@ mod tests {
     }
 
     #[test]
+    fn every_drawable_site_of_the_attention_manifests_is_supported() {
+        use keryx_verifiable_inference::support::check_manifest;
+        let entries = |m: &TierManifest| m.entries.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>();
+        for tier in 0..5u8 {
+            let m = TierManifest::for_attn(tier).unwrap();
+            check_manifest(&entries(&m), &m.chain.unwrap(), 131_072).unwrap_or_else(|e| panic!("tier {tier}: {e}"));
+        }
+        let m = TierManifest::for_attn(2).unwrap();
+        let mut bad = entries(&m);
+        let i = bad.iter().position(|e| matches!(e.chain, Chain::Layer(ll) if ll.attn.is_some())).unwrap();
+        if let Chain::Layer(ll) = &mut bad[i].chain {
+            ll.attn.as_mut().unwrap().softcap = 1;
+        }
+        assert!(check_manifest(&bad, &m.chain.unwrap(), 131_072).is_err());
+    }
+
+    #[test]
     fn attention_manifests_match_the_node() {
         let roots = [
-            "1310239c0304560afbc6ac95fc542ea6ef4b257725af7c11885689bd61bf19c2",
+            "2f39af56c0e32524a44915e1ca6ae8db4dd2fc127dbf1c99ba9a2b8cac8602ee",
             "3bbe87ed68f0eb59e2b21be9996ff328d56447dfbe5b8b2e98cca6872427cb66",
             "0bf8505d055517e996744319017647752ab1a5bfc6a393b36d667414d48fbe69",
-            "3bcdcaefa65ed44d90457f19571f8e29314c15429da4440db26efd8fcaf0d72f",
+            "9179f634df5dcc732b7132ea54b09c98fa00c6483202a76a50f064a1d409381d",
             "95dd7a2f9266ed5961130e33ab75d92a035774dad5f74277b83b45a5fac72ad3",
         ];
         for (tier, root) in roots.iter().enumerate() {
@@ -1158,7 +1175,7 @@ mod tests {
             assert!(layers.iter().all(|l| l[3] > 0 && l[3] <= c.seq_heads && l[4] % 32 == 0));
             let attn = layers.iter().filter(|l| l[1] <= 2).count() as u32;
             assert_eq!(attn, c.n_attn);
-            assert_eq!(m.seq_interval(), if tier == 4 { 32 } else { 48 });
+            assert_eq!(m.seq_interval(), if c.n_recur > 0 { 32 } else { DEFAULT_INTERVAL });
         }
     }
     use keryx_verifiable_inference::merkle::{rt_range_proof, rt_verify_range};
