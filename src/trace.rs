@@ -828,7 +828,7 @@ fn link_leaf(m: &TierManifest, ctx: &ChainCtx, g_rank: u64) -> Option<Option<u32
         manifest::LINK_ATTN_IN => Some(chain::resid_leaf(np, layer - 1, Resid::Out) as u32),
         manifest::LINK_FFN_IN => Some(chain::resid_leaf(np, layer, Resid::Attn) as u32),
         manifest::LINK_HEAD => Some(chain::resid_leaf(np, ctx.n_layers.checked_sub(1)? as u64, Resid::Out) as u32),
-        manifest::LINK_GLU | manifest::LINK_DIRECT => Some(2 * pl.src + 1),
+        manifest::LINK_GLU | manifest::LINK_DIRECT | manifest::LINK_HEAD_SLICE => Some(2 * pl.src + 1),
         _ => return None,
     })
 }
@@ -1000,6 +1000,17 @@ pub fn chain_opening_body(
                 let c = p.slot * per_slot + draw::point(seed, i)[3] % per_slot;
                 LinkOpening::Source { src: m.entry_opening(pl.src as u64), y: leaf_chunk(rec, p.t, *l, y, c)?, ids: Some(expert_ids(y, p.n_used)?) }
             }
+            (manifest::LINK_HEAD_SLICE, Some(l)) => {
+                let y = cap(p.t, *l)?;
+                let (g, src) = (m.entry(p.g_rank), m.entry(pl.src as u64));
+                let n_head = g.n_exp as u64;
+                if n_head < 2 || src.m % n_head != 0 || g.k < 32 {
+                    return None;
+                }
+                let per_chunk = (B3_CHUNK / 4) as u64;
+                let c = (p.slot * (src.m / n_head) + draw::point(seed, i)[3] % (g.k / 32) * 32) / per_chunk;
+                LinkOpening::Source { src: m.entry_opening(pl.src as u64), y: leaf_chunk(rec, p.t, *l, y, c)?, ids: None }
+            }
             (manifest::LINK_GLU | manifest::LINK_DIRECT, Some(l)) => {
                 let y = cap(p.t, *l)?;
                 let c = draw::point(seed, i)[3] % y.len().div_ceil(B3_CHUNK).max(1) as u64;
@@ -1135,7 +1146,7 @@ mod tests {
             "3bbe87ed68f0eb59e2b21be9996ff328d56447dfbe5b8b2e98cca6872427cb66",
             "0bf8505d055517e996744319017647752ab1a5bfc6a393b36d667414d48fbe69",
             "3bcdcaefa65ed44d90457f19571f8e29314c15429da4440db26efd8fcaf0d72f",
-            "25cde7355cfd5edea8259928aab14849739c931ba442a5e6d4e4710a05980644",
+            "95dd7a2f9266ed5961130e33ab75d92a035774dad5f74277b83b45a5fac72ad3",
         ];
         for (tier, root) in roots.iter().enumerate() {
             let m = TierManifest::for_attn(tier as u8).unwrap();
@@ -1147,7 +1158,7 @@ mod tests {
             assert!(layers.iter().all(|l| l[3] > 0 && l[3] <= c.seq_heads && l[4] % 32 == 0));
             let attn = layers.iter().filter(|l| l[1] <= 2).count() as u32;
             assert_eq!(attn, c.n_attn);
-            assert_eq!(m.seq_interval(), 48);
+            assert_eq!(m.seq_interval(), if tier == 4 { 32 } else { 48 });
         }
     }
     use keryx_verifiable_inference::merkle::{rt_range_proof, rt_verify_range};
