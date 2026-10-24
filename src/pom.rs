@@ -1644,7 +1644,7 @@ pub fn block_task_activation_daa() -> u64 {
 /// Node `attention_activation`: traces commit sequence leaves and audits open attention and
 /// recurrent points from this DAA.
 pub fn attention_activation_daa() -> u64 {
-    u64::MAX
+    gate(u64::MAX, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// H10 gate: walk-seed switch at/after this score. MUST equal the node's `h10_activation`.
