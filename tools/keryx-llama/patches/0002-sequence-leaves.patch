@@ -850,7 +850,7 @@ index 0000000..8f90ac3
 +    }
 +    s.caps.clear();
 +    for (uint32_t k = 0; k < n; ++k) {
-+        if (stream[k] >= s.n_leaves || hi[k] <= lo[k] || hi[k] - lo[k] > (1u << 24)) {
++        if (stream[k] >= s.n_leaves || hi[k] <= lo[k] || hi[k] - lo[k] > (1u << 27)) {
 +            s.caps.clear();
 +            return -2;
 +        }
