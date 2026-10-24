@@ -487,6 +487,7 @@ pub fn recur_opening(
         seq_root: seq.root,
         layer: m.entry_opening(base + d.layer),
         out_entry: m.entry_opening(d.proj as u64),
+        decay_entry: m.entry_opening(r.decay as u64),
         weights,
         records,
         start_rows,
