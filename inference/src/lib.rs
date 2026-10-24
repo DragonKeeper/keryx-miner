@@ -1,10 +1,10 @@
-/// Keryx OPoI (Optimistic Proof of Inference) — Phase 2 + Phase 3
-///
-/// Phase 2: fixed-point i32/i64 MLP — bit-exact on all hardware.
-///   Tags are verified on-chain; collateral is slashed for fraud.
-///   (The Phase-1 f32 MLP was reference-only, never consensus post-Phase 2 — removed.)
-/// Phase 3 A: AiResponse/AiChallenge as on-chain txs, RocksDB slash state.
-/// Phase 3 B: ZK fraud proof API (Groth16 stub — circuit VK lands in Phase 3 C).
+//! Keryx OPoI (Optimistic Proof of Inference) — Phase 2 + Phase 3
+//!
+//! Phase 2: fixed-point i32/i64 MLP — bit-exact on all hardware.
+//!   Tags are verified on-chain; collateral is slashed for fraud.
+//!   (The Phase-1 f32 MLP was reference-only, never consensus post-Phase 2 — removed.)
+//! Phase 3 A: AiResponse/AiChallenge as on-chain txs, RocksDB slash state.
+//! Phase 3 B: ZK fraud proof API (Groth16 stub — circuit VK lands in Phase 3 C).
 
 pub mod ai_payload;
 pub mod fraud_proof;

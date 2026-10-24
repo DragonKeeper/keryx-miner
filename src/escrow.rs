@@ -170,12 +170,12 @@ fn select_claim_batch(entries: &[EscrowEntry], daa_score: u64, in_flight_outpoin
             let eligible = !e.claimed
                 && !e.slashed
                 && daa_score >= e.confirm_daa + e.csv_window + 10
-                && e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa)
+                && e.orphan_retry_after_daa.is_none_or(|retry_daa| daa_score >= retry_daa)
                 && !in_flight_outpoints.contains(&format!("{}:{}", e.coinbase_txid, e.output_index));
             if !eligible {
                 continue;
             }
-            if batch_window.map_or(false, |w| w != e.csv_window) {
+            if batch_window.is_some_and(|w| w != e.csv_window) {
                 continue;
             }
             let cap = if e.batch_cap == 0 { MAX_CLAIM_BATCH } else { (e.batch_cap as usize).min(MAX_CLAIM_BATCH) };
@@ -592,7 +592,7 @@ impl EscrowWatcher {
         // whose claim can only be rejected as an orphan. Chain blocks arrive in full via
         // the VirtualChainChanged → GetBlock path; BlockAdded blocks carry
         // is_chain_block=false at notification time and are skipped here.
-        let is_chain_block = block.verbose_data.as_ref().map_or(false, |v| v.is_chain_block);
+        let is_chain_block = block.verbose_data.as_ref().is_some_and(|v| v.is_chain_block);
         if is_chain_block {
             self.track_block_escrows(block, daa_score, &block_hash);
         }
@@ -856,7 +856,7 @@ impl EscrowWatcher {
             // grinding path slashes it permanently at MAX_ORPHAN_RETRIES meanwhile.
             if e.orphan_slashed {
                 let holdoff = CAP_EXPIRY_DAA.saturating_mul(1u64 << e.orphan_retries.min(10) as u32);
-                if e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa.saturating_add(holdoff)) {
+                if e.orphan_retry_after_daa.is_none_or(|retry_daa| daa_score >= retry_daa.saturating_add(holdoff)) {
                     e.orphan_slashed = false;
                     healed = true;
                 }
@@ -1300,7 +1300,7 @@ thread_local! {
 fn inject_atomic_replace_failure(stage: u8) -> io::Result<()> {
     ATOMIC_REPLACE_FAILURE_STAGE.with(|configured| {
         if configured.get() == stage {
-            Err(io::Error::new(io::ErrorKind::Other, format!("injected atomic replacement failure at stage {stage}")))
+            Err(io::Error::other(format!("injected atomic replacement failure at stage {stage}")))
         } else {
             Ok(())
         }

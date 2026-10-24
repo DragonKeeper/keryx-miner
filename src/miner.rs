@@ -101,7 +101,7 @@ fn register_freeze_handler() {
     // follows the handler's own `extern "C-unwind"` definition.
     unsafe {
         let handler: nix::libc::sighandler_t =
-            std::mem::transmute(signal_panic as extern "C-unwind" fn(nix::libc::c_int));
+            signal_panic as extern "C-unwind" fn(nix::libc::c_int) as usize;
         let _ = nix::libc::signal(nix::libc::SIGUSR1, handler);
     }
 }
@@ -130,7 +130,7 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
     })
 }
 
-#[cfg(any(target_os = "windows"))]
+#[cfg(target_os = "windows")]
 fn register_freeze_handler() {}
 
 #[cfg(target_os = "windows")]
@@ -185,8 +185,7 @@ impl Drop for MinerManager {
             Ok(_) => {}
             Err(_) => warn!("All workers are already dead"),
         }
-        while !self.handles.is_empty() {
-            let handle = self.handles.pop().expect("There should be at least one");
+        while let Some(handle) = self.handles.pop() {
             let kill_switch = Arc::new(AtomicBool::new(true));
             trigger_freeze_handler(kill_switch.clone(), &handle);
             match handle.join() {
@@ -404,7 +403,8 @@ impl MinerManager {
                     .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0);
                 let pom_proof_overlap = std::env::var("KERYX_POM_PROOF_OVERLAP").ok().as_deref() != Some("0");
                 let inflight_proofs = Arc::new(AtomicUsize::new(0));
-                let mut task_state: Option<(usize, [u8; 32], Box<pow::State>, Arc<keryx_miner::block_task::DeviceTask>)> = None;
+                type TaskState = (usize, [u8; 32], Box<pow::State>, Arc<keryx_miner::block_task::DeviceTask>);
+                let mut task_state: Option<TaskState> = None;
 
                 loop {
                     nonces[0] = 0;
@@ -416,7 +416,7 @@ impl MinerManager {
                                 None => None,
                             },
                             Err(e) => {
-                                info!("{}: GPU thread crashed: {}", gpu_work.id(), e.to_string());
+                                info!("{}: GPU thread crashed: {}", gpu_work.id(), e);
                                 return Ok(());
                             }
                         };
@@ -585,7 +585,7 @@ impl MinerManager {
                                             block_seed.set_device_id(&device_id);
                                             match tx.blocking_send(block_seed.clone()) {
                                                 Ok(()) => block_seed.report_block(&worker_id),
-                                                Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
+                                                Err(e) => error!("Failed submitting PoM block: ({})", e),
                                             };
                                         }
                                     });
@@ -597,7 +597,7 @@ impl MinerManager {
                                 block_seed.set_device_id(&device_id);
                                 match send_channel.blocking_send(block_seed.clone()) {
                                     Ok(()) => block_seed.report_block(&gpu_work.id()),
-                                    Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
+                                    Err(e) => error!("Failed submitting PoM block: ({})", e),
                                 };
                                 if let BlockSeed::FullBlock { .. } = &block_seed {
                                     state = None;
@@ -646,7 +646,7 @@ impl MinerManager {
                             block_seed.set_device_id(&device_id);
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(&gpu_work.id()),
-                                Err(e) => error!("Failed submitting block: ({})", e.to_string()),
+                                Err(e) => error!("Failed submitting block: ({})", e),
                             };
                             if let BlockSeed::FullBlock { .. } = &block_seed {
                                 state = None;
@@ -707,9 +707,8 @@ impl MinerManager {
                 }
                 Ok(())
             })()
-            .map_err(|e: Error| {
-                error!("{}: GPU thread crashed: {}", gpu_work.id(), e.to_string());
-                e
+            .inspect_err(|e: &Error| {
+                error!("{}: GPU thread crashed: {}", gpu_work.id(), e);
             })
         })
     }
@@ -742,7 +741,7 @@ impl MinerManager {
                                 None => None,
                             },
                             Err(e) => {
-                                info!("CPU thread crashed: {}", e.to_string());
+                                info!("CPU thread crashed: {}", e);
                                 return Ok(());
                             }
                         };
@@ -775,7 +774,7 @@ impl MinerManager {
                         block_seed.set_device_id("CPU");
                         match send_channel.blocking_send(block_seed.clone()) {
                             Ok(()) => block_seed.report_block("CPU"),
-                            Err(e) => error!("Failed submitting block: ({})", e.to_string()),
+                            Err(e) => error!("Failed submitting block: ({})", e),
                         };
                         if let BlockSeed::FullBlock { .. } = &block_seed {
                             state = None;
@@ -785,7 +784,7 @@ impl MinerManager {
                     // TODO: Is this really necessary? can we just use Relaxed?
                     hashes_tried.fetch_add(1, Ordering::AcqRel);
 
-                    if nonce.0 % 128 == 0 {
+                    if nonce.0.is_multiple_of(128) {
                         if let Some(new_cmd) = block_channel.get_changed()? {
                             state = match new_cmd {
                                 Some(WorkerCommand::Job(s)) => Some(s),
@@ -799,9 +798,8 @@ impl MinerManager {
                 }
                 Ok(())
             })()
-            .map_err(|e: Error| {
-                error!("CPU thread crashed: {}", e.to_string());
-                e
+            .inspect_err(|e: &Error| {
+                error!("CPU thread crashed: {}", e);
             })
         }).expect("failed to spawn cpu-miner thread")
     }
@@ -848,7 +846,7 @@ impl MinerManager {
             }
 
             // No hashes this tick — keep the per-device counters drained for the next window.
-            for (_device, counter) in &*hashes_by_worker.lock().unwrap() {
+            for counter in (*hashes_by_worker.lock().unwrap()).values() {
                 counter.store(0, Ordering::Release);
             }
             stats.set_hashrates(0, &HashMap::new());
@@ -862,7 +860,7 @@ impl MinerManager {
                 if zero_streak >= STALL_GRACE_TICKS {
                     // Sustained zeros outside an inference pause — this is a real problem.
                     warn!("Workers stalled or crashed. Consider reducing workload and check that your node is synced");
-                    for (device, _) in &*hashes_by_worker.lock().unwrap() {
+                    for device in (*hashes_by_worker.lock().unwrap()).keys() {
                         warn!("Device {}: 0 hash/s", device);
                     }
                 } else {

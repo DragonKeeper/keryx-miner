@@ -519,8 +519,8 @@ pub fn serialize_header<H: Hasher>(hasher: &mut H, header: &RpcBlockHeader, for_
         .update(header.blue_score.to_le_bytes());
 
     // I'm assuming here BlueWork will never pass 256 bits.
-    let blue_work_len = (header.blue_work.len() + 1) / 2;
-    if header.blue_work.len() % 2 == 0 {
+    let blue_work_len = header.blue_work.len().div_ceil(2);
+    if header.blue_work.len().is_multiple_of(2) {
         decode_to_slice(&header.blue_work, &mut hash[..blue_work_len]).unwrap();
     } else {
         let mut blue_work = String::with_capacity(header.blue_work.len() + 1);
@@ -631,7 +631,6 @@ mod tests {
             pom_final_state: 0xdead_beef,
             service_state_hash: "55".repeat(32),
             pom_tier: 3,
-            ..Default::default()
         };
         let digest = |pre: bool| {
             let mut hasher = HeaderHasher::new();
@@ -878,10 +877,7 @@ mod tests {
         ];
         let mut buf = Buf(Vec::with_capacity(1983));
         serialize_header(&mut buf, &header, true);
-        // The vector's DAA sits above the block task gate: a zero task root follows the legacy fields.
-        let (legacy, task_root) = buf.0.split_at(expected_res.len());
-        assert_eq!(&expected_res[..], legacy);
-        assert_eq!(task_root, &[0u8; 32][..]);
+        assert_eq!(&expected_res[..], &buf.0[..]);
 
         let expected_hash = Hash::from_le_bytes([
             85, 146, 211, 217, 138, 239, 47, 85, 152, 59, 58, 16, 4, 149, 129, 179, 172, 226, 174, 233, 160, 96, 202,

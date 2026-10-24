@@ -64,13 +64,12 @@ struct CurrentTask {
     task: AiTask,
 }
 
-/// Shared inference result cache — persists across block changes so that if the
-/// same AiRequest is included in multiple consecutive job templates the miner can
-/// immediately submit with a CID once inference completed for the first occurrence.
-
 /// Max cached inference results — evict when full to prevent unbounded growth.
 const MAX_INFERENCE_CACHE_SIZE: usize = 1_000;
 
+/// Shared inference result cache — persists across block changes so that if the
+/// same AiRequest is included in multiple consecutive job templates the miner can
+/// immediately submit with a CID once inference completed for the first occurrence.
 struct InferenceCacheInner {
     /// stable_id → base58 CIDv0 string returned by IPFS after upload.
     results: HashMap<String, String>,
@@ -189,7 +188,7 @@ impl Client for StratumHandler {
 
         // Declare loaded LLM models so the bridge can challenge with the right model.
         let model_ids: Vec<String> =
-            keryx_miner::llm::loaded_model_ids().into_iter().map(|id| hex::encode(id)).collect();
+            keryx_miner::llm::loaded_model_ids().into_iter().map(hex::encode).collect();
         if !model_ids.is_empty() {
             info!("Inference: declaring {} model(s) to pool bridge", model_ids.len());
             self.send_channel

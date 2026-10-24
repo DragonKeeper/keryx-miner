@@ -65,6 +65,7 @@ impl<'de> Deserialize<'de> for StratumError {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum MiningNotify {
     // job_id, protobuf RpcBlockHeader (hex), timestamp, daa_score, bits, window_seed (hex)
     MiningNotifyV4((String, String, u64, u64, u32, String)),
@@ -79,6 +80,7 @@ pub(crate) enum MiningNotify {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
+#[allow(clippy::enum_variant_names)]
 pub enum MiningSubmit {
     // address, job_id, nonce, opoi_tag, cid, pom_proof (hex), task_root (hex)
     MiningSubmitWithPomTask((String, String, String, String, String, String, String)),

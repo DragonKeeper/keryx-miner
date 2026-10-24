@@ -23,7 +23,9 @@ impl DeviceTask {
 }
 
 static SEEDS: Mutex<BTreeMap<(u64, String), [u8; 32]>> = Mutex::new(BTreeMap::new());
-static TASKS: Mutex<BTreeMap<(u32, [u8; 32]), Arc<DeviceTask>>> = Mutex::new(BTreeMap::new());
+/// Task of a device for a window seed.
+type TaskKey = (u32, [u8; 32]);
+static TASKS: Mutex<BTreeMap<TaskKey, Arc<DeviceTask>>> = Mutex::new(BTreeMap::new());
 static FAILED: Mutex<BTreeMap<u32, [u8; 32]>> = Mutex::new(BTreeMap::new());
 
 /// Max windows whose seeds are kept.
