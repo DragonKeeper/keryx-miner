@@ -491,6 +491,12 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     }
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) {
+        // An MLA cache holds no V rows, but its value length still has to divide a quantized V type.
+        cp.type_v = GGML_TYPE_F16;
+        kv = "q8_0/f16";
+        ctx = llama_init_from_model(model, cp);
+    }
+    if (!ctx) {
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         cp.type_k = GGML_TYPE_F16;
         cp.type_v = GGML_TYPE_F16;
