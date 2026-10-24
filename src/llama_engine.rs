@@ -728,6 +728,7 @@ pub fn trace_configure(gguf: &str, gpu: usize, manifest: &[u8]) -> Result<usize,
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf).ok_or_else(|| "no engine hosts this model".to_string())?;
+    ensure_full_context(e, gpu)?;
     let _native = native();
     let rc = unsafe { (e.trace_configure)(e.model, manifest.as_ptr() as *const c_void, manifest.len(), 0) };
     if rc != 0 {
@@ -863,6 +864,7 @@ pub fn seq_configure(gguf: &str, gpu: usize, layers: &[SeqLayer], n_attn: u32, n
     if e.seq_layout == key && e.seq_leaves == n_leaves {
         return Ok(n_leaves);
     }
+    ensure_full_context(e, gpu)?;
     let _native = native();
     let rc = unsafe { (e.seq_configure)(e.model, layers.as_ptr() as *const u32, layers.len() as u32, n_attn, n_recur, seq_heads, interval) };
     if rc != 0 {
@@ -886,6 +888,7 @@ pub fn seq_replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, spans: 
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0 && e.seq_leaves > 0).ok_or_else(|| "no sequenced engine hosts this model".to_string())?;
+    ensure_full_context(e, gpu)?;
     let _native = native();
     let stream: Vec<u32> = spans.iter().map(|s| s.0).collect();
     let lo: Vec<u64> = spans.iter().map(|s| s.1).collect();
@@ -933,7 +936,7 @@ pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, l
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
-    ensure_context_for(e, gpu, tokens.len())?;
+    ensure_full_context(e, gpu)?;
     let e = &*e;
     let mut x = vec![0u8; CAPTURE_CAP];
     let mut y = vec![0u8; CAPTURE_CAP];
@@ -1004,7 +1007,7 @@ pub fn replay_multi(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, caps:
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
-    ensure_context_for(e, gpu, tokens.len())?;
+    ensure_full_context(e, gpu)?;
     let e = &*e;
     let pos: Vec<u32> = caps.iter().map(|c| c.0).collect();
     let leaf: Vec<u32> = caps.iter().map(|c| c.1).collect();
