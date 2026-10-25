@@ -115,6 +115,10 @@ const CHAIN_RESTORE_INFLIGHT: usize = 8;
 /// Submission attempts before giving up on an AiResponse.
 const AI_RESPONSE_MAX_ATTEMPTS: u32 = 100;
 
+/// Opening resubmissions at the response pace before slowing to [`OPENING_SLOW_RETRY_SECS`].
+const OPENING_FAST_RETRIES: u32 = 10;
+const OPENING_SLOW_RETRY_SECS: u64 = 60;
+
 /// DAA an unaudited trace is kept past its seed block.
 const TRACE_UNAUDITED_GRACE_DAA: u64 = 600;
 
@@ -1178,9 +1182,9 @@ impl KeryxdHandler {
             .collect();
         jobs.sort_unstable();
         // Earliest deadline first: every replay must still fit after the request and the ones before it.
-        let mut at = now + REPLAY_URGENT_BASE_DAA + next_work;
+        let mut at = now.saturating_add(REPLAY_URGENT_BASE_DAA).saturating_add(next_work);
         jobs.into_iter().any(|(deadline, work)| {
-            at += work;
+            at = at.saturating_add(work);
             at >= deadline
         })
     }
@@ -1294,9 +1298,15 @@ impl KeryxdHandler {
             let a = p.attn.as_ref().filter(|a| a.ready())?;
             Some((a.deadline_daa, txid.clone(), Some(a.path.clone())))
         });
-        let Some((_, txid, path)) = first.chain(phases).min_by_key(|(deadline, _, _)| *deadline) else {
+        // Deadlines still ahead first, earliest first; past ones (the node may still await them
+        // through its backlog extension) only when no request waits.
+        let now = self.last_known_daa;
+        let Some((deadline, txid, path)) = first.chain(phases).min_by_key(|(deadline, _, _)| (*deadline <= now, *deadline)) else {
             return Ok(());
         };
+        if deadline <= now && !self.ai_request_queue.is_empty() {
+            return Ok(());
+        }
         if let Some(path) = path {
             let p = self.pending_traces.get_mut(&txid).unwrap();
             let seed_hash = p.draw.as_ref().map(|d| d.seed_hash.clone()).unwrap_or_default();
@@ -1549,7 +1559,8 @@ impl KeryxdHandler {
                 warn!("Trace: opening {} of response {} missed its window", txid, o.response_txid);
                 return false;
             }
-            if now.duration_since(o.last).as_secs() < AI_RESPONSE_RETRY_SECS {
+            let wait = if o.attempts < OPENING_FAST_RETRIES { AI_RESPONSE_RETRY_SECS } else { OPENING_SLOW_RETRY_SECS };
+            if now.duration_since(o.last).as_secs() < wait {
                 return true;
             }
             o.attempts += 1;
@@ -1942,6 +1953,7 @@ impl KeryxdHandler {
     fn prune_traces(&mut self) {
         let daa = self.last_known_daa;
         let before: Vec<String> = self.pending_traces.keys().cloned().collect();
+        let inflight: std::collections::HashSet<String> = self.opening_inflight.values().map(|o| o.response_txid.clone()).collect();
         self.pending_traces.retain(|txid, p| match p.draw.as_ref() {
             None => (p.accepted_hash.is_some() && p.submitted_daa + TRACE_UNDRAWN_LIMIT_DAA > daa) || p.submitted_daa + AI_BACKFILL_WINDOW_DAA > daa,
             Some(d) if !d.audited => d.seed_daa + TRACE_UNAUDITED_GRACE_DAA > daa,
@@ -1950,8 +1962,9 @@ impl KeryxdHandler {
                     warn!("Trace: response {} was never opened — window closed", txid);
                 }
                 let deadline = d.deadline_daa.max(p.attn.as_ref().map_or(0, |a| a.deadline_daa));
+                let unfinished = inflight.contains(txid) || p.attn.as_ref().is_some_and(|a| a.ready() || a.awaiting_draw().is_some());
                 daa <= deadline
-                    || (d.opened && daa <= deadline + keryx_miner::trace::OPENING_BACKLOG_CAP_DAA)
+                    || (unfinished && daa <= deadline + keryx_miner::trace::OPENING_BACKLOG_CAP_DAA)
                     || p.attn.as_ref().is_some_and(|a| a.awaiting_draw().is_some() && daa <= a.deadline_daa + 2 * keryx_miner::trace::TRACE_SEED_DELAY_DAA)
             }
         });

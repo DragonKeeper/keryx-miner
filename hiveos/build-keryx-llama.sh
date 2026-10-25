@@ -35,10 +35,12 @@ mkdir -p "$OUT"
 SRC=/tmp/llama-src-$TAG
 if [ ! -d "$SRC" ]; then
   git clone --quiet --depth 1 --branch "$TAG" https://github.com/ggml-org/llama.cpp "$SRC"
-  for p in "$REPO"/tools/keryx-llama/patches/*.patch; do
-    git -C "$SRC" apply "$p"
-  done
 fi
+git -C "$SRC" checkout --quiet -- .
+git -C "$SRC" clean -fdq
+for p in "$REPO"/tools/keryx-llama/patches/*.patch; do
+  git -C "$SRC" apply "$p"
+done
 
 docker run --rm --network host \
   -v "$SRC":/llama -v "$REPO":/repo:ro -v "$OUT":/out "${CUDAMOUNT[@]}" \
