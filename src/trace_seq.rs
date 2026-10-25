@@ -134,7 +134,7 @@ pub fn draw_attn(m: &TierManifest, rec: &TraceRecord, seed: &Hash) -> Option<Att
         let kv = d[2] % nkv;
         (kv, kv * g + d[2] / nkv % g)
     };
-    let start = if a.swa_window > 0 { (t + 1).saturating_sub(a.swa_window as u64) } else { 0 };
+    let start = if !mla && a.swa_window > 0 { (t + 1).saturating_sub(a.swa_window as u64) } else { 0 };
     let row = a.head_dim as usize / 32 * 34;
     let (row, dv) = if mla { (row, a.mla_rank as usize) } else { (2 * row, a.head_dim as usize) };
     let (c, b) = block_params(row, partial_len(dv))?;

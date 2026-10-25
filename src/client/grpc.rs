@@ -752,7 +752,7 @@ impl KeryxdHandler {
             challenge_inference_rx: None,
             opoi_challenge_active: None,
             pending_block_submissions,
-            last_known_daa: chain_daa.unwrap_or(0),
+            last_known_daa: chain_daa.unwrap_or(0).max(LAST_KNOWN_DAA.load(Ordering::Relaxed)),
             ipfs_url,
             escrow_pubkey,
             escrow_watcher,
@@ -993,7 +993,7 @@ impl KeryxdHandler {
                     self.ai_seen_prefixes.insert(stable_id.clone());
                     self.ai_request_queue.push_back((stable_id.clone(), request_hash, model_id, prompt, prompt_len, max_tokens, private));
                     while self.ai_request_queue.len() > MAX_AI_QUEUE_SIZE {
-                        self.ai_request_queue.pop_front();
+                        self.ai_request_queue.pop_back();
                     }
                     while self.ai_seen_prefixes.len() > MAX_AI_SEEN_IDS {
                         self.ai_seen_prefixes.clear();
@@ -1158,19 +1158,30 @@ impl KeryxdHandler {
     /// leaves no more than both durations.
     fn urgent_replay(&self, next_work: u64) -> bool {
         let now = self.last_known_daa;
-        self.pending_traces.values().any(|p| {
-            let Some(d) = p.draw.as_ref().filter(|d| d.audited) else { return false };
-            let r = &p.trace.record;
-            let n_gen = r.n_pos.saturating_sub(r.n_prompt);
-            let work = |phase: bool| {
-                let replay = speeds::replay_daa(&p.model_id, phase, p.gen_secs, n_gen)
-                    .unwrap_or_else(|| keryx_miner::trace::work_daa(p.tier, r.n_prompt, n_gen, if phase { 2 } else { 3 }));
-                REPLAY_URGENT_BASE_DAA + next_work + replay
-            };
-            if !d.opened {
-                return d.deadline_daa.saturating_sub(now) <= work(false);
-            }
-            p.attn.as_ref().filter(|a| a.ready()).is_some_and(|a| a.deadline_daa.saturating_sub(now) <= work(true))
+        let mut jobs: Vec<(u64, u64)> = self
+            .pending_traces
+            .values()
+            .filter_map(|p| {
+                let d = p.draw.as_ref().filter(|d| d.audited)?;
+                let r = &p.trace.record;
+                let n_gen = r.n_pos.saturating_sub(r.n_prompt);
+                let work = |phase: bool| {
+                    speeds::replay_daa(&p.model_id, phase, p.gen_secs, n_gen)
+                        .unwrap_or_else(|| keryx_miner::trace::work_daa(p.tier, r.n_prompt, n_gen, if phase { 2 } else { 3 }))
+                };
+                if !d.opened {
+                    return Some((d.deadline_daa, work(false)));
+                }
+                p.attn.as_ref().filter(|a| a.ready()).map(|a| (a.deadline_daa, work(true)))
+            })
+            .filter(|(deadline, _)| *deadline > now)
+            .collect();
+        jobs.sort_unstable();
+        // Earliest deadline first: every replay must still fit after the request and the ones before it.
+        let mut at = now + REPLAY_URGENT_BASE_DAA + next_work;
+        jobs.into_iter().any(|(deadline, work)| {
+            at += work;
+            at >= deadline
         })
     }
 
@@ -1534,16 +1545,12 @@ impl KeryxdHandler {
         let daa = self.last_known_daa;
         let mut resend: Vec<crate::proto::RpcTransaction> = Vec::new();
         self.opening_inflight.retain(|txid, o| {
-            if daa > o.deadline_daa {
+            if daa > o.deadline_daa + keryx_miner::trace::OPENING_BACKLOG_CAP_DAA {
                 warn!("Trace: opening {} of response {} missed its window", txid, o.response_txid);
                 return false;
             }
             if now.duration_since(o.last).as_secs() < AI_RESPONSE_RETRY_SECS {
                 return true;
-            }
-            if o.attempts >= AI_RESPONSE_MAX_ATTEMPTS {
-                warn!("Trace: giving up on opening {} after {} submit attempts", txid, o.attempts);
-                return false;
             }
             o.attempts += 1;
             o.last = now;
@@ -1839,6 +1846,18 @@ impl KeryxdHandler {
 
     /// Draws every accepted trace whose seed block is known: the first chain block after the
     /// accepting one at `TRACE_SEED_DELAY_DAA` or more.
+    /// Whether a chain rebuild that failed, waits for its retry or continues a page starts at or
+    /// after `accepted` in the chain log, so the log may still miss blocks past it.
+    fn rebuild_pending_after(&self, accepted: &str) -> bool {
+        let Some(from) = self.chain_log.iter().position(|e| e.hash == accepted) else { return false };
+        let pending = |h: &String| {
+            self.chain_restore_failures.contains_key(h)
+                || self.chain_restore_continuations.contains(h)
+                || self.chain_restore_retry.iter().any(|(_, s)| s == h)
+        };
+        self.chain_log.iter().skip(from).any(|e| pending(&e.hash))
+    }
+
     fn resolve_traces(&mut self) {
         let mut drawn: Vec<(String, TraceDraw)> = Vec::new();
         for (txid, p) in self.pending_traces.iter() {
@@ -1846,7 +1865,7 @@ impl KeryxdHandler {
                 continue;
             }
             let Some(accepted) = p.accepted_hash.as_deref() else { continue };
-            if self.chain_restore_starts.iter().any(|h| h == accepted) {
+            if self.chain_restore_starts.iter().any(|h| h == accepted) || self.rebuild_pending_after(accepted) {
                 continue;
             }
             let Some((seed_hash, daa, accepted_daa)) = seed_block_after(&self.chain_log, accepted) else { continue };
@@ -1871,9 +1890,18 @@ impl KeryxdHandler {
             ));
         }
         let mut children: Vec<String> = Vec::new();
+        let held: std::collections::HashSet<String> = self
+            .pending_traces
+            .values()
+            .filter_map(|p| p.attn.as_ref()?.awaiting_draw().map(|h| h.to_string()))
+            .filter(|h| self.rebuild_pending_after(h))
+            .collect();
         for (txid, p) in self.pending_traces.iter_mut() {
             let (Some(d), Some(a)) = (p.draw.as_ref(), p.attn.as_mut()) else { continue };
             let Some(accepted) = a.awaiting_draw() else { continue };
+            if held.contains(accepted) {
+                continue;
+            }
             let Some((block, _, accepted_daa)) = seed_block_after(&self.chain_log, accepted) else { continue };
             let (Some(txid_bytes), Some(block_bytes)) = (hash32(txid), hash32(block)) else { continue };
             let phase = a.path.len();
@@ -1921,7 +1949,10 @@ impl KeryxdHandler {
                 if daa > d.deadline_daa && !d.opened {
                     warn!("Trace: response {} was never opened — window closed", txid);
                 }
-                daa <= d.deadline_daa.max(p.attn.as_ref().map_or(0, |a| a.deadline_daa)) || p.attn.as_ref().is_some_and(|a| a.awaiting_draw().is_some() && daa <= a.deadline_daa + 2 * keryx_miner::trace::TRACE_SEED_DELAY_DAA)
+                let deadline = d.deadline_daa.max(p.attn.as_ref().map_or(0, |a| a.deadline_daa));
+                daa <= deadline
+                    || (d.opened && daa <= deadline + keryx_miner::trace::OPENING_BACKLOG_CAP_DAA)
+                    || p.attn.as_ref().is_some_and(|a| a.awaiting_draw().is_some() && daa <= a.deadline_daa + 2 * keryx_miner::trace::TRACE_SEED_DELAY_DAA)
             }
         });
         for txid in before.iter().filter(|t| !self.pending_traces.contains_key(*t)) {
@@ -2741,6 +2772,7 @@ impl KeryxdHandler {
 impl Drop for KeryxdHandler {
     fn drop(&mut self) {
         self.block_handle.abort();
+        LAST_KNOWN_DAA.fetch_max(self.last_known_daa, Ordering::Relaxed);
         let parked = Parked {
             queue: std::mem::take(&mut self.ai_request_queue),
             inference: self.inference_rx.take(),
@@ -2774,6 +2806,9 @@ struct Parked {
 }
 
 static PARKED: Mutex<Option<Parked>> = Mutex::new(None);
+
+/// Last DAA score a closed connection knew of.
+static LAST_KNOWN_DAA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Leading bytes of a private prompt compressed with raw DEFLATE.
 const COMPRESSED_PROMPT_MAGIC: [u8; 4] = [0x00, b'K', b'Z', 0x01];

@@ -598,6 +598,9 @@ pub fn work_daa(tier: u8, n_prompt: u32, n_gen: u32, prompt_passes: u64) -> u64 
     prompt_passes * (n_prompt.min(MAX_PROMPT) as u64 / 10) + n_gen.min(MAX_TOKENS_CAP) as u64 * per_token
 }
 
+/// Largest opening deadline extension the node grants from the network backlog; matches the node.
+pub const OPENING_BACKLOG_CAP_DAA: u64 = 36_000;
+
 /// Window the first opening of an attention audit adds for its prompt; matches the node.
 pub fn attn_first_prompt_daa(n_prompt: u32) -> u64 {
     const REPLAYS: u64 = 3;
@@ -1024,7 +1027,7 @@ pub fn chain_opening_body(
             (manifest::LINK_NONE, None) => LinkOpening::None,
             (manifest::LINK_ATTN_IN, None) => LinkOpening::Token {
                 embd: row_opening(m, index, ctx.embd_entry as u64, tok(p.t)? as u64)?,
-                norm: norm_fragment(m, index, pl.norm as u64, block?)?,
+                norm: norm_fragment(m, index, pl.norm as u64, chain::link_block(seed, i, &point.x, layout, g.k)?)?,
             },
             (manifest::LINK_GLU, Some(l)) if p.experts => {
                 let y = cap(p.t, *l)?;
