@@ -1767,7 +1767,7 @@ impl KeryxdHandler {
                 if daa > d.deadline_daa && !d.opened {
                     warn!("Trace: response {} was never opened — window closed", txid);
                 }
-                daa <= d.deadline_daa.max(p.attn.as_ref().map_or(0, |a| a.deadline_daa))
+                daa <= d.deadline_daa.max(p.attn.as_ref().map_or(0, |a| a.deadline_daa)) || p.attn.as_ref().is_some_and(|a| a.awaiting_draw().is_some())
             }
         });
         for txid in before.iter().filter(|t| !self.pending_traces.contains_key(*t)) {
