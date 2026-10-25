@@ -119,6 +119,12 @@ const AI_RESPONSE_MAX_ATTEMPTS: u32 = 100;
 const OPENING_FAST_RETRIES: u32 = 10;
 const OPENING_SLOW_RETRY_SECS: u64 = 60;
 
+/// Delay before a response accepted ahead of its request is sent again: past the mempool's
+/// memory of accepted transactions.
+const EARLY_RESPONSE_RESEND_DELAY: std::time::Duration = std::time::Duration::from_secs(125);
+/// Sends of such a response before it is left alone.
+const EARLY_RESPONSE_RESENDS: u32 = 10;
+
 /// DAA an unaudited trace is kept past its seed block.
 const TRACE_UNAUDITED_GRACE_DAA: u64 = 600;
 
@@ -228,6 +234,8 @@ struct PendingTrace {
     reorgs: u32,
     /// Attention phases after the first, once the first is submitted.
     attn: Option<AttnPhases>,
+    /// The response transaction, while this run still holds it.
+    response_tx: Option<crate::proto::RpcTransaction>,
 }
 
 /// The attention phases of an audited response, phase order.
@@ -543,6 +551,11 @@ pub struct KeryxdHandler {
     chain_restore_retry: Vec<(std::time::Instant, String)>,
     /// Chain-log blocks whose GetBlock failed: retry time, hash, failures.
     chain_block_retry: Vec<(std::time::Instant, String, u32)>,
+    /// Traced responses waiting for their trace to reach the disk before they are sent.
+    persisting: Vec<(std::sync::mpsc::Receiver<()>, String, crate::proto::RpcTransaction)>,
+    /// Responses accepted before their request, sent again once it is accepted: next send,
+    /// txid, sends so far.
+    response_resend: Vec<(std::time::Instant, String, u32)>,
     /// Chain rebuilds continuing a page that ended before the tip.
     chain_restore_continuations: std::collections::HashSet<String>,
 
@@ -662,6 +675,8 @@ impl Client for KeryxdHandler {
                         self.last_strike_poll = std::time::Instant::now();
                         self.client_send(GetServiceStrikesRequestMessage {}).await?;
                     }
+                    self.release_persisted_responses().await?;
+                    self.resend_early_responses().await?;
                     self.retry_pending_ai_responses().await?;
                     self.prune_traces();
                     self.retry_pending_openings().await?;
@@ -776,6 +791,8 @@ impl KeryxdHandler {
             chain_restore_failures: std::collections::HashMap::new(),
             chain_restore_retry: Vec::new(),
             chain_block_retry: Vec::new(),
+            persisting: Vec::new(),
+            response_resend: Vec::new(),
             chain_restore_continuations: std::collections::HashSet::new(),
             replay_rx: None,
             opening_inflight: restored_openings,
@@ -1617,8 +1634,15 @@ impl KeryxdHandler {
     /// Records a chain block's DAA score once its GetBlock answer arrives.
     /// Writes the on-disk copy of a pending trace.
     fn persist_trace(&self, txid: &str) {
-        let Some(p) = self.pending_traces.get(txid) else { return };
-        self.trace_store.save_queued(keryx_miner::trace_store::StoredTraceOwned {
+        if let Some(record) = self.trace_record(txid) {
+            self.trace_store.save_queued(record);
+        }
+    }
+
+    /// The on-disk record of a pending trace.
+    fn trace_record(&self, txid: &str) -> Option<keryx_miner::trace_store::StoredTraceOwned> {
+        let p = self.pending_traces.get(txid)?;
+        Some(keryx_miner::trace_store::StoredTraceOwned {
             response_txid: txid.to_string(),
             model_id: p.model_id,
             tier: p.tier,
@@ -1631,7 +1655,7 @@ impl KeryxdHandler {
             attn: p.attn.as_ref().map(AttnPhases::stored),
             anchor_hash: p.anchor_hash.clone(),
             gen_secs: p.gen_secs,
-        });
+        })
     }
 
     /// Loads the stored traces of a previous run and the openings they had already submitted.
@@ -1693,6 +1717,7 @@ impl KeryxdHandler {
                     built_phase: None,
                     reorgs: 0,
                     attn,
+                    response_tx: None,
                 },
             );
         }
@@ -1761,6 +1786,45 @@ impl KeryxdHandler {
         let delay = CHAIN_RESTORE_RETRY_BASE.saturating_mul(1 << (*failures - 1).min(4)).min(CHAIN_RESTORE_RETRY_MAX);
         warn!("Trace: chain rebuild from block {} failed: {} — retrying in {} s", start, error, delay.as_secs());
         self.chain_restore_retry.push((std::time::Instant::now() + delay, start));
+    }
+
+    /// Sends the traced responses whose trace is now on disk.
+    async fn release_persisted_responses(&mut self) -> Result<(), Error> {
+        let mut ready = Vec::new();
+        self.persisting.retain(|(written, txid, tx)| match written.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            _ => {
+                ready.push((txid.clone(), tx.clone()));
+                false
+            }
+        });
+        for (txid, tx) in ready {
+            self.ai_response_inflight.insert(txid, (tx.clone(), 1, std::time::Instant::now()));
+            if let Err(e) = self.client_send(KaspadMessage::submit_transaction(tx)).await {
+                warn!("Inference: failed to send AiResponse tx: {}", e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends again the responses a chain block accepted before their request, once the mempool
+    /// forgot them: one the ledger did not credit is admitted, one it credited is refused.
+    async fn resend_early_responses(&mut self) -> Result<(), Error> {
+        let now = std::time::Instant::now();
+        let traces = &self.pending_traces;
+        self.response_resend.retain(|(_, txid, sends)| *sends < EARLY_RESPONSE_RESENDS && traces.get(txid).is_some_and(|p| p.response_tx.is_some()));
+        let mut due = Vec::new();
+        for (at, txid, sends) in self.response_resend.iter_mut().filter(|(at, _, _)| *at <= now) {
+            *at = now + std::time::Duration::from_secs(OPENING_SLOW_RETRY_SECS);
+            *sends += 1;
+            if let Some(tx) = self.pending_traces.get(txid).and_then(|p| p.response_tx.clone()) {
+                due.push(tx);
+            }
+        }
+        for tx in due {
+            self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+        }
+        Ok(())
     }
 
     /// Asks again for the chain-log blocks whose GetBlock failed, once their retry is due.
@@ -2353,14 +2417,22 @@ impl KeryxdHandler {
                     built_phase: None,
                     reorgs: 0,
                     attn: None,
+                    response_tx: Some(rpc_tx.clone()),
                 };
                 self.pending_traces.insert(txid.clone(), pending);
-                self.persist_trace(&txid);
+                // The response leaves only once its trace is on disk: a crash in between would
+                // leave an audit nothing can open.
+                let (done, written) = std::sync::mpsc::channel();
+                if let Some(record) = self.trace_record(&txid) {
+                    self.trace_store.save_queued_notify(record, done);
+                }
+                self.persisting.push((written, txid, rpc_tx));
+            } else {
+                self.ai_response_inflight.insert(txid, (rpc_tx.clone(), 1, std::time::Instant::now()));
+                if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
+                    warn!("Inference: failed to send AiResponse tx: {}", e);
+                }
             }
-            self.ai_response_inflight.insert(txid, (rpc_tx.clone(), 1, std::time::Instant::now()));
-        }
-        if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
-            warn!("Inference: failed to send AiResponse tx: {}", e);
         }
 
         // Register inference escrow outpoint for auto-claim after the challenge window.
@@ -2765,6 +2837,24 @@ impl KeryxdHandler {
                             }
                             return Ok(());
                         }
+                        let resent = self
+                            .response_resend
+                            .iter()
+                            .position(|(_, t, _)| *t == res.transaction_id || err.as_ref().is_some_and(|e| e.contains(t.as_str())));
+                        if let Some(i) = resent {
+                            match err.as_deref() {
+                                None => {
+                                    info!("Inference: response {} sent again and admitted", self.response_resend[i].1);
+                                    self.response_resend.remove(i);
+                                }
+                                Some(e) if e.contains("not awaited") => {
+                                    log::debug!("Inference: response {} already credited", self.response_resend[i].1);
+                                    self.response_resend.remove(i);
+                                }
+                                Some(e) => log::debug!("Inference: response sent again refused: {}", e),
+                            }
+                            return Ok(());
+                        }
                         let inflight_txid = if self.ai_response_inflight.contains_key(&res.transaction_id) {
                             Some(res.transaction_id.clone())
                         } else {
@@ -2849,6 +2939,21 @@ impl KeryxdHandler {
                 }
                 let mut accepted_now: Vec<String> = Vec::new();
                 for accepted in &notif.accepted_transaction_ids {
+                    // A request accepted after its response: the ledger parked that response.
+                    for txid in &accepted.accepted_transaction_ids {
+                        let early: Vec<String> = self
+                            .pending_traces
+                            .iter()
+                            .filter(|(_, p)| p.accepted_hash.as_ref().is_some_and(|h| *h != accepted.accepting_block_hash) && hex::encode(p.request_hash) == *txid)
+                            .map(|(t, _)| t.clone())
+                            .collect();
+                        for t in early {
+                            if !self.response_resend.iter().any(|(_, r, _)| *r == t) {
+                                info!("Trace: response {} accepted before its request — sent again shortly", t);
+                                self.response_resend.push((std::time::Instant::now() + EARLY_RESPONSE_RESEND_DELAY, t, 0));
+                            }
+                        }
+                    }
                     for txid in &accepted.accepted_transaction_ids {
                         if let Some(p) = self.pending_traces.get_mut(txid).filter(|p| p.accepted_hash.is_none()) {
                             p.accepted_hash = Some(accepted.accepting_block_hash.clone());
@@ -2901,6 +3006,12 @@ impl Drop for KeryxdHandler {
     fn drop(&mut self) {
         self.block_handle.abort();
         LAST_KNOWN_DAA.fetch_max(self.last_known_daa, Ordering::Relaxed);
+        if !self.persisting.is_empty() {
+            self.trace_store.flush();
+            for (_, txid, tx) in std::mem::take(&mut self.persisting) {
+                self.ai_response_inflight.insert(txid, (tx, 1, std::time::Instant::now()));
+            }
+        }
         let parked = Parked {
             queue: std::mem::take(&mut self.ai_request_queue),
             inference: self.inference_rx.take(),

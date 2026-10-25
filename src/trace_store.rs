@@ -360,6 +360,12 @@ impl TraceStore {
         let _ = writer().send(Job::Save(self.dir.clone(), Box::new(record)));
     }
 
+    /// Queues the record and signals `done` once it is written.
+    pub fn save_queued_notify(&self, record: StoredTraceOwned, done: mpsc::Sender<()>) {
+        let _ = writer().send(Job::Save(self.dir.clone(), Box::new(record)));
+        let _ = writer().send(Job::Flush(done));
+    }
+
     /// Queues the removal of a record behind the writes already queued.
     pub fn remove(&self, txid: &str) {
         let _ = writer().send(Job::Remove(self.path(txid)));
