@@ -166,6 +166,8 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
             "-DGGML_F16C=OFF",
             "-DGGML_BMI2=OFF",
             "-DGGML_CUDA_NCCL=OFF",
+            // Traces are captured in the quantized kernels: no cuBLAS fallback on any architecture.
+            "-DGGML_CUDA_FORCE_MMQ=ON",
             "-DCMAKE_BUILD_TYPE=Release",
             &format!("-DCMAKE_CUDA_COMPILER={nvcc}"),
         ]);
