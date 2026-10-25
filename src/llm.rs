@@ -1149,7 +1149,7 @@ fn open_chain(
     let d = draw_chain(m, pctx, rec, seed).ok_or("no stage-2 draw")?;
     let caps = replay_captures(gguf, dev_id, m, trace, &d.captures(m.n_products as u64))?;
     let body = chain_opening_body(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index).ok_or_else(|| "no stage-2 opening".to_string())?;
-    match &trace.seq {
+    let body = match &trace.seq {
         Some(seq) => {
             let mut o = keryx_verifiable_inference::opening::Opening::decode(&body).ok_or("undecodable stage-2 opening")?;
             o.roots = Some((rec.trace_root, seq.root));
@@ -1157,10 +1157,13 @@ fn open_chain(
             if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
                 return Err(format!("stage-2 opening of {} B over the cap", body.len()));
             }
-            Ok(body)
+            body
         }
-        None => Ok(body),
-    }
+        None => body,
+    };
+    let ctx = m.chain.ok_or("no stage-2 context")?;
+    crate::trace::verify_chain_opening(&m.tier_ctx(index), &ctx, pctx, rec, seed, request_hash, &body).map_err(|e| format!("stage-2 opening fails its own check: {e}"))?;
+    Ok(body)
 }
 
 /// Traces a fixed prompt under the stage-2 manifest, then opens and verifies it under two seeds

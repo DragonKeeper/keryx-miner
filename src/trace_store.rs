@@ -15,6 +15,18 @@ const V3_VERSION: u32 = 3;
 /// Records written before sequence leaves: read and kept, without them.
 const LEGACY_VERSION: u32 = 2;
 const FILE_EXT: &str = "trace";
+/// Mutable part of a record, rewritten on each change while the trace file is written once.
+const STATE_EXT: &str = "state";
+
+/// The fields of a record that change after its first write.
+#[derive(BorshSerialize, BorshDeserialize)]
+struct StoredState {
+    accepted_hash: Option<String>,
+    opening: Option<StoredOpening>,
+    attn: Option<StoredAttn>,
+    anchor_hash: Option<String>,
+    gen_secs: Option<f64>,
+}
 
 /// The opening already built for a response: resent as is after a restart.
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
@@ -267,7 +279,9 @@ fn writer() -> &'static mpsc::Sender<Job> {
                 for job in rx {
                     match job {
                         Job::Save(dir, rec) => {
-                            if let Err(e) = write_record(&dir, &rec.record()) {
+                            let written = dir.join(format!("{}.{}", rec.response_txid, FILE_EXT)).exists();
+                            let res = if written { write_state(&dir, &rec) } else { write_record(&dir, &rec.record()) };
+                            if let Err(e) = res {
                                 log::warn!("Trace: cannot persist response {}: {}", rec.response_txid, e);
                             }
                         }
@@ -285,18 +299,37 @@ fn writer() -> &'static mpsc::Sender<Job> {
     })
 }
 
-/// Writes the record atomically: temporary file, sync, rename.
-fn write_record(dir: &Path, record: &StoredTraceRef) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    let bytes = borsh::to_vec(record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let path = dir.join(format!("{}.{}", record.response_txid, FILE_EXT));
+/// Writes `bytes` to `path` atomically: temporary file, sync, rename.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut f = fs::File::create(&tmp)?;
-        io::Write::write_all(&mut f, &bytes)?;
+        io::Write::write_all(&mut f, bytes)?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, &path)
+    fs::rename(&tmp, path)
+}
+
+/// Writes the whole record and drops any older state file.
+fn write_record(dir: &Path, record: &StoredTraceRef) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let bytes = borsh::to_vec(record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    write_atomic(&dir.join(format!("{}.{}", record.response_txid, FILE_EXT)), &bytes)?;
+    let _ = fs::remove_file(dir.join(format!("{}.{}", record.response_txid, STATE_EXT)));
+    Ok(())
+}
+
+/// Writes the mutable fields of a record whose trace file is already written.
+fn write_state(dir: &Path, rec: &StoredTraceOwned) -> io::Result<()> {
+    let state = StoredState {
+        accepted_hash: rec.accepted_hash.clone(),
+        opening: rec.opening.clone(),
+        attn: rec.attn.clone(),
+        anchor_hash: rec.anchor_hash.clone(),
+        gen_secs: rec.gen_secs,
+    };
+    let bytes = borsh::to_vec(&state).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    write_atomic(&dir.join(format!("{}.{}", rec.response_txid, STATE_EXT)), &bytes)
 }
 
 pub struct TraceStore {
@@ -330,6 +363,7 @@ impl TraceStore {
     /// Queues the removal of a record behind the writes already queued.
     pub fn remove(&self, txid: &str) {
         let _ = writer().send(Job::Remove(self.path(txid)));
+        let _ = writer().send(Job::Remove(self.dir.join(format!("{}.{}", txid, STATE_EXT))));
     }
 
     /// Waits until every queued write and removal is applied.
@@ -352,7 +386,17 @@ impl TraceStore {
                 continue;
             }
             match fs::read(&path).map_err(|e| e.to_string()).and_then(|b| decode(&b)) {
-                Ok(t) if t.version == STORE_VERSION => out.push(t),
+                Ok(mut t) if t.version == STORE_VERSION => {
+                    let state = fs::read(path.with_extension(STATE_EXT)).ok().and_then(|b| StoredState::try_from_slice(&b).ok());
+                    if let Some(st) = state {
+                        t.accepted_hash = st.accepted_hash;
+                        t.opening = st.opening;
+                        t.attn = st.attn;
+                        t.anchor_hash = st.anchor_hash;
+                        t.gen_secs = st.gen_secs;
+                    }
+                    out.push(t)
+                }
                 Ok(t) => {
                     log::warn!("Trace: stored record {} has version {} — dropped", path.display(), t.version);
                     let _ = fs::remove_file(&path);
@@ -409,6 +453,42 @@ mod tests {
         assert_eq!(t.gen_secs, Some(12.5));
         store.remove("deadbeef");
         assert!(store.load_all().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn later_writes_keep_the_trace_file_and_update_the_state() {
+        let dir = std::env::temp_dir().join(format!("keryx-trace-store-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = TraceStore { dir: dir.clone() };
+        let trace = Arc::new(crate::trace::ResponseTrace::test_sample());
+        let owned = |accepted: Option<&str>| StoredTraceOwned {
+            response_txid: "cc".into(),
+            model_id: [1u8; 32],
+            tier: 1,
+            request_hash: [2u8; 32],
+            max_tokens: 16,
+            submitted_daa: 3,
+            accepted_hash: accepted.map(Into::into),
+            opening: None,
+            trace: Arc::clone(&trace),
+            attn: None,
+            anchor_hash: None,
+            gen_secs: None,
+        };
+        store.save_queued(owned(None));
+        store.flush();
+        let trace_file = dir.join("cc.trace");
+        let first = fs::metadata(&trace_file).unwrap().modified().unwrap();
+        store.save_queued(owned(Some("beef")));
+        store.flush();
+        assert_eq!(fs::metadata(&trace_file).unwrap().modified().unwrap(), first);
+        assert!(dir.join("cc.state").exists());
+        let loaded = store.load_all();
+        assert_eq!(loaded[0].accepted_hash.as_deref(), Some("beef"));
+        store.remove("cc");
+        store.flush();
+        assert!(!dir.join("cc.state").exists() && !trace_file.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

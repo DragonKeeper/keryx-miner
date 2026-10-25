@@ -125,8 +125,6 @@ const TRACE_UNAUDITED_GRACE_DAA: u64 = 600;
 /// Chain-log entries kept beyond the ones the pending traces still need.
 const CHAIN_LOG_TAIL: usize = 512;
 
-/// Rejections of an opening the node does not await before it is dropped.
-const OPENING_NOT_AWAITED_MAX_ATTEMPTS: u32 = 5;
 
 /// Built opening bodies kept per response, one per seed block.
 const BUILT_OPENINGS_KEPT: usize = 4;
@@ -140,14 +138,21 @@ const NODE_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(9
 const REPLAY_URGENT_BASE_DAA: u64 = 1_500;
 /// A chain rebuild answer of at least this many blocks is continued from its last block.
 const CHAIN_RESTORE_PAGE_MIN: usize = 100;
-/// Longest an accepted response waits for its draw to be rebuilt; matches the node's ledger horizon.
+/// Longest a response waits for its acceptance and draw: past the node's ledger horizon its
+/// request is no longer pending.
 const TRACE_UNDRAWN_LIMIT_DAA: u64 = 72_000;
 /// First delay before a failed chain rebuild is retried, doubled at each failure up to the max.
 const CHAIN_RESTORE_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(5);
 const CHAIN_RESTORE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Failed replays of one draw before it is given up.
-const REPLAY_MAX_FAILURES: u32 = 2;
+/// First delay before a failed replay is retried, doubled at each failure up to the max.
+const REPLAY_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+const REPLAY_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Delay before the replay retry following `failures` failed replays.
+fn replay_backoff(failures: u32) -> std::time::Instant {
+    std::time::Instant::now() + REPLAY_RETRY_BASE.saturating_mul(1 << failures.min(5)).min(REPLAY_RETRY_MAX)
+}
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -241,6 +246,8 @@ struct AttnPhases {
     /// A replay of the next phase was started for the current path.
     opened: bool,
     failures: u32,
+    /// Earliest retry of a failed replay of the next phase.
+    retry_at: Option<std::time::Instant>,
     /// Phase transactions undone by a reorg, and the chain block that accepted one afterwards: a
     /// phase rebuilt for the same child has the same transaction.
     dropped: std::collections::HashSet<String>,
@@ -259,6 +266,7 @@ impl AttnPhases {
             deadline_daa,
             opened: false,
             failures: 0,
+            retry_at: None,
             dropped: Default::default(),
             late: Default::default(),
         }
@@ -286,6 +294,7 @@ impl AttnPhases {
             deadline_daa: s.deadline_daa,
             opened: false,
             failures: 0,
+            retry_at: None,
             dropped: Default::default(),
             late: Default::default(),
         })
@@ -314,8 +323,13 @@ impl AttnPhases {
     }
 
     /// Whether the next phase can be built: its child is drawn and no replay was started.
+    /// Whether the next phase is drawn and not submitted yet.
+    fn next_phase_owed(&self) -> bool {
+        self.path.len() == self.bodies.len()
+    }
+
     fn ready(&self) -> bool {
-        self.path.len() == self.bodies.len() && !self.opened
+        self.path.len() == self.bodies.len() && !self.opened && self.retry_at.is_none_or(|t| t <= std::time::Instant::now())
     }
 
     /// Undoes the phases and children that depended on `removed` chain blocks; returns the
@@ -358,6 +372,15 @@ struct TraceDraw {
     opened: bool,
     /// Replays of this seed that built no opening.
     replay_failures: u32,
+    /// Earliest retry of a failed replay.
+    retry_at: Option<std::time::Instant>,
+}
+
+impl TraceDraw {
+    /// Whether the first opening still needs a replay that may start now.
+    fn replay_ready(&self) -> bool {
+        self.audited && !self.opened && self.retry_at.is_none_or(|t| t <= std::time::Instant::now())
+    }
 }
 
 /// A chain block in chain order; its DAA score arrives with the GetBlock answer.
@@ -518,13 +541,15 @@ pub struct KeryxdHandler {
     chain_restore_failures: std::collections::HashMap<String, u32>,
     /// Failed chain rebuilds waiting for their retry.
     chain_restore_retry: Vec<(std::time::Instant, String)>,
+    /// Chain-log blocks whose GetBlock failed: retry time, hash, failures.
+    chain_block_retry: Vec<(std::time::Instant, String, u32)>,
     /// Chain rebuilds continuing a page that ended before the tip.
     chain_restore_continuations: std::collections::HashSet<String>,
 
     /// In-flight replay building an opening.
     replay_rx: Option<ReplayJob>,
 
-    /// In-flight opening submissions not yet accepted by the mempool, keyed by txid.
+    /// Opening submissions not yet accepted by a chain block, keyed by txid.
     opening_inflight: std::collections::HashMap<String, OpeningInflight>,
 
     /// Finished inference being uploaded and confirmed on the public gateways; its AiResponse
@@ -641,6 +666,7 @@ impl Client for KeryxdHandler {
                     self.prune_traces();
                     self.retry_pending_openings().await?;
                     self.retry_chain_restores().await?;
+                    self.retry_chain_blocks().await?;
                     self.try_start_replay(miner).await?;
                 }
             }
@@ -749,6 +775,7 @@ impl KeryxdHandler {
             chain_restore_starts: VecDeque::new(),
             chain_restore_failures: std::collections::HashMap::new(),
             chain_restore_retry: Vec::new(),
+            chain_block_retry: Vec::new(),
             chain_restore_continuations: std::collections::HashSet::new(),
             replay_rx: None,
             opening_inflight: restored_openings,
@@ -1162,30 +1189,42 @@ impl KeryxdHandler {
     /// leaves no more than both durations.
     fn urgent_replay(&self, next_work: u64) -> bool {
         let now = self.last_known_daa;
-        let mut jobs: Vec<(u64, u64)> = self
+        let mut jobs: Vec<(u64, u64, bool)> = self
             .pending_traces
             .values()
             .filter_map(|p| {
-                let d = p.draw.as_ref().filter(|d| d.audited)?;
                 let r = &p.trace.record;
+                // Accepted under the audit-all rule: certain to be audited once drawn, due no
+                // earlier than its submission plus the seed delay and the window.
+                if p.draw.is_none() && p.accepted_hash.is_some() && keryx_miner::trace::audit_all_active(p.submitted_daa) {
+                    let n_gen = r.n_pos.saturating_sub(r.n_prompt);
+                    let work = speeds::replay_daa(&p.model_id, false, p.gen_secs, n_gen).unwrap_or_else(|| keryx_miner::trace::work_daa(p.tier, r.n_prompt, n_gen, 3));
+                    let due = p.submitted_daa + keryx_miner::trace::TRACE_SEED_DELAY_DAA + keryx_miner::trace::opening_window_daa(p.tier, p.max_tokens);
+                    return Some((due, work, false));
+                }
+                let d = p.draw.as_ref().filter(|d| d.audited)?;
                 let n_gen = r.n_pos.saturating_sub(r.n_prompt);
                 let work = |phase: bool| {
                     speeds::replay_daa(&p.model_id, phase, p.gen_secs, n_gen)
                         .unwrap_or_else(|| keryx_miner::trace::work_daa(p.tier, r.n_prompt, n_gen, if phase { 2 } else { 3 }))
                 };
-                if !d.opened {
-                    return Some((d.deadline_daa, work(false)));
+                if d.replay_ready() {
+                    return Some((d.deadline_daa, work(false), true));
                 }
-                p.attn.as_ref().filter(|a| a.ready()).map(|a| (a.deadline_daa, work(true)))
+                p.attn.as_ref().filter(|a| a.ready()).map(|a| (a.deadline_daa, work(true), true))
             })
-            .filter(|(deadline, _)| *deadline > now)
+            .filter(|(deadline, _, _)| *deadline > now)
             .collect();
         jobs.sort_unstable();
-        // Earliest deadline first: every replay must still fit after the request and the ones before it.
+        // Earliest deadline first: every replay must still fit after the request and the ones
+        // before it. Undrawn audits take their share but cannot start yet, so only a replay that
+        // can start now, at or before the first overflow, makes it urgent.
         let mut at = now.saturating_add(REPLAY_URGENT_BASE_DAA).saturating_add(next_work);
-        jobs.into_iter().any(|(deadline, work)| {
+        let mut startable = false;
+        jobs.into_iter().any(|(deadline, work, ready)| {
             at = at.saturating_add(work);
-            at >= deadline
+            startable |= ready;
+            at >= deadline && startable
         })
     }
 
@@ -1290,7 +1329,7 @@ impl KeryxdHandler {
             return Ok(());
         }
         let first = self.pending_traces.iter().filter_map(|(txid, p)| {
-            let d = p.draw.as_ref().filter(|d| d.audited && !d.opened)?;
+            let d = p.draw.as_ref().filter(|d| d.replay_ready())?;
             Some((d.deadline_daa, txid.clone(), None))
         });
         let phases = self.pending_traces.iter().filter_map(|(txid, p)| {
@@ -1394,11 +1433,11 @@ impl KeryxdHandler {
                 .filter(|d| d.seed_hash == job.seed_hash)
                 .map(|d| {
                     d.replay_failures += 1;
-                    d.opened = d.replay_failures > REPLAY_MAX_FAILURES;
-                    !d.opened
+                    d.opened = false;
+                    d.retry_at = Some(replay_backoff(d.replay_failures));
                 });
-            if retry == Some(true) {
-                warn!("Trace: no opening built for response {} — retrying", job.response_txid);
+            if retry.is_some() {
+                warn!("Trace: no opening built for response {} — retrying later", job.response_txid);
             } else {
                 warn!("Trace: no opening built for response {}", job.response_txid);
             }
@@ -1520,8 +1559,9 @@ impl KeryxdHandler {
         };
         let Some(body) = body else {
             a.failures += 1;
-            a.opened = a.failures > REPLAY_MAX_FAILURES;
-            warn!("Trace: attention phase {} of response {} not built{}", path.len(), response_txid, if a.opened { "" } else { " — retrying" });
+            a.opened = false;
+            a.retry_at = Some(replay_backoff(a.failures));
+            warn!("Trace: attention phase {} of response {} not built — retrying later", path.len(), response_txid);
             return;
         };
         let deadline_daa = a.deadline_daa;
@@ -1723,6 +1763,23 @@ impl KeryxdHandler {
         self.chain_restore_retry.push((std::time::Instant::now() + delay, start));
     }
 
+    /// Asks again for the chain-log blocks whose GetBlock failed, once their retry is due.
+    async fn retry_chain_blocks(&mut self) -> Result<(), Error> {
+        let now = std::time::Instant::now();
+        let log = &self.chain_log;
+        self.chain_block_retry.retain(|(_, h, _)| log.iter().any(|c| c.hash == *h && c.daa.is_none()));
+        let due: Vec<String> = self.chain_block_retry.iter().filter(|(at, _, _)| *at <= now).map(|(_, h, _)| h.clone()).collect();
+        for (at, h, _) in self.chain_block_retry.iter_mut() {
+            if due.contains(h) {
+                *at = now + CHAIN_RESTORE_RETRY_MAX;
+            }
+        }
+        for hash in due {
+            self.client_send(GetBlockRequestMessage { hash, include_transactions: true }).await?;
+        }
+        Ok(())
+    }
+
     /// Requeues the chain rebuilds whose retry is due while a pending response still needs them.
     async fn retry_chain_restores(&mut self) -> Result<(), Error> {
         let now = std::time::Instant::now();
@@ -1770,8 +1827,20 @@ impl KeryxdHandler {
         noted
     }
 
+    /// Ends the submissions of the openings chain blocks accepted.
+    fn note_opening_acceptances(&mut self, accepted: &[crate::proto::RpcAcceptedTransactionIds]) {
+        for a in accepted {
+            for txid in &a.accepted_transaction_ids {
+                if let Some(o) = self.opening_inflight.remove(txid) {
+                    info!("Trace: opening {} of response {} accepted by chain block {}", txid, o.response_txid, a.accepting_block_hash);
+                }
+            }
+        }
+    }
+
     /// Notes the acceptances of restored responses that lost their accepting block.
     fn note_restored_acceptances(&mut self, accepted: &[crate::proto::RpcAcceptedTransactionIds]) {
+        self.note_opening_acceptances(accepted);
         let mut noted: Vec<String> = self.note_phase_acceptances(accepted);
         for a in accepted {
             for txid in &a.accepted_transaction_ids {
@@ -1835,6 +1904,9 @@ impl KeryxdHandler {
                 p.draw = None;
                 reset.push(txid.clone());
             } else if let Some(dropped) = p.attn.as_mut().and_then(|a| a.on_removed(&removed)) {
+                if let (Some(d), Some(a)) = (p.draw.as_ref(), p.attn.as_mut()) {
+                    a.deadline_daa = a.deadline_daa.min(d.deadline_daa);
+                }
                 log::debug!("Trace: chain reorg — attention phases of response {} back to phase {}", txid, p.attn.as_ref().map_or(0, |a| a.bodies.len() - 1));
                 self.opening_inflight.retain(|t, _| !dropped.contains(t));
                 rephased.push(txid.clone());
@@ -1897,8 +1969,38 @@ impl KeryxdHandler {
                     deadline_daa,
                     opened: p.opening.as_ref().is_some_and(|o| o.seed_hash == seed_hash),
                     replay_failures: 0,
+                    retry_at: None,
                 },
             ));
+        }
+        // The node chains the deadline of each new audit of a key behind the open ones of that
+        // key, in seed order then txid order; without its network backlog, this stays at or
+        // before the node's deadline.
+        drawn.sort_by(|(ta, a), (tb, b)| (a.seed_daa, ta).cmp(&(b.seed_daa, tb)));
+        let inflight: std::collections::HashSet<String> = self.opening_inflight.values().map(|o| o.response_txid.clone()).collect();
+        let mut open: Vec<u64> = self
+            .pending_traces
+            .iter()
+            .filter_map(|(t, p)| {
+                let d = p.draw.as_ref().filter(|d| d.audited)?;
+                let unfinished = !d.opened || inflight.contains(t) || p.attn.as_ref().is_some_and(|a| a.next_phase_owed() || a.awaiting_draw().is_some());
+                unfinished.then(|| d.deadline_daa.max(p.attn.as_ref().map_or(0, |a| a.deadline_daa)))
+            })
+            .collect();
+        for (txid, d) in drawn.iter_mut().filter(|(_, d)| d.audited) {
+            let Some(p) = self.pending_traces.get(txid) else { continue };
+            let r = &p.trace.record;
+            let work = keryx_miner::trace::service_work_daa(p.tier, r.n_prompt, r.n_pos.saturating_sub(r.n_prompt));
+            match keryx_miner::trace::chained_deadline(d.deadline_daa, &open, d.seed_daa, work) {
+                Some(deadline) => {
+                    d.deadline_daa = deadline;
+                    open.push(deadline);
+                }
+                None => {
+                    info!("Trace: response {} past the audit queue of this key — not audited", txid);
+                    d.audited = false;
+                }
+            }
         }
         let mut children: Vec<String> = Vec::new();
         let held: std::collections::HashSet<String> = self
@@ -1955,14 +2057,14 @@ impl KeryxdHandler {
         let before: Vec<String> = self.pending_traces.keys().cloned().collect();
         let inflight: std::collections::HashSet<String> = self.opening_inflight.values().map(|o| o.response_txid.clone()).collect();
         self.pending_traces.retain(|txid, p| match p.draw.as_ref() {
-            None => (p.accepted_hash.is_some() && p.submitted_daa + TRACE_UNDRAWN_LIMIT_DAA > daa) || p.submitted_daa + AI_BACKFILL_WINDOW_DAA > daa,
+            None => p.submitted_daa + TRACE_UNDRAWN_LIMIT_DAA > daa,
             Some(d) if !d.audited => d.seed_daa + TRACE_UNAUDITED_GRACE_DAA > daa,
             Some(d) => {
                 if daa > d.deadline_daa && !d.opened {
                     warn!("Trace: response {} was never opened — window closed", txid);
                 }
                 let deadline = d.deadline_daa.max(p.attn.as_ref().map_or(0, |a| a.deadline_daa));
-                let unfinished = inflight.contains(txid) || p.attn.as_ref().is_some_and(|a| a.ready() || a.awaiting_draw().is_some());
+                let unfinished = !d.opened || inflight.contains(txid) || p.attn.as_ref().is_some_and(|a| a.next_phase_owed() || a.awaiting_draw().is_some());
                 daa <= deadline
                     || (unfinished && daa <= deadline + keryx_miner::trace::OPENING_BACKLOG_CAP_DAA)
                     || p.attn.as_ref().is_some_and(|a| a.awaiting_draw().is_some() && daa <= a.deadline_daa + 2 * keryx_miner::trace::TRACE_SEED_DELAY_DAA)
@@ -2510,10 +2612,15 @@ impl KeryxdHandler {
             Payload::GetBlockResponse(msg) => {
                 let mut was_validation = false;
                 if let Some(e) = msg.error {
-                    if let Some(pos) = self.chain_log.iter().position(|c| e.message.contains(c.hash.as_str())) {
-                        warn!("Trace: chain block {} unavailable — left out of the chain log", self.chain_log[pos].hash);
-                        self.chain_log.remove(pos);
-                        self.resolve_traces();
+                    // A chain block missing from the log would shift every seed block after it:
+                    // it is asked again until the node answers or a reorg removes it.
+                    if let Some(c) = self.chain_log.iter().find(|c| c.daa.is_none() && e.message.contains(c.hash.as_str())) {
+                        let failures = self.chain_block_retry.iter().find(|(_, h, _)| *h == c.hash).map_or(0, |(_, _, f)| *f) + 1;
+                        let delay = CHAIN_RESTORE_RETRY_BASE.saturating_mul(1 << (failures - 1).min(4)).min(CHAIN_RESTORE_RETRY_MAX);
+                        warn!("Trace: chain block {} unavailable — asked again in {} s", c.hash, delay.as_secs());
+                        let hash = c.hash.clone();
+                        self.chain_block_retry.retain(|(_, h, _)| *h != hash);
+                        self.chain_block_retry.push((std::time::Instant::now() + delay, hash, failures));
                     }
                     // Validation answer: "cannot find header <hash>" — unknown to this
                     // node (pruned or not yet synced), the entries are kept.
@@ -2621,23 +2728,30 @@ impl KeryxdHandler {
                             err.as_ref().and_then(|e| self.opening_inflight.keys().find(|k| e.contains(k.as_str())).cloned())
                         };
                         if let Some(txid) = opening_txid {
+                            // Kept until a chain block accepts it: a node restart or an eviction
+                            // empties the mempool, and a syncing node awaits nothing yet.
                             match err.as_deref() {
                                 None => {
-                                    self.opening_inflight.remove(&txid);
+                                    if let Some(o) = self.opening_inflight.get_mut(&txid) {
+                                        o.attempts = o.attempts.max(OPENING_FAST_RETRIES);
+                                    }
                                     info!("Trace: opening accepted by the mempool");
                                 }
                                 Some(e) if e.contains("an opening for response") => {
                                     info!("Trace: another opening of this response is in the mempool — retrying");
                                 }
                                 Some(e) if e.contains("already") => {
-                                    self.opening_inflight.remove(&txid);
-                                    info!("Trace: opening already known to the node — done");
+                                    if let Some(o) = self.opening_inflight.get_mut(&txid) {
+                                        o.attempts = o.attempts.max(OPENING_FAST_RETRIES);
+                                    }
+                                    log::debug!("Trace: opening already known to the node");
                                 }
                                 Some(e) if e.contains("not awaited") => {
                                     let attempts = self.opening_inflight.get(&txid).map_or(1, |o| o.attempts);
-                                    if attempts >= OPENING_NOT_AWAITED_MAX_ATTEMPTS {
-                                        self.opening_inflight.remove(&txid);
-                                        warn!("Trace: opening not awaited by the node — dropped: {}", e);
+                                    if attempts <= 1 {
+                                        warn!("Trace: opening not awaited by the node yet — retrying until its window ends: {}", e);
+                                    } else {
+                                        log::debug!("Trace: opening not awaited (attempt {}): {}", attempts, e);
                                     }
                                 }
                                 Some(e) => {
@@ -2747,6 +2861,7 @@ impl KeryxdHandler {
                         }
                     }
                 }
+                self.note_opening_acceptances(&notif.accepted_transaction_ids);
                 accepted_now.extend(self.note_phase_acceptances(&notif.accepted_transaction_ids));
                 for txid in accepted_now {
                     self.persist_trace(&txid);

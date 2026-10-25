@@ -601,6 +601,25 @@ pub fn work_daa(tier: u8, n_prompt: u32, n_gen: u32, prompt_passes: u64) -> u64 
 /// Largest opening deadline extension the node grants from the network backlog; matches the node.
 pub const OPENING_BACKLOG_CAP_DAA: u64 = 36_000;
 
+/// Replays an open audit costs its responder, in units of serving work; matches the node.
+pub const OPEN_AUDIT_WORK_PASSES: u64 = 3;
+
+/// Opening deadline of an audit of `work` serving work seeded at `seed_daa` with its own window
+/// ending at `own`, chained behind the deadlines of the open audits of the same key; `None` past
+/// the chain cap, where the node opens no audit. The node adds its network backlog on top.
+pub fn chained_deadline(own: u64, open_ends: &[u64], seed_daa: u64, work: u64) -> Option<u64> {
+    let start = open_ends.iter().copied().filter(|e| *e >= seed_daa).max().map_or(own, |end| own.max(end + OPEN_AUDIT_WORK_PASSES * work));
+    (start - own <= OPENING_BACKLOG_CAP_DAA).then_some(start)
+}
+
+/// Serving work of one request under the node's v3 window. MUST equal the node's `service_work_daa`.
+pub fn service_work_daa(tier: u8, n_prompt: u32, generated: u32) -> u64 {
+    const RATE: [u64; 5] = [90, 180, 85, 70, 35];
+    const MAX_TOKENS_CAP: u32 = 4_096;
+    let rate = RATE[(tier as usize).min(RATE.len() - 1)];
+    2 * (n_prompt as u64).div_ceil(100) + (rate * generated.min(MAX_TOKENS_CAP) as u64).div_ceil(100)
+}
+
 /// Window the first opening of an attention audit adds for its prompt; matches the node.
 pub fn attn_first_prompt_daa(n_prompt: u32) -> u64 {
     const REPLAYS: u64 = 3;
@@ -1173,6 +1192,16 @@ pub fn opening_signature_message(body: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadlines_chain_behind_the_open_audits_of_the_key() {
+        let work = service_work_daa(0, 0, 4_096);
+        assert_eq!(chained_deadline(5_000, &[], 100, work), Some(5_000));
+        assert_eq!(chained_deadline(5_000, &[90], 100, work), Some(5_000), "a closed or missed audit no longer counts");
+        assert_eq!(chained_deadline(5_000, &[4_000], 100, work), Some(4_000 + OPEN_AUDIT_WORK_PASSES * work));
+        let far = 5_000 + OPENING_BACKLOG_CAP_DAA;
+        assert_eq!(chained_deadline(5_000, &[far], 100, work), None);
+    }
 
     #[test]
     fn work_follows_the_node_rates() {
