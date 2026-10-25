@@ -75,7 +75,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
  
  #define QS_CHUNK_START 1u
  #define QS_CHUNK_END   2u
-@@ -335,6 +336,10 @@
+@@ -335,6 +336,11 @@
      uint32_t    ub_tokens = 0;
      std::unordered_set<uint32_t> seen;
      bool        overflow = false;
@@ -83,10 +83,11 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
 +    size_t      lse_cap = 0;
 +    int         lse_layer = -1;
 +    uint32_t    lse_heads = 0, lse_tokens = 0;
++    std::vector<uint64_t> lse_pos;  // by layer index
  };
  
  static qs_dev     qs_devs[QS_MAX_DEVICES];
-@@ -498,9 +503,62 @@
+@@ -498,9 +504,63 @@
      return false;
  }
  
@@ -136,6 +137,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
 +    qs_lse_gather<<<(n + 255)/256, 256, 0, stream>>>(s.lse, s.lse_heads, s.lse_tokens, g, (float *) s.scratch);
 +    const uint32_t len = s.lse_tokens*g*sizeof(float);
 +    qs_append<<<L.heads, 128, 0, stream>>>(s.streams, 2*s.seq_heads*(s.n_attn + s.n_recur) + L.slot*s.seq_heads, 1, s.scratch, len, len, s.d_caps, s.n_caps);
++    s.lse_pos[il] += s.lse_tokens;
 +    s.lse_layer = -1;
 +}
 +
@@ -150,7 +152,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
          return;
      }
      if (node->op == GGML_OP_SET_ROWS) {
-@@ -515,6 +573,7 @@
+@@ -515,6 +575,7 @@
  }
  
  static void qs_free(qs_dev & s) {
@@ -158,7 +160,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
      cudaFree(s.streams);
      cudaFree(s.scratch);
      cudaFree(s.ckpt);
-@@ -559,8 +618,11 @@
+@@ -559,8 +620,11 @@
      s.seq_heads = seq_heads;
      s.interval = interval;
      s.max_tokens = max_tokens;
@@ -172,7 +174,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
          || cudaMalloc(&s.scratch, std::max<size_t>(scratch, 4)) != cudaSuccess
          || cudaMalloc(&s.ckpt, std::max<size_t>(ckpt, 4)) != cudaSuccess
          || cudaMalloc(&s.roots, (size_t) s.n_leaves*32) != cudaSuccess
-@@ -570,6 +632,7 @@
+@@ -570,6 +634,7 @@
      }
      s.scratch_bytes = scratch;
      s.ckpt_bytes = ckpt;
@@ -180,11 +182,25 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
      s.on = true;
      return 0;
  }
-@@ -596,6 +659,7 @@
+@@ -596,6 +661,8 @@
      s.ub_tokens = 0;
      s.seen.clear();
      s.overflow = false;
 +    s.lse_layer = -1;
++    s.lse_pos.assign(s.layer.size(), 0);
      if (cudaMemset(s.streams, 0, (size_t) s.n_leaves*sizeof(qs_stream)) != cudaSuccess) {
+         return -2;
+     }
+@@ -624,6 +691,12 @@
+     if (s.overflow) {
+         return -4;
+     }
++    for (size_t il = 0; il < s.layer.size(); ++il) {
++        const uint32_t kind = s.layer[il].kind;
++        if ((kind == Q8S_ATTN || kind == Q8S_MLA) && (il >= s.lse_pos.size() || s.lse_pos[il] != s.pos + s.ub_tokens)) {
++            return -4;
++        }
++    }
+     if (out_cap < (size_t) s.n_leaves*32) {
          return -2;
      }
