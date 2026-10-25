@@ -136,9 +136,9 @@ const NODE_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(9
 const REPLAY_URGENT_BASE_DAA: u64 = 1_500;
 /// A chain rebuild answer of at least this many blocks is continued from its last block.
 const CHAIN_RESTORE_PAGE_MIN: usize = 100;
-/// First delay before a failed chain rebuild is retried, doubled at each failure up to the max.
 /// Longest an accepted response waits for its draw to be rebuilt; matches the node's ledger horizon.
 const TRACE_UNDRAWN_LIMIT_DAA: u64 = 72_000;
+/// First delay before a failed chain rebuild is retried, doubled at each failure up to the max.
 const CHAIN_RESTORE_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(5);
 const CHAIN_RESTORE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -1010,6 +1010,9 @@ impl KeryxdHandler {
                 // outpoint is never tracked and the inference_reward is never claimed.
                 if inference_reward > 0 {
                     if let Some(txid) = txid_hex {
+                        if self.ai_request_txids.len() >= MAX_AI_SEEN_IDS {
+                            self.ai_request_txids.clear();
+                        }
                         self.ai_request_txids.insert(stable_id, (txid, inference_reward));
                     }
                 }
@@ -1445,9 +1448,14 @@ impl KeryxdHandler {
             });
         }
         self.persist_trace(response_txid);
-        for (_, rpc_tx) in txs {
-            if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
+        for (i, (_, rpc_tx)) in txs.iter().enumerate() {
+            if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx.clone())).await {
                 warn!("Trace: failed to send the opening tx: {}", e);
+                for (_, unsent) in &txs[i..] {
+                    if let Some(o) = Self::compute_rpc_txid(unsent).and_then(|t| self.opening_inflight.get_mut(&t)) {
+                        o.attempts = 0;
+                    }
+                }
                 break;
             }
         }
@@ -1761,12 +1769,12 @@ impl KeryxdHandler {
         }
     }
 
-    /// Fetches the queued chain blocks a few at a time until every restored trace is drawn.
     /// Whether a pending trace still waits for chain blocks to draw it.
     fn restore_needed(&self) -> bool {
         self.pending_traces.values().any(|p| (p.accepted_hash.is_some() && p.draw.is_none()) || p.attn.as_ref().is_some_and(|a| a.awaiting_draw().is_some()))
     }
 
+    /// Fetches the queued chain blocks a few at a time until every restored trace is drawn.
     async fn chain_restore_pump(&mut self) -> Result<(), Error> {
         if !self.restore_needed() {
             self.chain_restore_queue.clear();
