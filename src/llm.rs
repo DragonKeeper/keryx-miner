@@ -1069,11 +1069,14 @@ fn open_attention(
     };
     verify(&op).map_err(|e| format!("attention phase {e:?} at layer {}, position {}, path {path:?}", d.layer, d.t))?;
     let body = op.encode();
-    if body.len() > keryx_verifiable_inference::opening::MAX_BODY_LEN {
+    if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
         return Err(format!("attention opening of {} B over the cap", body.len()));
     }
     Ok(body)
 }
+
+/// Bytes the seeded envelope adds to an opening body.
+const SEEDED_OVERHEAD: usize = 33;
 
 /// The recurrent opening of the draw of `seed`, checked as the node checks it.
 #[allow(clippy::too_many_arguments)]
@@ -1098,7 +1101,7 @@ fn open_recurrent(
     keryx_verifiable_inference::recur::verify_recur_point(&m.tier_ctx(index), &ctx, &seq_response_ctx(rec, seq), seed, &op)
         .map_err(|e| format!("recurrent point {e:?} at layer {}, segment {}", d.layer, d.segment))?;
     let body = op.encode();
-    if body.len() > keryx_verifiable_inference::opening::MAX_BODY_LEN {
+    if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
         return Err(format!("recurrent opening of {} B over the cap", body.len()));
     }
     Ok(body)
@@ -1150,7 +1153,11 @@ fn open_chain(
         Some(seq) => {
             let mut o = keryx_verifiable_inference::opening::Opening::decode(&body).ok_or("undecodable stage-2 opening")?;
             o.roots = Some((rec.trace_root, seq.root));
-            Ok(o.encode())
+            let body = o.encode();
+            if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
+                return Err(format!("stage-2 opening of {} B over the cap", body.len()));
+            }
+            Ok(body)
         }
         None => Ok(body),
     }
