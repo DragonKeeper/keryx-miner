@@ -585,6 +585,13 @@ pub fn opening_window_daa(tier: u8, max_tokens: u32) -> u64 {
     BASE_DAA + max_tokens.min(MAX_TOKENS_CAP) as u64 * per_token_daa
 }
 
+/// Window the first opening of an attention audit adds for its prompt; matches the node.
+pub fn attn_first_prompt_daa(n_prompt: u32) -> u64 {
+    const REPLAYS: u64 = 3;
+    const MAX_PROMPT: u32 = 131_072;
+    REPLAYS * (n_prompt.min(MAX_PROMPT) as u64 / 10)
+}
+
 /// One drawn point: the manifest entry, the gate of its pair, the position and the output row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointSpec {
@@ -788,7 +795,7 @@ pub fn build_prefix_point(m: &TierManifest, rec: &TraceRecord, ctx: &PrefixCtx, 
 /// Encoded opening body, `None` above the consensus size cap.
 pub fn opening_body(response_txid: [u8; 32], points: Vec<Point>, prefix: Option<PrefixPoint>) -> Option<Vec<u8>> {
     let body = Opening { response_txid, points, prefix, links: Vec::new(), experts: Vec::new(), resid: None, roots: None }.encode();
-    (body.len() <= opening::MAX_BODY_LEN).then_some(body)
+    (body.len() + 33 <= opening::MAX_BODY_LEN).then_some(body)
 }
 
 /// The residual point of a stage-2 draw.
@@ -1111,7 +1118,7 @@ pub fn chain_opening_body(
     let n = points.len();
     debug_assert_eq!(experts.len(), n);
     let body = Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: Some(resid), roots: None }.encode();
-    (body.len() <= opening::MAX_BODY_LEN).then_some(body)
+    (body.len() + 33 <= opening::MAX_BODY_LEN).then_some(body)
 }
 
 /// Checks a stage-2 opening body as the node does; `Err` names the failing part.
@@ -1150,6 +1157,8 @@ mod tests {
         assert_eq!(attn_phase_window_daa(4, 8_000, 0, 5_000), 19_384);
         assert_eq!(attn_phase_window_daa(3, 100, 2_000, 9_000), 3_500);
         assert_eq!(attn_phase_window_daa(4, u32::MAX, u32::MAX, u32::MAX), 16_107);
+        assert_eq!(attn_first_prompt_daa(30_000), 9_000);
+        assert_eq!(attn_first_prompt_daa(u32::MAX), 39_321);
     }
 
     #[test]
