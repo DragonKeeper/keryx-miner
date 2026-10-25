@@ -496,12 +496,13 @@ pub fn audited(seed: &Hash) -> bool {
 pub fn attn_phase_window_daa(tier: u8, max_tokens: u32, n_prompt: u32, n_pos: u32) -> u64 {
     const BASE_DAA: u64 = 3_000;
     const MAX_TOKENS_CAP: u32 = 4_096;
+    const MAX_PROMPT: u32 = 131_072;
     let per_token: u64 = match tier {
         0..=2 => 2,
         3 => 3,
         _ => 4,
     };
-    BASE_DAA + n_prompt as u64 / 10 + n_pos.saturating_sub(n_prompt).min(max_tokens.min(MAX_TOKENS_CAP)) as u64 * per_token
+    BASE_DAA + n_prompt.min(MAX_PROMPT) as u64 / 10 + n_pos.saturating_sub(n_prompt).min(max_tokens.min(MAX_TOKENS_CAP)) as u64 * per_token
 }
 const ATTN_CHILD_DOMAIN: &[u8] = b"KeryxAttnChildV1";
 
@@ -1148,6 +1149,7 @@ mod tests {
         assert_eq!(attn_phase_window_daa(2, 1_000, 30_000, 30_900), 7_800);
         assert_eq!(attn_phase_window_daa(4, 8_000, 0, 5_000), 19_384);
         assert_eq!(attn_phase_window_daa(3, 100, 2_000, 9_000), 3_500);
+        assert_eq!(attn_phase_window_daa(4, u32::MAX, u32::MAX, u32::MAX), 16_107);
     }
 
     #[test]
