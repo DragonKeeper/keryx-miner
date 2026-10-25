@@ -2324,6 +2324,7 @@ mod h15_gate_tests {
             trace_audit_activation_daa(),
             trace_chain_activation_daa(),
             trace_seed_bind_activation_daa(),
+            attention_activation_daa(),
         ] {
             assert_eq!(g, H15_ACTIVATION_DAA);
         }

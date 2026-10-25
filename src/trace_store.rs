@@ -61,6 +61,8 @@ pub struct StoredTrace {
     pub attn: Option<StoredAttn>,
     /// Last chain block known when the response was submitted.
     pub anchor_hash: Option<String>,
+    /// Measured duration of the generation, in seconds.
+    pub gen_secs: Option<f64>,
 }
 
 #[derive(BorshDeserialize)]
@@ -93,6 +95,7 @@ impl From<V4StoredTrace> for StoredTrace {
             trace: t.trace,
             attn: t.attn,
             anchor_hash: None,
+            gen_secs: None,
         }
     }
 }
@@ -126,6 +129,7 @@ impl From<V3StoredTrace> for StoredTrace {
             trace: t.trace,
             attn: None,
             anchor_hash: None,
+            gen_secs: None,
         }
     }
 }
@@ -165,6 +169,7 @@ impl From<LegacyStoredTrace> for StoredTrace {
             trace: crate::trace::ResponseTrace { record: t.trace.record, tokens: t.trace.tokens, seq: None },
             attn: None,
             anchor_hash: None,
+            gen_secs: None,
         }
     }
 }
@@ -200,6 +205,7 @@ pub struct StoredTraceRef<'a> {
     pub trace: &'a crate::trace::ResponseTrace,
     pub attn: &'a Option<StoredAttn>,
     pub anchor_hash: &'a Option<String>,
+    pub gen_secs: Option<f64>,
 }
 
 impl<'a> StoredTraceRef<'a> {
@@ -221,6 +227,7 @@ pub struct StoredTraceOwned {
     pub trace: Arc<crate::trace::ResponseTrace>,
     pub attn: Option<StoredAttn>,
     pub anchor_hash: Option<String>,
+    pub gen_secs: Option<f64>,
 }
 
 impl StoredTraceOwned {
@@ -238,6 +245,7 @@ impl StoredTraceOwned {
             trace: &self.trace,
             attn: &self.attn,
             anchor_hash: &self.anchor_hash,
+            gen_secs: self.gen_secs,
         }
     }
 }
@@ -384,6 +392,7 @@ mod tests {
             trace: &trace,
             attn: &attn,
             anchor_hash: &Some("0a".into()),
+            gen_secs: Some(12.5),
         };
         store.save(&rec).unwrap();
         let loaded = store.load_all();
@@ -397,6 +406,7 @@ mod tests {
         assert_eq!(t.trace.record.trace_root, trace.record.trace_root);
         assert_eq!(t.attn, attn);
         assert_eq!(t.anchor_hash.as_deref(), Some("0a"));
+        assert_eq!(t.gen_secs, Some(12.5));
         store.remove("deadbeef");
         assert!(store.load_all().is_empty());
         let _ = fs::remove_dir_all(&dir);
@@ -420,6 +430,7 @@ mod tests {
             trace: Arc::clone(&trace),
             attn: None,
             anchor_hash: anchor.map(Into::into),
+            gen_secs: None,
         };
         store.save_queued(owned("aa", Some("01")));
         store.remove("aa");
@@ -498,6 +509,7 @@ mod tests {
             trace: &trace,
             attn: &None,
             anchor_hash: &None,
+            gen_secs: None,
         };
         store.save(&rec).unwrap();
         #[derive(BorshSerialize)]
