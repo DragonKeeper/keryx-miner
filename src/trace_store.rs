@@ -5,8 +5,11 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, OnceLock};
 
-const STORE_VERSION: u32 = 4;
+const STORE_VERSION: u32 = 5;
+/// Records written before the chain anchor: read and kept, without it.
+const V4_VERSION: u32 = 4;
 /// Records written before attention phases: read and kept, without them.
 const V3_VERSION: u32 = 3;
 /// Records written before sequence leaves: read and kept, without them.
@@ -56,6 +59,42 @@ pub struct StoredTrace {
     pub opening: Option<StoredOpening>,
     pub trace: crate::trace::ResponseTrace,
     pub attn: Option<StoredAttn>,
+    /// Last chain block known when the response was submitted.
+    pub anchor_hash: Option<String>,
+}
+
+#[derive(BorshDeserialize)]
+struct V4StoredTrace {
+    version: u32,
+    response_txid: String,
+    model_id: [u8; 32],
+    tier: u8,
+    request_hash: [u8; 32],
+    max_tokens: u32,
+    submitted_daa: u64,
+    accepted_hash: Option<String>,
+    opening: Option<StoredOpening>,
+    trace: crate::trace::ResponseTrace,
+    attn: Option<StoredAttn>,
+}
+
+impl From<V4StoredTrace> for StoredTrace {
+    fn from(t: V4StoredTrace) -> Self {
+        Self {
+            version: STORE_VERSION,
+            response_txid: t.response_txid,
+            model_id: t.model_id,
+            tier: t.tier,
+            request_hash: t.request_hash,
+            max_tokens: t.max_tokens,
+            submitted_daa: t.submitted_daa,
+            accepted_hash: t.accepted_hash,
+            opening: t.opening,
+            trace: t.trace,
+            attn: t.attn,
+            anchor_hash: None,
+        }
+    }
 }
 
 #[derive(BorshDeserialize)]
@@ -86,6 +125,7 @@ impl From<V3StoredTrace> for StoredTrace {
             opening: t.opening,
             trace: t.trace,
             attn: None,
+            anchor_hash: None,
         }
     }
 }
@@ -124,6 +164,7 @@ impl From<LegacyStoredTrace> for StoredTrace {
             opening: t.opening.map(|o| StoredOpening { seed_hash: o.seed_hash, deadline_daa: o.deadline_daa, payload: o.payload, extra: Vec::new() }),
             trace: crate::trace::ResponseTrace { record: t.trace.record, tokens: t.trace.tokens, seq: None },
             attn: None,
+            anchor_hash: None,
         }
     }
 }
@@ -131,11 +172,14 @@ impl From<LegacyStoredTrace> for StoredTrace {
 fn decode(b: &[u8]) -> Result<StoredTrace, String> {
     match StoredTrace::try_from_slice(b) {
         Ok(t) => Ok(t),
-        Err(e) => match V3StoredTrace::try_from_slice(b) {
-            Ok(t) if t.version == V3_VERSION => Ok(t.into()),
-            _ => match LegacyStoredTrace::try_from_slice(b) {
-                Ok(t) if t.version == LEGACY_VERSION => Ok(t.into()),
-                _ => Err(e.to_string()),
+        Err(e) => match V4StoredTrace::try_from_slice(b) {
+            Ok(t) if t.version == V4_VERSION => Ok(t.into()),
+            _ => match V3StoredTrace::try_from_slice(b) {
+                Ok(t) if t.version == V3_VERSION => Ok(t.into()),
+                _ => match LegacyStoredTrace::try_from_slice(b) {
+                    Ok(t) if t.version == LEGACY_VERSION => Ok(t.into()),
+                    _ => Err(e.to_string()),
+                },
             },
         },
     }
@@ -155,12 +199,96 @@ pub struct StoredTraceRef<'a> {
     pub opening: &'a Option<StoredOpening>,
     pub trace: &'a crate::trace::ResponseTrace,
     pub attn: &'a Option<StoredAttn>,
+    pub anchor_hash: &'a Option<String>,
 }
 
 impl<'a> StoredTraceRef<'a> {
     pub fn version() -> u32 {
         STORE_VERSION
     }
+}
+
+/// [`StoredTrace`] owned, for a queued write.
+pub struct StoredTraceOwned {
+    pub response_txid: String,
+    pub model_id: [u8; 32],
+    pub tier: u8,
+    pub request_hash: [u8; 32],
+    pub max_tokens: u32,
+    pub submitted_daa: u64,
+    pub accepted_hash: Option<String>,
+    pub opening: Option<StoredOpening>,
+    pub trace: Arc<crate::trace::ResponseTrace>,
+    pub attn: Option<StoredAttn>,
+    pub anchor_hash: Option<String>,
+}
+
+impl StoredTraceOwned {
+    fn record(&self) -> StoredTraceRef<'_> {
+        StoredTraceRef {
+            version: STORE_VERSION,
+            response_txid: &self.response_txid,
+            model_id: &self.model_id,
+            tier: self.tier,
+            request_hash: &self.request_hash,
+            max_tokens: self.max_tokens,
+            submitted_daa: self.submitted_daa,
+            accepted_hash: &self.accepted_hash,
+            opening: &self.opening,
+            trace: &self.trace,
+            attn: &self.attn,
+            anchor_hash: &self.anchor_hash,
+        }
+    }
+}
+
+enum Job {
+    Save(PathBuf, Box<StoredTraceOwned>),
+    Remove(PathBuf),
+    Flush(mpsc::Sender<()>),
+}
+
+/// The process-wide writer: one thread applies every queued write and removal in order.
+fn writer() -> &'static mpsc::Sender<Job> {
+    static WRITER: OnceLock<mpsc::Sender<Job>> = OnceLock::new();
+    WRITER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("trace-store".into())
+            .spawn(move || {
+                for job in rx {
+                    match job {
+                        Job::Save(dir, rec) => {
+                            if let Err(e) = write_record(&dir, &rec.record()) {
+                                log::warn!("Trace: cannot persist response {}: {}", rec.response_txid, e);
+                            }
+                        }
+                        Job::Remove(path) => {
+                            let _ = fs::remove_file(path);
+                        }
+                        Job::Flush(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            })
+            .expect("trace store writer thread");
+        tx
+    })
+}
+
+/// Writes the record atomically: temporary file, sync, rename.
+fn write_record(dir: &Path, record: &StoredTraceRef) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let bytes = borsh::to_vec(record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let path = dir.join(format!("{}.{}", record.response_txid, FILE_EXT));
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        io::Write::write_all(&mut f, &bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)
 }
 
 pub struct TraceStore {
@@ -181,26 +309,33 @@ impl TraceStore {
         self.dir.join(format!("{}.{}", txid, FILE_EXT))
     }
 
-    /// Writes the record atomically: temporary file, sync, rename.
+    /// Writes the record now.
     pub fn save(&self, record: &StoredTraceRef) -> io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
-        let bytes = borsh::to_vec(record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let path = self.path(record.response_txid);
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f = fs::File::create(&tmp)?;
-            io::Write::write_all(&mut f, &bytes)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &path)
+        write_record(&self.dir, record)
     }
 
+    /// Queues the record for the writer thread.
+    pub fn save_queued(&self, record: StoredTraceOwned) {
+        let _ = writer().send(Job::Save(self.dir.clone(), Box::new(record)));
+    }
+
+    /// Queues the removal of a record behind the writes already queued.
     pub fn remove(&self, txid: &str) {
-        let _ = fs::remove_file(self.path(txid));
+        let _ = writer().send(Job::Remove(self.path(txid)));
     }
 
-    /// Every readable record; unreadable files are dropped with a warning.
+    /// Waits until every queued write and removal is applied.
+    pub fn flush(&self) {
+        let (done, wait) = mpsc::channel();
+        if writer().send(Job::Flush(done)).is_ok() {
+            let _ = wait.recv();
+        }
+    }
+
+    /// Every readable record, once the queued writes are applied; unreadable files are dropped
+    /// with a warning.
     pub fn load_all(&self) -> Vec<StoredTrace> {
+        self.flush();
         let mut out = Vec::new();
         let Ok(entries) = fs::read_dir(&self.dir) else { return out };
         for entry in entries.flatten() {
@@ -248,6 +383,7 @@ mod tests {
             opening: &opening,
             trace: &trace,
             attn: &attn,
+            anchor_hash: &Some("0a".into()),
         };
         store.save(&rec).unwrap();
         let loaded = store.load_all();
@@ -260,8 +396,71 @@ mod tests {
         assert_eq!(t.trace.tokens, trace.tokens);
         assert_eq!(t.trace.record.trace_root, trace.record.trace_root);
         assert_eq!(t.attn, attn);
+        assert_eq!(t.anchor_hash.as_deref(), Some("0a"));
         store.remove("deadbeef");
         assert!(store.load_all().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queued_writes_apply_in_order_and_v4_records_still_load() {
+        let dir = std::env::temp_dir().join(format!("keryx-trace-store-queue-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = TraceStore { dir: dir.clone() };
+        let trace = Arc::new(crate::trace::ResponseTrace::test_sample());
+        let owned = |txid: &str, anchor: Option<&str>| StoredTraceOwned {
+            response_txid: txid.into(),
+            model_id: [1u8; 32],
+            tier: 1,
+            request_hash: [2u8; 32],
+            max_tokens: 16,
+            submitted_daa: 3,
+            accepted_hash: None,
+            opening: None,
+            trace: Arc::clone(&trace),
+            attn: None,
+            anchor_hash: anchor.map(Into::into),
+        };
+        store.save_queued(owned("aa", Some("01")));
+        store.remove("aa");
+        store.remove("bb");
+        store.save_queued(owned("bb", Some("02")));
+        store.save_queued(owned("bb", Some("03")));
+        #[derive(BorshSerialize)]
+        struct V4Ref<'a> {
+            version: u32,
+            response_txid: &'a str,
+            model_id: [u8; 32],
+            tier: u8,
+            request_hash: [u8; 32],
+            max_tokens: u32,
+            submitted_daa: u64,
+            accepted_hash: Option<String>,
+            opening: Option<StoredOpening>,
+            trace: &'a crate::trace::ResponseTrace,
+            attn: Option<StoredAttn>,
+        }
+        let attn = Some(StoredAttn { bodies: vec![vec![1]], payload: "ab".into(), deadline_daa: 9, accepted_hash: None });
+        let v4 = V4Ref {
+            version: V4_VERSION,
+            response_txid: "cc",
+            model_id: [1u8; 32],
+            tier: 2,
+            request_hash: [2u8; 32],
+            max_tokens: 16,
+            submitted_daa: 1,
+            accepted_hash: Some("ee".into()),
+            opening: None,
+            trace: &trace,
+            attn: attn.clone(),
+        };
+        store.flush();
+        fs::write(store.path("cc"), borsh::to_vec(&v4).unwrap()).unwrap();
+        let mut loaded = store.load_all();
+        loaded.sort_by(|a, b| a.response_txid.cmp(&b.response_txid));
+        assert_eq!(loaded.iter().map(|t| t.response_txid.as_str()).collect::<Vec<_>>(), vec!["bb", "cc"]);
+        assert_eq!(loaded[0].anchor_hash.as_deref(), Some("03"));
+        assert_eq!((loaded[1].version, loaded[1].anchor_hash.is_none(), &loaded[1].attn), (STORE_VERSION, true, &attn));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -298,6 +497,7 @@ mod tests {
             opening: &None,
             trace: &trace,
             attn: &None,
+            anchor_hash: &None,
         };
         store.save(&rec).unwrap();
         #[derive(BorshSerialize)]

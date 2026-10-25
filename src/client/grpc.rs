@@ -136,8 +136,9 @@ const NODE_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(9
 const REPLAY_URGENT_BASE_DAA: u64 = 1_500;
 /// A chain rebuild answer of at least this many blocks is continued from its last block.
 const CHAIN_RESTORE_PAGE_MIN: usize = 100;
-/// Failed chain rebuilds from one accepting block before its response is dropped.
-const CHAIN_RESTORE_MAX_FAILURES: u32 = 3;
+/// First delay before a failed chain rebuild is retried, doubled at each failure up to the max.
+const CHAIN_RESTORE_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(5);
+const CHAIN_RESTORE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Failed replays of one draw before it is given up.
 const REPLAY_MAX_FAILURES: u32 = 2;
@@ -172,6 +173,7 @@ struct InferenceJob {
     model_id: [u8; 32],
     tier: Option<u8>,
     max_tokens: u32,
+    started: std::time::Instant,
     /// `None`: the inference failed, no AiResponse is submitted.
     rx: oneshot::Receiver<Option<keryx_miner::llm::Generated>>,
 }
@@ -182,6 +184,8 @@ struct TraceContext {
     tier: u8,
     max_tokens: u32,
     trace: keryx_miner::trace::ResponseTrace,
+    /// Measured duration of the generation, in seconds.
+    gen_secs: f64,
 }
 
 /// An AI request read from a transaction: raw payload, model id, prompt, plaintext prompt length,
@@ -198,6 +202,10 @@ struct PendingTrace {
     submitted_daa: u64,
     /// Chain block that accepted the response.
     accepted_hash: Option<String>,
+    /// Last chain block known when the response was submitted.
+    anchor_hash: Option<String>,
+    /// Measured duration of its generation, in seconds; unknown once restored.
+    gen_secs: Option<f64>,
     draw: Option<TraceDraw>,
     /// Opening already built and submitted for this response.
     opening: Option<keryx_miner::trace_store::StoredOpening>,
@@ -356,6 +364,7 @@ struct ReplayJob {
     seed_hash: String,
     /// Path of the attention phase it builds; `None` for the first opening.
     path: Option<Vec<u64>>,
+    started: std::time::Instant,
     rx: oneshot::Receiver<Option<Vec<u8>>>,
 }
 
@@ -499,6 +508,8 @@ pub struct KeryxdHandler {
     chain_restore_starts: VecDeque<String>,
     /// Failed chain rebuilds, by accepting block.
     chain_restore_failures: std::collections::HashMap<String, u32>,
+    /// Failed chain rebuilds waiting for their retry.
+    chain_restore_retry: Vec<(std::time::Instant, String)>,
 
     /// In-flight replay building an opening.
     replay_rx: Option<ReplayJob>,
@@ -619,6 +630,7 @@ impl Client for KeryxdHandler {
                     self.retry_pending_ai_responses().await?;
                     self.prune_traces();
                     self.retry_pending_openings().await?;
+                    self.retry_chain_restores().await?;
                     self.try_start_replay(miner).await?;
                 }
             }
@@ -725,6 +737,7 @@ impl KeryxdHandler {
             chain_restore_pending: std::collections::HashSet::new(),
             chain_restore_starts: VecDeque::new(),
             chain_restore_failures: std::collections::HashMap::new(),
+            chain_restore_retry: Vec::new(),
             replay_rx: None,
             opening_inflight: restored_openings,
             publish_rx: None,
@@ -748,7 +761,7 @@ impl KeryxdHandler {
         Ok(handler)
     }
 
-    /// Takes over the request queue and in-flight inference of the previous connection.
+    /// Takes over the request queue and in-flight work of the previous connection.
     fn restore_parked(&mut self) {
         let Some(parked) = PARKED.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
         for entry in parked.queue {
@@ -760,6 +773,12 @@ impl KeryxdHandler {
             self.ai_seen_prefixes.insert(job.stable_id.clone());
             self.inference_rx = Some(job);
         }
+        if let Some(job) = parked.replay {
+            info!("Trace: resuming the replay of response {} across the reconnect", job.response_txid);
+            self.replay_rx = Some(job);
+        }
+        self.publish_rx = parked.publish;
+        self.ai_response_inflight.extend(parked.responses);
     }
 
     fn create_block_channel(
@@ -788,8 +807,9 @@ impl KeryxdHandler {
         )
     }
 
+    /// Sends to the node; a channel still full after the silence limit fails like a closed one.
     async fn client_send(&self, msg: impl Into<KaspadMessage>) -> Result<(), SendError<KaspadMessage>> {
-        self.send_channel.send(msg.into()).await
+        self.send_channel.send_timeout(msg.into(), NODE_SILENCE_LIMIT).await.map_err(|e| SendError(e.into_inner()))
     }
 
     async fn client_get_block_template(&mut self) -> Result<(), SendError<KaspadMessage>> {
@@ -1104,22 +1124,35 @@ impl KeryxdHandler {
         self.inference_rx.is_some() || self.challenge_inference_rx.is_some() || self.replay_rx.is_some()
     }
 
-    /// Whether an audit replay must start before the next request: its deadline leaves no more
-    /// than its estimated cost.
-    fn urgent_replay(&self) -> bool {
+    /// Estimated duration of the next queued request, in DAA.
+    fn next_request_work(&self) -> u64 {
+        let Some((_, _, model_id, _, prompt_len, max_tokens, _)) = self.ai_request_queue.front() else { return 0 };
+        let tier = keryx_miner::models::pom_tier_index(model_id, self.last_known_daa).unwrap_or(u8::MAX);
+        speeds::generation_daa(model_id, *max_tokens as u32).unwrap_or_else(|| keryx_miner::trace::work_daa(tier, *prompt_len, *max_tokens as u32, 1))
+    }
+
+    /// Whether an audit replay must start before a request of `next_work` DAA: its deadline
+    /// leaves no more than both durations.
+    fn urgent_replay(&self, next_work: u64) -> bool {
         let now = self.last_known_daa;
         self.pending_traces.values().any(|p| {
             let Some(d) = p.draw.as_ref().filter(|d| d.audited) else { return false };
-            let n = p.trace.record.n_pos as u64;
+            let r = &p.trace.record;
+            let n_gen = r.n_pos.saturating_sub(r.n_prompt);
+            let work = |phase: bool| {
+                let replay = speeds::replay_daa(&p.model_id, phase, p.gen_secs, n_gen)
+                    .unwrap_or_else(|| keryx_miner::trace::work_daa(p.tier, r.n_prompt, n_gen, if phase { 2 } else { 3 }));
+                REPLAY_URGENT_BASE_DAA + next_work + replay
+            };
             if !d.opened {
-                return d.deadline_daa.saturating_sub(now) <= REPLAY_URGENT_BASE_DAA + 3 * n / 10;
+                return d.deadline_daa.saturating_sub(now) <= work(false);
             }
-            p.attn.as_ref().filter(|a| a.ready()).is_some_and(|a| a.deadline_daa.saturating_sub(now) <= REPLAY_URGENT_BASE_DAA + 2 * n / 10)
+            p.attn.as_ref().filter(|a| a.ready()).is_some_and(|a| a.deadline_daa.saturating_sub(now) <= work(true))
         })
     }
 
     fn try_start_inference(&mut self) {
-        if self.inference_busy() || keryx_miner::llm::probe_in_flight() || self.urgent_replay() {
+        if self.inference_busy() || keryx_miner::llm::probe_in_flight() || self.urgent_replay(self.next_request_work()) {
             return;
         }
         while self.ai_request_queue.front().is_some_and(|(sid, ..)| self.ai_answered_by_me.contains(sid)) {
@@ -1134,7 +1167,16 @@ impl KeryxdHandler {
             let chain = keryx_miner::trace::chain_active(self.last_known_daa);
             let attention = chain && keryx_miner::trace::attention_active(self.last_known_daa);
             let unreadable = matches!(private, Some(PrivateRequest::Unreadable));
-            let job = InferenceJob { stable_id: stable_id.clone(), request_hash, private, model_id, tier, max_tokens: max_tokens as u32, rx: rx_done };
+            let job = InferenceJob {
+                stable_id: stable_id.clone(),
+                request_hash,
+                private,
+                model_id,
+                tier,
+                max_tokens: max_tokens as u32,
+                started: std::time::Instant::now(),
+                rx: rx_done,
+            };
             if unreadable {
                 // No inference to run: the answer is the fixed error text.
                 let _ = tx_done.send(Some(keryx_miner::llm::Generated { text: UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string(), trace: None }));
@@ -1206,7 +1248,7 @@ impl KeryxdHandler {
             info!("Trace: response {} audited at chain block {} — opening already built", txid, seed_hash);
             self.submit_opening(&txid, &seed_hash, body).await;
         }
-        if self.inference_busy() || self.publish_rx.is_some() || (!self.ai_request_queue.is_empty() && !self.urgent_replay()) || keryx_miner::llm::probe_in_flight() {
+        if self.inference_busy() || self.publish_rx.is_some() || (!self.ai_request_queue.is_empty() && !self.urgent_replay(self.next_request_work())) || keryx_miner::llm::probe_in_flight() {
             return Ok(());
         }
         let first = self.pending_traces.iter().filter_map(|(txid, p)| {
@@ -1242,7 +1284,7 @@ impl KeryxdHandler {
             let body = keryx_miner::llm::open_trace(&model_id, tier, &trace, &seed, txid_bytes, &request_hash, accepted_daa);
             let _ = tx_done.send(body);
         });
-        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: None, rx: rx_done });
+        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: None, started: std::time::Instant::now(), rx: rx_done });
         Ok(())
     }
 
@@ -1263,7 +1305,7 @@ impl KeryxdHandler {
             let body = keryx_miner::llm::open_attention_phase(&model_id, tier, &trace, &seed, txid_bytes, &job_path, &prev);
             let _ = tx_done.send(body);
         });
-        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: Some(path), rx: rx_done });
+        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: Some(path), started: std::time::Instant::now(), rx: rx_done });
         Ok(())
     }
 
@@ -1279,6 +1321,13 @@ impl KeryxdHandler {
             }
             Err(_) => None,
         };
+        if body.is_some() {
+            if let Some(p) = self.pending_traces.get(&job.response_txid) {
+                if let Some(base) = p.gen_secs {
+                    speeds::note_replay(&p.model_id, job.path.is_some(), job.started.elapsed().as_secs_f64() / base.max(0.001));
+                }
+            }
+        }
         if let Some(path) = job.path {
             self.on_attention_phase_built(&job.response_txid, &job.seed_hash, path, body).await;
             return true;
@@ -1464,23 +1513,19 @@ impl KeryxdHandler {
     /// Writes the on-disk copy of a pending trace.
     fn persist_trace(&self, txid: &str) {
         let Some(p) = self.pending_traces.get(txid) else { return };
-        let attn = p.attn.as_ref().map(AttnPhases::stored);
-        let record = keryx_miner::trace_store::StoredTraceRef {
-            version: keryx_miner::trace_store::StoredTraceRef::version(),
-            response_txid: txid,
-            model_id: &p.model_id,
+        self.trace_store.save_queued(keryx_miner::trace_store::StoredTraceOwned {
+            response_txid: txid.to_string(),
+            model_id: p.model_id,
             tier: p.tier,
-            request_hash: &p.request_hash,
+            request_hash: p.request_hash,
             max_tokens: p.max_tokens,
             submitted_daa: p.submitted_daa,
-            accepted_hash: &p.accepted_hash,
-            opening: &p.opening,
-            trace: &p.trace,
-            attn: &attn,
-        };
-        if let Err(e) = self.trace_store.save(&record) {
-            warn!("Trace: cannot persist response {}: {}", txid, e);
-        }
+            accepted_hash: p.accepted_hash.clone(),
+            opening: p.opening.clone(),
+            trace: Arc::clone(&p.trace),
+            attn: p.attn.as_ref().map(AttnPhases::stored),
+            anchor_hash: p.anchor_hash.clone(),
+        });
     }
 
     /// Loads the stored traces of a previous run and the openings they had already submitted.
@@ -1534,6 +1579,8 @@ impl KeryxdHandler {
                     trace: Arc::new(t.trace),
                     submitted_daa: t.submitted_daa,
                     accepted_hash: t.accepted_hash,
+                    anchor_hash: t.anchor_hash,
+                    gen_secs: None,
                     draw: None,
                     opening: t.opening,
                     built: Vec::new(),
@@ -1555,7 +1602,7 @@ impl KeryxdHandler {
             .pending_traces
             .values()
             .filter_map(|p| match (&p.draw, &p.attn) {
-                (None, _) => p.accepted_hash.clone(),
+                (None, _) => p.accepted_hash.clone().or_else(|| p.anchor_hash.clone()),
                 (Some(_), Some(a)) => a.accepted.iter().rev().flatten().find(|h| !h.is_empty()).cloned().or_else(|| p.accepted_hash.clone()),
                 (Some(_), None) => None,
             })
@@ -1599,26 +1646,37 @@ impl KeryxdHandler {
         self.chain_restore_queue.extend(unknown);
     }
 
-    /// Retries a failed chain rebuild from `start`; past the limit, drops the responses it
-    /// accepted.
+    /// Schedules a failed chain rebuild from `start` again, later each time; the responses it
+    /// serves are kept until their own windows close.
     fn on_chain_restore_failed(&mut self, start: String, error: &str) {
         let failures = self.chain_restore_failures.entry(start.clone()).or_insert(0);
         *failures += 1;
-        if *failures < CHAIN_RESTORE_MAX_FAILURES {
-            warn!("Trace: chain rebuild from block {} failed: {} — retrying", start, error);
-            self.chain_restore_starts.push_back(start);
-            return;
+        let delay = CHAIN_RESTORE_RETRY_BASE.saturating_mul(1 << (*failures - 1).min(4)).min(CHAIN_RESTORE_RETRY_MAX);
+        warn!("Trace: chain rebuild from block {} failed: {} — retrying in {} s", start, error, delay.as_secs());
+        self.chain_restore_retry.push((std::time::Instant::now() + delay, start));
+    }
+
+    /// Requeues the chain rebuilds whose retry is due while a pending response still needs them.
+    async fn retry_chain_restores(&mut self) -> Result<(), Error> {
+        let now = std::time::Instant::now();
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.chain_restore_retry).into_iter().partition(|(at, _)| *at <= now);
+        self.chain_restore_retry = later;
+        let idle = self.chain_restore_starts.is_empty();
+        for (_, start) in due {
+            let needed = self.pending_traces.values().any(|p| {
+                p.accepted_hash.as_ref().or(p.anchor_hash.as_ref()) == Some(&start)
+                    || p.attn.as_ref().is_some_and(|a| a.accepted.iter().flatten().any(|h| *h == start))
+            });
+            if needed {
+                self.chain_restore_starts.push_back(start);
+            } else {
+                self.chain_restore_failures.remove(&start);
+            }
         }
-        warn!("Trace: chain rebuild from block {} failed: {} — its responses are dropped", start, error);
-        self.chain_restore_failures.remove(&start);
-        let dropped: Vec<String> =
-            self.pending_traces.iter().filter(|(_, p)| p.accepted_hash.as_deref() == Some(start.as_str())).map(|(t, _)| t.clone()).collect();
-        for txid in dropped {
-            self.pending_traces.remove(&txid);
-            self.trace_store.remove(&txid);
-            self.opening_inflight.retain(|_, o| o.response_txid != txid);
+        if idle && !self.chain_restore_starts.is_empty() {
+            self.request_next_chain_restore().await?;
         }
-        self.chain_log.retain(|e| e.hash != start);
+        Ok(())
     }
 
     /// Notes the chain blocks accepting the last submitted attention phases; returns their
@@ -1947,10 +2005,14 @@ impl KeryxdHandler {
             info!("Inference: inference produced no result — AiResponse skipped");
             return true;
         };
-        let InferenceJob { request_hash, private, model_id, tier, max_tokens, .. } = job;
+        let InferenceJob { request_hash, private, model_id, tier, max_tokens, started, .. } = job;
         let result = generated.text;
+        let gen_secs = started.elapsed().as_secs_f64();
         let trace = match (generated.trace, tier) {
-            (Some(trace), Some(tier)) => Some(TraceContext { model_id, tier, max_tokens, trace }),
+            (Some(trace), Some(tier)) => {
+                speeds::note_generation(&model_id, trace.record.n_pos.saturating_sub(trace.record.n_prompt), gen_secs);
+                Some(TraceContext { model_id, tier, max_tokens, trace, gen_secs })
+            }
             _ => None,
         };
 
@@ -2082,6 +2144,8 @@ impl KeryxdHandler {
                     trace: Arc::new(t.trace),
                     submitted_daa: self.last_known_daa,
                     accepted_hash: None,
+                    anchor_hash: self.chain_log.back().map(|e| e.hash.clone()),
+                    gen_secs: Some(t.gen_secs),
                     draw: None,
                     opening: None,
                     built: Vec::new(),
@@ -2619,20 +2683,28 @@ impl KeryxdHandler {
 impl Drop for KeryxdHandler {
     fn drop(&mut self) {
         self.block_handle.abort();
-        let queue = std::mem::take(&mut self.ai_request_queue);
-        let inference = self.inference_rx.take();
-        if !queue.is_empty() || inference.is_some() {
-            *PARKED.lock().unwrap_or_else(|p| p.into_inner()) = Some(Parked { queue, inference });
+        let parked = Parked {
+            queue: std::mem::take(&mut self.ai_request_queue),
+            inference: self.inference_rx.take(),
+            replay: self.replay_rx.take(),
+            publish: self.publish_rx.take(),
+            responses: std::mem::take(&mut self.ai_response_inflight),
+        };
+        if !parked.queue.is_empty() || parked.inference.is_some() || parked.replay.is_some() || parked.publish.is_some() || !parked.responses.is_empty() {
+            *PARKED.lock().unwrap_or_else(|p| p.into_inner()) = Some(parked);
         }
     }
 }
 
 type QueuedRequest = (String, [u8; 32], [u8; 32], String, u32, usize, Option<PrivateRequest>);
 
-/// Request queue and in-flight inference left by a closed connection.
+/// Request queue and in-flight work left by a closed connection.
 struct Parked {
     queue: VecDeque<QueuedRequest>,
     inference: Option<InferenceJob>,
+    replay: Option<ReplayJob>,
+    publish: Option<PendingPublish>,
+    responses: std::collections::HashMap<String, (crate::proto::RpcTransaction, u32, std::time::Instant)>,
 }
 
 static PARKED: Mutex<Option<Parked>> = Mutex::new(None);
@@ -2654,6 +2726,101 @@ fn decode_private_prompt(bytes: &[u8]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&inflated).into_owned())
+}
+
+/// Generation and replay speeds measured on this rig, by model, for the life of the process.
+mod speeds {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// DAA scores per second of the network.
+    const DAA_PER_SEC: f64 = 10.0;
+    /// Weight of a new measurement in the running averages.
+    const EMA: f64 = 0.3;
+    /// Fewest generated tokens for a generation to update the speed.
+    const MIN_TOKENS: u32 = 32;
+    /// Replay over generation durations assumed before one is measured.
+    const FIRST_RATIO: f64 = 3.0;
+    const PHASE_RATIO: f64 = 2.0;
+
+    #[derive(Default, Clone, Copy)]
+    struct Speed {
+        secs_per_token: Option<f64>,
+        first_ratio: Option<f64>,
+        phase_ratio: Option<f64>,
+    }
+
+    static SPEEDS: Mutex<BTreeMap<[u8; 32], Speed>> = Mutex::new(BTreeMap::new());
+
+    fn ema(old: Option<f64>, new: f64) -> Option<f64> {
+        if !new.is_finite() || new <= 0.0 {
+            return old;
+        }
+        Some(old.map_or(new, |o| o + EMA * (new - o)))
+    }
+
+    fn get(model: &[u8; 32]) -> Speed {
+        SPEEDS.lock().unwrap_or_else(|p| p.into_inner()).get(model).copied().unwrap_or_default()
+    }
+
+    /// Records a generation of `n_gen` tokens that took `secs`.
+    pub(super) fn note_generation(model: &[u8; 32], n_gen: u32, secs: f64) {
+        if n_gen < MIN_TOKENS {
+            return;
+        }
+        let mut m = SPEEDS.lock().unwrap_or_else(|p| p.into_inner());
+        let s = m.entry(*model).or_default();
+        s.secs_per_token = ema(s.secs_per_token, secs / n_gen as f64);
+    }
+
+    /// Records a replay that took `ratio` times its generation.
+    pub(super) fn note_replay(model: &[u8; 32], phase: bool, ratio: f64) {
+        let ratio = ratio.clamp(0.05, 20.0);
+        let mut m = SPEEDS.lock().unwrap_or_else(|p| p.into_inner());
+        let s = m.entry(*model).or_default();
+        if phase {
+            s.phase_ratio = ema(s.phase_ratio, ratio);
+        } else {
+            s.first_ratio = ema(s.first_ratio, ratio);
+        }
+    }
+
+    /// Estimated duration of a generation of `n_gen` tokens, in DAA; `None` before a measure.
+    pub(super) fn generation_daa(model: &[u8; 32], n_gen: u32) -> Option<u64> {
+        get(model).secs_per_token.map(|s| (s * n_gen as f64 * DAA_PER_SEC).round() as u64)
+    }
+
+    /// Estimated duration of a replay of a response generated in `gen_secs` (or of `n_gen`
+    /// tokens when unknown), in DAA; `None` before a measure.
+    pub(super) fn replay_daa(model: &[u8; 32], phase: bool, gen_secs: Option<f64>, n_gen: u32) -> Option<u64> {
+        let s = get(model);
+        let base = gen_secs.or_else(|| s.secs_per_token.map(|t| t * n_gen.max(1) as f64))?;
+        let ratio = if phase { s.phase_ratio.unwrap_or(PHASE_RATIO) } else { s.first_ratio.unwrap_or(FIRST_RATIO) };
+        Some((base * ratio * DAA_PER_SEC).round() as u64)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn estimates_follow_the_measured_speeds() {
+            let model = [0x7Au8; 32];
+            assert_eq!(generation_daa(&model, 100), None);
+            assert_eq!(replay_daa(&model, false, None, 100), None);
+            assert_eq!(replay_daa(&model, false, Some(10.0), 100), Some(300));
+            note_generation(&model, 8, 100.0);
+            assert_eq!(generation_daa(&model, 100), None, "a short generation is not a speed");
+            note_generation(&model, 1_000, 20.0);
+            assert_eq!(generation_daa(&model, 4_096), Some(819));
+            note_replay(&model, false, 1.5);
+            assert_eq!(replay_daa(&model, false, Some(10.0), 0), Some(150));
+            assert_eq!(replay_daa(&model, false, None, 1_000), Some(300));
+            assert_eq!(replay_daa(&model, true, Some(10.0), 0), Some(200));
+            note_generation(&model, 1_000, 40.0);
+            assert_eq!(generation_daa(&model, 1_000), Some(260));
+        }
+    }
 }
 
 #[cfg(test)]

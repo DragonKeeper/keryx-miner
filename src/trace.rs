@@ -585,6 +585,19 @@ pub fn opening_window_daa(tier: u8, max_tokens: u32) -> u64 {
     BASE_DAA + max_tokens.min(MAX_TOKENS_CAP) as u64 * per_token_daa
 }
 
+/// Work of `prompt_passes` passes over a prompt of `n_prompt` positions and of `n_gen` generated
+/// tokens, at the per-position rates of the node's windows.
+pub fn work_daa(tier: u8, n_prompt: u32, n_gen: u32, prompt_passes: u64) -> u64 {
+    const MAX_TOKENS_CAP: u32 = 4_096;
+    const MAX_PROMPT: u32 = 131_072;
+    let per_token: u64 = match tier {
+        0..=2 => 2,
+        3 => 3,
+        _ => 4,
+    };
+    prompt_passes * (n_prompt.min(MAX_PROMPT) as u64 / 10) + n_gen.min(MAX_TOKENS_CAP) as u64 * per_token
+}
+
 /// Window the first opening of an attention audit adds for its prompt; matches the node.
 pub fn attn_first_prompt_daa(n_prompt: u32) -> u64 {
     const REPLAYS: u64 = 3;
@@ -1157,6 +1170,14 @@ pub fn opening_signature_message(body: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_follows_the_node_rates() {
+        assert_eq!(work_daa(0, 1_000, 100, 3), 300 + 200);
+        assert_eq!(work_daa(4, 1_000, 100, 1), 100 + 400);
+        assert_eq!(work_daa(3, 1_000_000, 10_000, 2), 2 * 13_107 + 4_096 * 3);
+        assert_eq!(work_daa(u8::MAX, 0, 10, 1), 40);
+    }
 
     #[test]
     fn the_attention_phase_window_scales_with_the_replay() {
