@@ -8,8 +8,8 @@ use keryx_verifiable_inference::manifest::{self, Chain, Entry};
 use borsh::{BorshDeserialize, BorshSerialize};
 use keryx_verifiable_inference::merkle::{b3_chunk_cv, b3_path, b3_root, rt_range_proof, Hash, B3_CHUNK};
 use keryx_verifiable_inference::opening::{
-    self, ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, MoeAdd, Opening, Point, PrefixPoint, ResidAdd, ResidOpening,
-    ResidPoint, ResidSrc,
+    self, ChunkRange, EntryOpening, ExpertIds, ExpertRow, FeedRow, LeafBytes, LeafChunk, LinkOpening, MoeAdd, Opening, Point, PrefixPoint,
+    ResidAdd, ResidOpening, ResidPoint, ResidSrc,
 };
 use keryx_verifiable_inference::prefix::{self, PrefixCtx};
 use keryx_verifiable_inference::verify::{self, ResponseCtx, TierCtx};
@@ -898,7 +898,7 @@ pub fn draw_chain(m: &TierManifest, pctx: &PrefixCtx, rec: &TraceRecord, seed: &
         return None;
     }
     let d = draw::point(seed, chain::RESID_POINT);
-    let sel = d[1] % (2 * n_layers);
+    let sel = chain::resid_site(d[1], 2 * n_layers);
     let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
     let t = chain::resid_position(&ctx, &rec.response_ctx(), layer, d[0]).ok()?;
     let ll = match m.entry(ctx.layer_base as u64 + layer).chain {
@@ -934,8 +934,10 @@ impl ChainDraw {
         if let Some(l) = r.src_leaf(np) {
             add(r.t, l);
         }
+        add(r.t, 2 * r.rank as u32);
         add(r.t, 2 * r.rank as u32 + 1);
         if let Some(moe) = &r.moe {
+            add(r.t, 2 * moe.down_exps);
             add(r.t, 2 * moe.down_exps + 1);
             add(r.t, chain::router_leaf(np, self.n_layers, r.layer) as u32);
         }
@@ -1008,7 +1010,7 @@ pub fn captures_match(rec: &TraceRecord, caps: &Captures) -> bool {
     caps.iter().all(|(&(t, leaf), b)| (t as u64) < rec.n_pos as u64 && *blake3::hash(b).as_bytes() == rec.leaf(t as u64, leaf))
 }
 
-/// Stage-2 opening of `d` without its residual point, and the residual point; `None` when a part
+/// Stage-2 opening of `d` without its residual point, and its residual opening; `None` when a part
 /// cannot be built.
 #[allow(clippy::too_many_arguments)]
 pub fn chain_opening(
@@ -1022,7 +1024,7 @@ pub fn chain_opening(
     d: &ChainDraw,
     caps: &Captures,
     index: &WeightIndex,
-) -> Option<(Opening, ResidPoint)> {
+) -> Option<(Opening, ResidOpening)> {
     let ctx = m.chain?;
     let np = m.n_products as u64;
     let cap = |t: u64, leaf: u32| caps.get(&(t as u32, leaf)).map(Vec::as_slice);
@@ -1158,9 +1160,38 @@ pub fn chain_opening(
         src,
         add,
     };
+
+    let dr = draw::point(seed, chain::RESID_POINT);
+    let (pe, per) = (m.entry(r.rank), (B3_CHUNK / 4) as u64);
+    let lo = r.c * per;
+    let row = lo + (dr[3] >> 32) % per.min(pe.m.checked_sub(lo).filter(|&n| n > 0)?);
+    let feed = FeedRow {
+        x: cap(r.t, 2 * r.rank as u32)?.to_vec(),
+        x_path: b3_path(rpos, 2 * r.rank as usize),
+        row: row_opening(m, index, r.rank, row)?.1,
+        bias: if pe.bias == manifest::NONE { None } else { Some(bytes_range(m, index, pe.bias as u64, row * 4, 4)?) },
+    };
+    let expert = match &r.moe {
+        Some(moe) => {
+            let n_used = ctx.n_used as u64;
+            let down_y = cap(r.t, 2 * moe.down_exps + 1)?;
+            let slot = (dr[3] >> 48) % n_used.max(1);
+            let s = down_y.len().checked_sub(4 * n_used as usize)? + 4 * slot as usize;
+            let id = u32::from_le_bytes(down_y.get(s..s + 4)?.try_into().ok()?) as u64;
+            let (first, last, _) = m.entry(moe.down_exps as u64).row_chunks(id, row)?;
+            Some(ExpertRow {
+                entry: m.entry_opening(moe.down_exps as u64),
+                x: cap(r.t, 2 * moe.down_exps)?.to_vec(),
+                x_path: b3_path(rpos, 2 * moe.down_exps as usize),
+                row: range_proof(index, first, last)?,
+            })
+        }
+        None => None,
+    };
     let n = points.len();
     debug_assert_eq!(experts.len(), n);
-    Some((Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: None, roots: None }, resid))
+    let opening = Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: None, roots: None };
+    Some((opening, ResidOpening { response_txid, roots: None, resid, feed, expert }))
 }
 
 /// Checks the trace and residual pieces of a stage-2 opening as the node does; `Err` names the
@@ -1193,7 +1224,7 @@ pub fn verify_chain_opening(
         chain::verify_chain_point(tier, ctx, &resp, seed, i as u32, p, *tok, link, o.experts[i].as_ref()).map_err(|e| format!("point {i}: {e:?}"))?;
     }
     chain::verify_chain_prefix_point(tier, ctx, pctx, &resp, seed, request_hash, pp).map_err(|e| format!("prefix point: {e:?}"))?;
-    chain::verify_resid_point(tier, ctx, &resp, seed, &r.resid).map_err(|e| format!("residual point: {e:?}"))
+    chain::verify_resid_opening(tier, ctx, &resp, seed, &r).map_err(|e| format!("residual point: {e:?}"))
 }
 
 /// The message an opening is signed over.

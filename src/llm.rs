@@ -1161,13 +1161,14 @@ fn open_chain(
     index: &crate::pom::WeightIndex,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     use crate::trace::{chain_opening, draw_chain};
-    use keryx_verifiable_inference::opening::{ResidOpening, MAX_BODY_LEN};
+    use keryx_verifiable_inference::opening::MAX_BODY_LEN;
     let rec = &trace.record;
     let d = draw_chain(m, pctx, rec, seed).ok_or("no stage-2 draw")?;
     let caps = replay_captures(gguf, dev_id, m, trace, &d.captures(m.n_products as u64))?;
-    let (mut o, resid) = chain_opening(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index).ok_or_else(|| "no stage-2 opening".to_string())?;
+    let (mut o, mut r) = chain_opening(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index).ok_or_else(|| "no stage-2 opening".to_string())?;
     o.roots = trace.seq.as_ref().map(|seq| (rec.trace_root, seq.root));
-    let resid = ResidOpening { response_txid, roots: o.roots, resid }.encode();
+    r.roots = o.roots;
+    let resid = r.encode();
     let body = o.encode();
     for (name, b) in [("stage-2", &body), ("residual", &resid)] {
         if b.len() + SEEDED_OVERHEAD > MAX_BODY_LEN {
