@@ -76,7 +76,6 @@ pub struct GpuKernelInfo {
 }
 
 /// Per-device v4 tile-offset buffer, reused across batches (the chase overwrites every word).
-/// Ported from the ocminer (suprnova) fork.
 static V4_OFFSETS: OnceLock<Mutex<HashMap<usize, Arc<CudaSlice<u32>>>>> = OnceLock::new();
 /// Prefix of the error returned when the context pad does not fit in VRAM.
 const PAD_ALLOC_ERR: &str = "context pad does not fit";
@@ -121,8 +120,7 @@ fn v4_scratch(stream: &Arc<CudaStream>, batch: usize) -> Result<Arc<Mutex<V4Scra
 }
 
 /// Per-device bucket LUT for the chaseless walk's segment resolve (`pom_mine_v4_ncf`), built
-/// host-side from the prefix table once per installed blob. Ported from the ocminer
-/// (suprnova) fork.
+/// host-side from the prefix table once per installed blob.
 struct V4NcfLut {
     t_count: u32,
     n_chunks: u64,
@@ -742,7 +740,7 @@ fn is_nextgen_device(device_id: usize) -> bool {
     major > 8 || (major == 8 && minor >= 9)
 }
 
-/// v4 grind batch sizing (SM-derived, after GerardMensoif's PR #37): the plateau is broad
+/// v4 batch sizing (SM-derived): the plateau is broad
 /// from ~8K upward, one launch stays well inside a template window at 10 BPS.
 const POM_V4_NONCES_PER_SM: u64 = 384;
 const POM_V4_BATCH_MIN: u64 = 8192;

@@ -2779,7 +2779,7 @@ impl KeryxdHandler {
             Payload::SubmitTransactionResponse(res) => {
                 // Escrow claims and inference submissions share this stream. Match responses to
                 // in-flight claims by identity (txid, or the txid embedded in the rejection
-                // text) — attributing by position slashed valid escrow entries before.
+                // text).
                 use crate::escrow::SubmitResponseOutcome;
                 let err = res.error.as_ref().map(|e| e.message.clone());
                 let outcome = self

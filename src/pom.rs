@@ -322,9 +322,8 @@ pub fn seed_state(pow_seed: u64) -> u64 {
     mix64(pow_seed ^ SEED_SALT)
 }
 
-/// Pre-H5 possession transition (FROZEN — produces all blocks below `H5_ACTIVATION_DAA`). The 4
-/// chunk words are XOR-folded into one accumulator before a single `mix64`, so only their XOR
-/// (8 bytes) is load-bearing. Kept verbatim for historical parity with the node's `transition_v1`.
+/// Pre-H5 possession transition (FROZEN — produces all blocks below `H5_ACTIVATION_DAA`). Byte-exact
+/// mirror of the node's `transition_v1`.
 #[inline]
 pub fn transition_v1(state: u64, chunk: &[u64; CHUNK_WORDS]) -> u64 {
     let mut h = state;
@@ -334,9 +333,8 @@ pub fn transition_v1(state: u64, chunk: &[u64; CHUNK_WORDS]) -> u64 {
     mix64(h)
 }
 
-/// H5 possession transition (active at/after `H5_ACTIVATION_DAA`). `mix64` is chained through each
-/// of the 4 chunk words, so all 32 bytes are load-bearing and order-dependent — the v1 fold
-/// shortcut is closed. Byte-exact mirror of the node's `transition_v2`.
+/// H5 possession transition (active at/after `H5_ACTIVATION_DAA`): `mix64` chained through each of
+/// the 4 chunk words. Byte-exact mirror of the node's `transition_v2`.
 #[inline]
 pub fn transition_v2(state: u64, chunk: &[u64; CHUNK_WORDS]) -> u64 {
     let mut h = state;
@@ -1590,9 +1588,8 @@ pub fn coin_age_verification_activation_daa() -> u64 {
 }
 
 /// H5 activation DAA score. At/after this score the possession walk switches from the frozen v1
-/// XOR-fold (`transition_v1`) to the non-foldable mix64-chained `transition_v2`, both on the GPU
-/// kernel (`pom_mine.cu`, `walk_v2` param) and the CPU walk/proof path — closing the pre-H5 fold
-/// shortcut. MUST equal the node's `MAINNET_PARAMS.h5_activation` (= node `H5_ACTIVATION_DAA`),
+/// XOR-fold (`transition_v1`) to the mix64-chained `transition_v2`, both on the GPU
+/// kernel (`pom_mine.cu`, `walk_v2` param) and the CPU walk/proof path. MUST equal the node's `MAINNET_PARAMS.h5_activation` (= node `H5_ACTIVATION_DAA`),
 /// node↔miner lockstep exactly like `coin_age_verification_activation_daa`. Set to the relaunch tip
 /// DAA — MUST equal node `MAINNET_PARAMS.h5_activation` / `H5_ACTIVATION_DAA` = 59_009_037.
 /// Testnet: 0 — node TESTNET_PARAMS.h5_activation = new(0).
@@ -1654,8 +1651,7 @@ pub fn h10_activation_daa() -> u64 {
 
 /// H8 request-identity gate. At/after this score a request is identified by the transaction id of
 /// the AiRequest, not by the digest of its payload. MUST equal the node's
-/// `reward_routing_activation`: a miner deriving the other identity signs responses the node
-/// cannot credit, and is struck for work it actually did.
+/// `reward_routing_activation`.
 pub fn reward_routing_activation_daa() -> u64 {
     gate(79_210_000, 0)
 }

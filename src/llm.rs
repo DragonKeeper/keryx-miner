@@ -540,8 +540,7 @@ fn probe_backoff(attempts: u32) -> Duration {
 }
 
 /// Withdraw a model from `ai:cap`: the files are on disk but this miner cannot serve it right
-/// now. Announcing it anyway earns assigned requests it cannot answer, hence service-bond strikes.
-/// The GPUs mining its tier park until it serves again.
+/// now. The GPUs mining its tier park until it serves again.
 pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
     let recoveries = probe_recoveries().read().unwrap().get(model_id).copied().unwrap_or(0);
     let mut models = unavailable_models().write().unwrap();
@@ -1219,7 +1218,7 @@ fn chain_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, attenti
 }
 
 /// Arms the canonical trace of `tier` on the engine hosting `spec`, under the stage-2 manifest
-/// when `chain`; `false` when the tier is not audited or the engine cannot trace. A tier that
+/// when `chain`; `false` when the tier has no manifest or the engine cannot trace. A tier that
 /// cannot pass its self-check stops the miner.
 fn arm_trace(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, chain: bool, attention: bool) -> bool {
     use crate::trace::TierManifest;
