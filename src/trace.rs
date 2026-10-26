@@ -26,7 +26,7 @@ pub const STAGE_1A: u8 = 1;
 /// Points opened per audited response.
 pub const POINTS: u32 = draw::POINTS;
 
-/// Serialized manifests of the audited tiers, in tier order; a missing tier is not audited.
+/// Serialized manifests of the tiers, in tier order; `None` = no manifest.
 const MANIFESTS: [Option<&[u8]>; 5] = [
     Some(include_bytes!("../assets/trace-manifests/tier0.bin")),
     Some(include_bytes!("../assets/trace-manifests/tier1.bin")),
@@ -201,7 +201,7 @@ pub fn chain_ctx(tier: u8) -> Option<(ChainCtx, PrefixCtx)> {
 pub const KIMI_PREFIX_OFFSET: u32 = 6;
 
 
-/// The prefix context of `tier`, `None` when the tier is not audited.
+/// The prefix context of `tier`; `None` = no manifest.
 pub fn prefix_ctx(tier: u8) -> Option<&'static PrefixCtx> {
     PREFIXES.get(tier as usize).and_then(|p| p.as_ref())
 }
@@ -302,7 +302,7 @@ impl TierManifest {
             .unwrap_or(DEFAULT_INTERVAL)
     }
 
-    /// The embedded manifest of `tier`, `None` when the tier is not audited.
+    /// The embedded manifest of `tier`; `None` = no manifest.
     pub fn for_tier(tier: u8) -> Option<Self> {
         MANIFESTS.get(tier as usize).copied().flatten().and_then(Self::parse)
     }
@@ -905,7 +905,7 @@ pub fn draw_chain(m: &TierManifest, pctx: &PrefixCtx, rec: &TraceRecord, seed: &
         Chain::Layer(ll) if ll.layer as u64 == layer => ll,
         _ => return None,
     };
-    let moe = ll.moe.filter(|_| kind == Resid::Out);
+    let moe = ll.moe.filter(|_| kind == Resid::Out && ll.post_ffn == manifest::NONE);
     let rank = if kind == Resid::Attn { ll.proj } else { ll.down } as u64;
     let dim = m.entry(rank).m;
     let c = d[2] % (4 * dim).div_ceil(B3_CHUNK as u64).max(1);
