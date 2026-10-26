@@ -8,8 +8,8 @@ use keryx_verifiable_inference::manifest::{self, Chain, Entry};
 use borsh::{BorshDeserialize, BorshSerialize};
 use keryx_verifiable_inference::merkle::{b3_chunk_cv, b3_path, b3_root, rt_range_proof, Hash, B3_CHUNK};
 use keryx_verifiable_inference::opening::{
-    self, ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, MoeAdd, Opening, Point, PrefixPoint, ResidAdd, ResidPoint,
-    ResidSrc,
+    self, ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, MoeAdd, Opening, Point, PrefixPoint, ResidAdd, ResidOpening,
+    ResidPoint, ResidSrc,
 };
 use keryx_verifiable_inference::prefix::{self, PrefixCtx};
 use keryx_verifiable_inference::verify::{self, ResponseCtx, TierCtx};
@@ -1008,10 +1008,10 @@ pub fn captures_match(rec: &TraceRecord, caps: &Captures) -> bool {
     caps.iter().all(|(&(t, leaf), b)| (t as u64) < rec.n_pos as u64 && *blake3::hash(b).as_bytes() == rec.leaf(t as u64, leaf))
 }
 
-/// Encoded stage-2 opening body of `d`, `None` when a part cannot be built or the body exceeds
-/// the consensus cap.
+/// Stage-2 opening of `d` without its residual point, and the residual point; `None` when a part
+/// cannot be built.
 #[allow(clippy::too_many_arguments)]
-pub fn chain_opening_body(
+pub fn chain_opening(
     m: &TierManifest,
     pctx: &PrefixCtx,
     rec: &TraceRecord,
@@ -1022,7 +1022,7 @@ pub fn chain_opening_body(
     d: &ChainDraw,
     caps: &Captures,
     index: &WeightIndex,
-) -> Option<Vec<u8>> {
+) -> Option<(Opening, ResidPoint)> {
     let ctx = m.chain?;
     let np = m.n_products as u64;
     let cap = |t: u64, leaf: u32| caps.get(&(t as u32, leaf)).map(Vec::as_slice);
@@ -1160,15 +1160,32 @@ pub fn chain_opening_body(
     };
     let n = points.len();
     debug_assert_eq!(experts.len(), n);
-    let body = Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: Some(resid), roots: None }.encode();
-    (body.len() + 33 <= opening::MAX_BODY_LEN).then_some(body)
+    Some((Opening { response_txid, points, prefix: Some(prefix), links, experts, resid: None, roots: None }, resid))
 }
 
-/// Checks a stage-2 opening body as the node does; `Err` names the failing part.
-pub fn verify_chain_opening(tier: &TierCtx, ctx: &ChainCtx, pctx: &PrefixCtx, rec: &TraceRecord, seed: &Hash, request_hash: &[u8; 32], body: &[u8]) -> Result<(), String> {
+/// Checks the trace and residual pieces of a stage-2 opening as the node does; `Err` names the
+/// failing part.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_chain_opening(
+    tier: &TierCtx,
+    ctx: &ChainCtx,
+    pctx: &PrefixCtx,
+    rec: &TraceRecord,
+    seed: &Hash,
+    request_hash: &[u8; 32],
+    body: &[u8],
+    resid_body: &[u8],
+) -> Result<(), String> {
     let o = Opening::decode(body).ok_or("malformed body")?;
+    let r = ResidOpening::decode(resid_body).ok_or("malformed residual body")?;
     let resp = rec.response_ctx();
-    let (Some(pp), Some(rp)) = (&o.prefix, &o.resid) else { return Err("stage-2 part missing".into()) };
+    let Some(pp) = &o.prefix else { return Err("stage-2 part missing".into()) };
+    if o.resid.is_some() {
+        return Err("residual point in the trace piece".into());
+    }
+    if r.response_txid != o.response_txid || r.roots != o.roots {
+        return Err("residual piece of another opening".into());
+    }
     if o.points.len() != POINTS as usize || o.links.len() != o.points.len() || o.experts.len() != o.points.len() {
         return Err("point count".into());
     }
@@ -1176,7 +1193,7 @@ pub fn verify_chain_opening(tier: &TierCtx, ctx: &ChainCtx, pctx: &PrefixCtx, re
         chain::verify_chain_point(tier, ctx, &resp, seed, i as u32, p, *tok, link, o.experts[i].as_ref()).map_err(|e| format!("point {i}: {e:?}"))?;
     }
     chain::verify_chain_prefix_point(tier, ctx, pctx, &resp, seed, request_hash, pp).map_err(|e| format!("prefix point: {e:?}"))?;
-    chain::verify_resid_point(tier, ctx, &resp, seed, rp).map_err(|e| format!("residual point: {e:?}"))
+    chain::verify_resid_point(tier, ctx, &resp, seed, &r.resid).map_err(|e| format!("residual point: {e:?}"))
 }
 
 /// The message an opening is signed over.

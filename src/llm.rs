@@ -1107,8 +1107,8 @@ fn open_recurrent(
     Ok(body)
 }
 
-/// Every opening of a response under the attention rule: the trace opening, then the attention
-/// and, when the tier has recurrent layers, the recurrent one.
+/// Every opening of a stage-2 response: the trace opening, the attention and recurrent ones under
+/// the attention rule when the tier has such layers, then the residual one.
 #[allow(clippy::too_many_arguments)]
 fn open_pieces(
     gguf: &str,
@@ -1121,17 +1121,33 @@ fn open_pieces(
     response_txid: [u8; 32],
     index: &crate::pom::WeightIndex,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let mut bodies = vec![open_chain(gguf, dev_id, m, pctx, trace, seed, request_hash, response_txid, index)?];
+    let (body, resid) = open_chain(gguf, dev_id, m, pctx, trace, seed, request_hash, response_txid, index)?;
+    let mut bodies = vec![body];
     if trace.seq.is_some() {
         bodies.push(open_attention(gguf, dev_id, m, trace, seed, response_txid, index, &[], None)?);
         if m.chain.is_some_and(|c| c.n_recur > 0) {
             bodies.push(open_recurrent(gguf, dev_id, m, trace, seed, response_txid, index)?);
         }
     }
+    bodies.push(resid);
     Ok(bodies)
 }
 
-/// Replays a stage-2 response once for every leaf the draw of `seed` opens and builds the opening.
+/// A trace opening body carrying the residual point of its residual piece, as the block task
+/// commits it.
+fn inline_resid(body: &[u8], resid: &[u8]) -> Result<Vec<u8>, String> {
+    use keryx_verifiable_inference::opening::{Opening, ResidOpening, MAX_BODY_LEN};
+    let mut o = Opening::decode(body).ok_or("undecodable stage-2 opening")?;
+    o.resid = Some(ResidOpening::decode(resid).ok_or("undecodable residual opening")?.resid);
+    let b = o.encode();
+    if b.len() + SEEDED_OVERHEAD > MAX_BODY_LEN {
+        return Err(format!("block task opening of {} B over the cap", b.len()));
+    }
+    Ok(b)
+}
+
+/// Replays a stage-2 response once for every leaf the draw of `seed` opens and builds its trace
+/// and residual openings.
 #[allow(clippy::too_many_arguments)]
 fn open_chain(
     gguf: &str,
@@ -1143,27 +1159,24 @@ fn open_chain(
     request_hash: &[u8; 32],
     response_txid: [u8; 32],
     index: &crate::pom::WeightIndex,
-) -> Result<Vec<u8>, String> {
-    use crate::trace::{chain_opening_body, draw_chain};
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    use crate::trace::{chain_opening, draw_chain};
+    use keryx_verifiable_inference::opening::{ResidOpening, MAX_BODY_LEN};
     let rec = &trace.record;
     let d = draw_chain(m, pctx, rec, seed).ok_or("no stage-2 draw")?;
     let caps = replay_captures(gguf, dev_id, m, trace, &d.captures(m.n_products as u64))?;
-    let body = chain_opening_body(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index).ok_or_else(|| "no stage-2 opening".to_string())?;
-    let body = match &trace.seq {
-        Some(seq) => {
-            let mut o = keryx_verifiable_inference::opening::Opening::decode(&body).ok_or("undecodable stage-2 opening")?;
-            o.roots = Some((rec.trace_root, seq.root));
-            let body = o.encode();
-            if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
-                return Err(format!("stage-2 opening of {} B over the cap", body.len()));
-            }
-            body
+    let (mut o, resid) = chain_opening(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index).ok_or_else(|| "no stage-2 opening".to_string())?;
+    o.roots = trace.seq.as_ref().map(|seq| (rec.trace_root, seq.root));
+    let resid = ResidOpening { response_txid, roots: o.roots, resid }.encode();
+    let body = o.encode();
+    for (name, b) in [("stage-2", &body), ("residual", &resid)] {
+        if b.len() + SEEDED_OVERHEAD > MAX_BODY_LEN {
+            return Err(format!("{name} opening of {} B over the cap", b.len()));
         }
-        None => body,
-    };
+    }
     let ctx = m.chain.ok_or("no stage-2 context")?;
-    crate::trace::verify_chain_opening(&m.tier_ctx(index), &ctx, pctx, rec, seed, request_hash, &body).map_err(|e| format!("stage-2 opening fails its own check: {e}"))?;
-    Ok(body)
+    crate::trace::verify_chain_opening(&m.tier_ctx(index), &ctx, pctx, rec, seed, request_hash, &body, &resid).map_err(|e| format!("stage-2 opening fails its own check: {e}"))?;
+    Ok((body, resid))
 }
 
 /// Traces a fixed prompt under the stage-2 manifest, then opens and verifies it under two seeds
@@ -1197,7 +1210,7 @@ fn chain_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, attenti
     let tier_ctx = m.tier_ctx(&index);
     for seed in [[0x11u8; 32], [0x77u8; 32]] {
         let bodies = open_pieces(gguf, dev_id, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], &index)?;
-        verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &request_hash, &bodies[0])?;
+        verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &request_hash, &bodies[0], bodies.last().ok_or("no residual piece")?)?;
     }
     PREFIX_CHECKED.lock().unwrap().insert((gguf.to_string(), dev_id, key));
     log::info!("LlmEngine '{}': stage-2 self-check passed (gpu{})", spec.name, dev_id);
@@ -1366,7 +1379,9 @@ pub fn open_block_task(model_id: &[u8; 32], tier: u8, trace: &crate::trace::Resp
     let index = weight_index(spec, &gguf)?;
     let m = crate::trace::TierManifest::for_chain(tier)?;
     let (ctx, pctx) = crate::trace::chain_ctx(tier)?;
-    let body = match open_chain(&gguf, dev_id, &m, &task_prefix(&pctx), trace, &draw_seed(block_hash), &task_bytes(window_seed), [0u8; 32], &index) {
+    let body = match open_chain(&gguf, dev_id, &m, &task_prefix(&pctx), trace, &draw_seed(block_hash), &task_bytes(window_seed), [0u8; 32], &index)
+        .and_then(|(b, r)| inline_resid(&b, &r))
+    {
         Ok(b) => b,
         Err(e) => {
             log::warn!("LlmEngine '{}': block task opening failed ({})", spec.name, e);
@@ -1602,7 +1617,7 @@ mod tests {
                 let t0 = std::time::Instant::now();
                 let bodies = open_pieces(&gguf, 0, &m, &pctx, &trace, &seed, &rh, [3u8; 32], &index).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
                 let took = t0.elapsed();
-                verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &rh, &bodies[0]).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
+                verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &rh, &bodies[0], bodies.last().unwrap()).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
                 let sizes: Vec<usize> = bodies.iter().map(Vec::len).collect();
                 let t1 = std::time::Instant::now();
                 let phases = attention_phases(&gguf, &m, &trace, &seed, &index, &bodies[1]).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
@@ -1649,11 +1664,11 @@ mod tests {
                 }
                 *kinds.entry(format!("resid{:?}{}", d.resid.kind, if d.resid.layer + 1 == ctx.n_layers as u64 { "-last" } else { "" })).or_default() += 1;
                 let t0 = std::time::Instant::now();
-                let body = open_chain(&gguf, 0, &m, &pctx, &trace, &seed, &rh, [3u8; 32], &index).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
+                let (body, resid) = open_chain(&gguf, 0, &m, &pctx, &trace, &seed, &rh, [3u8; 32], &index).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
                 let took = t0.elapsed();
-                verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &rh, &body).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
-                eprintln!("{label} seed {counter}: verified, body {} B, replay+build {:.2?}", body.len(), took);
-                sizes.push(body.len());
+                verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &rh, &body, &resid).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
+                eprintln!("{label} seed {counter}: verified, body {} B, residual {} B, replay+build {:.2?}", body.len(), resid.len(), took);
+                sizes.push(body.len().max(resid.len()));
             }
             eprintln!("{label}: max body {} B, coverage {:?}", sizes.iter().max().unwrap(), kinds);
         }
@@ -1672,6 +1687,7 @@ mod tests {
             let block_hash = *blake3::hash(&counter.to_le_bytes()).as_bytes();
             let t0 = std::time::Instant::now();
             let body = open_chain(&gguf, 0, &m, &tp, &task, &draw_seed(&block_hash), &task_bytes(&window_seed), [0u8; 32], &index)
+                .and_then(|(b, r)| inline_resid(&b, &r))
                 .unwrap_or_else(|e| panic!("task {counter}: {e}"));
             let took = t0.elapsed();
             let opening = keryx_verifiable_inference::opening::Opening::decode(&body).unwrap();
