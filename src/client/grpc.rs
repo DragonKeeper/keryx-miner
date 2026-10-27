@@ -2210,6 +2210,7 @@ impl KeryxdHandler {
                 && self.replay_rx.as_ref().is_none_or(|j| j.response_txid != o.response_txid);
             let (Some(txid_bytes), Some(seed)) = (hash32(&o.response_txid), hash32(&o.seed)) else { continue };
             let Some(p) = self.pending_traces.get(&o.response_txid) else { continue };
+            let had_draw = p.draw.is_some();
             let same_seed = p.draw.as_ref().is_some_and(|d| d.seed == seed);
             let seeded = if same_seed {
                 None
@@ -2228,7 +2229,11 @@ impl KeryxdHandler {
             };
             let p = self.pending_traces.get_mut(&o.response_txid).unwrap();
             if let Some((seed_hash, seed_daa)) = seeded {
-                info!("Trace: response {} — audit seeded by block {} as the node does, opening due by DAA {}", o.response_txid, seed_hash, o.deadline_daa);
+                if had_draw {
+                    info!("Trace: response {} — seed differs from the node, audit seeded by block {}, opening due by DAA {}", o.response_txid, seed_hash, o.deadline_daa);
+                } else {
+                    info!("Trace: response {} — audit seeded by the node at block {}, opening due by DAA {}", o.response_txid, seed_hash, o.deadline_daa);
+                }
                 let kept = p.opening.as_ref().is_some_and(|op| op.seed_hash == seed_hash);
                 p.draw = Some(TraceDraw {
                     seed_hash,
