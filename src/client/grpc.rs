@@ -2162,7 +2162,9 @@ impl KeryxdHandler {
         for (txid, d) in drawn {
             if d.audited {
                 let reorgs = self.pending_traces.get(&txid).map_or(0, |p| p.reorgs);
-                if reorgs == 0 {
+                if d.opened {
+                    info!("Trace: response {} — audit restored, opening already submitted", txid);
+                } else if reorgs == 0 {
                     info!("Trace: response {} drawn for audit, opening due by DAA {}", txid, d.deadline_daa);
                 } else {
                     info!("Trace: response {} drawn for audit after {} chain reorgs, opening due by DAA {}", txid, reorgs, d.deadline_daa);
