@@ -492,7 +492,9 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
         };
         log::info!("llama engine: loading {} on GPU {} via {} (in-process, zero-dup)…", gguf, gpu, so.display());
         let (floor, cap) = crate::models::spec_for_gguf(gguf).map_or((4096, 4096), |m| (m.ctx_floor as c_int, m.ctx_cap as c_int));
-        let configured_ctx: Option<c_int> = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok());
+        let max_ctx = keryx_verifiable_inference::shape::MAX_TRACE_POSITIONS.min(c_int::MAX as u32) as c_int;
+        let configured_ctx: Option<c_int> =
+            std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse::<c_int>().ok()).map(|c| c.clamp(1, max_ctx));
         let ladder = configured_ctx.map_or_else(|| context_ladder(cap, floor), |c| vec![c]);
         let mut model = std::ptr::null_mut();
         let mut n_ctx: c_int = 0;
