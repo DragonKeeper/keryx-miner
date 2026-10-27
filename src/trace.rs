@@ -604,12 +604,11 @@ pub const OPENING_BACKLOG_CAP_DAA: u64 = 36_000;
 /// Replays an open audit costs its responder, in units of serving work; matches the node.
 pub const OPEN_AUDIT_WORK_PASSES: u64 = 3;
 
-/// Opening deadline of an audit of `work` serving work seeded at `seed_daa` with its own window
-/// ending at `own`, chained behind the deadlines of the open audits of the same key; `None` past
-/// the chain cap, where the node opens no audit. The node adds its network backlog on top.
-pub fn chained_deadline(own: u64, open_ends: &[u64], seed_daa: u64, work: u64) -> Option<u64> {
-    let start = open_ends.iter().copied().filter(|e| *e >= seed_daa).max().map_or(own, |end| own.max(end + OPEN_AUDIT_WORK_PASSES * work));
-    (start - own <= OPENING_BACKLOG_CAP_DAA).then_some(start)
+/// First estimate of the opening deadline of an audit of `work` serving work seeded at
+/// `seed_daa` with its own window ending at `own`, chained behind the open audits of the same
+/// key; the node's deadline replaces it once known.
+pub fn chained_deadline(own: u64, open_ends: &[u64], seed_daa: u64, work: u64) -> u64 {
+    open_ends.iter().copied().filter(|e| *e >= seed_daa).max().map_or(own, |end| own.max(end + OPEN_AUDIT_WORK_PASSES * work))
 }
 
 /// Serving work of one request under the node's v3 window. MUST equal the node's `service_work_daa`.
@@ -1244,11 +1243,11 @@ mod tests {
     #[test]
     fn deadlines_chain_behind_the_open_audits_of_the_key() {
         let work = service_work_daa(0, 0, 4_096);
-        assert_eq!(chained_deadline(5_000, &[], 100, work), Some(5_000));
-        assert_eq!(chained_deadline(5_000, &[90], 100, work), Some(5_000), "a closed or missed audit no longer counts");
-        assert_eq!(chained_deadline(5_000, &[4_000], 100, work), Some(4_000 + OPEN_AUDIT_WORK_PASSES * work));
+        assert_eq!(chained_deadline(5_000, &[], 100, work), 5_000);
+        assert_eq!(chained_deadline(5_000, &[90], 100, work), 5_000, "a closed or missed audit no longer counts");
+        assert_eq!(chained_deadline(5_000, &[4_000], 100, work), 4_000 + OPEN_AUDIT_WORK_PASSES * work);
         let far = 5_000 + OPENING_BACKLOG_CAP_DAA;
-        assert_eq!(chained_deadline(5_000, &[far], 100, work), None);
+        assert_eq!(chained_deadline(5_000, &[far], 100, work), far + OPEN_AUDIT_WORK_PASSES * work, "the node, not the miner, bounds the chain");
     }
 
     #[test]

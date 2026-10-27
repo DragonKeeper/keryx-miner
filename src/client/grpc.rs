@@ -5,7 +5,7 @@ use crate::proto::kaspad_message::Payload;
 use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
     GetBlockDagInfoRequestMessage, GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage,
-    GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
+    GetAwaitedOpeningsRequestMessage, GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
     NotifyNewBlockTemplateRequestMessage, NotifyVirtualSelectedParentChainChangedRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
@@ -420,6 +420,24 @@ fn hash32(hex_str: &str) -> Option<[u8; 32]> {
     hex::decode(hex_str).ok()?.try_into().ok()
 }
 
+/// Node version that answers `GetAwaitedOpenings`.
+const AWAITED_OPENINGS_SINCE: (u32, u32, u32) = (1, 6, 6);
+/// Latest opening deadline after a response's acceptance on the node; matches the node.
+const AUDIT_SPAN_DAA: u64 = 270_000;
+/// Attention phases the node's span test reserves; matches the node.
+const AUDIT_PHASES_RESERVED: u64 = 3;
+/// Seconds between two `GetAwaitedOpenings` polls.
+const AWAITED_POLL_SECS: u64 = 10;
+/// Response txids per `GetAwaitedOpenings` poll; the node accepts up to 1 024.
+const AWAITED_POLL_MAX: usize = 1_024;
+
+/// Whether the leading `major.minor.patch` of `version` is at least `min`.
+fn version_at_least(version: &str, min: (u32, u32, u32)) -> bool {
+    let mut parts = version.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).map(|s| s.parse::<u32>().unwrap_or(0));
+    let v = (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    v >= min
+}
+
 /// The seed block of a response accepted by chain block `accepted`: the first later chain block
 /// at `TRACE_SEED_DELAY_DAA` or more, with its DAA score and the accepting block's. `None` while
 /// a block on the way has no DAA score yet.
@@ -604,6 +622,9 @@ pub struct KeryxdHandler {
 
     /// Last service-bond strike poll instant.
     last_strike_poll: std::time::Instant,
+    /// The node answers `GetAwaitedOpenings`.
+    node_awaited_openings: bool,
+    last_awaited_poll: std::time::Instant,
     /// Last message received from the node, and last probe sent while it is silent.
     last_message: std::time::Instant,
     last_probe: std::time::Instant,
@@ -674,6 +695,10 @@ impl Client for KeryxdHandler {
                     if self.escrow_pubkey.is_some() && self.last_strike_poll.elapsed().as_secs() >= 60 {
                         self.last_strike_poll = std::time::Instant::now();
                         self.client_send(GetServiceStrikesRequestMessage {}).await?;
+                    }
+                    if self.node_awaited_openings && self.last_awaited_poll.elapsed().as_secs() >= AWAITED_POLL_SECS {
+                        self.last_awaited_poll = std::time::Instant::now();
+                        self.poll_awaited_openings().await?;
                     }
                     self.release_persisted_responses().await?;
                     self.resend_early_responses().await?;
@@ -807,6 +832,8 @@ impl KeryxdHandler {
             escrow_cert,
             service_identity,
             last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
+            node_awaited_openings: false,
+            last_awaited_poll: std::time::Instant::now(),
             last_message: std::time::Instant::now(),
             last_probe: std::time::Instant::now(),
             strike_status: None,
@@ -1193,6 +1220,20 @@ impl KeryxdHandler {
     }
 
     /// Estimated duration of the next queued request, in DAA.
+    /// Room the node's span test takes for the next request's audit behind the open ones: its
+    /// chained work, its attention phases and the network backlog at its cap.
+    fn next_request_span_cost(&self) -> u64 {
+        let Some((_, _, model_id, _, prompt_len, max_tokens, _)) = self.ai_request_queue.front() else { return 0 };
+        let tier = keryx_miner::models::pom_tier_index(model_id, self.last_known_daa).unwrap_or(u8::MAX);
+        let (n_prompt, max_tokens) = (*prompt_len as u32, *max_tokens as u32);
+        let work = keryx_miner::trace::OPEN_AUDIT_WORK_PASSES * keryx_miner::trace::service_work_daa(tier, n_prompt, max_tokens);
+        let backlog = keryx_miner::trace::OPENING_BACKLOG_CAP_DAA;
+        let phase = keryx_miner::trace::TRACE_SEED_DELAY_DAA
+            + keryx_miner::trace::attn_phase_window_daa(tier, max_tokens, n_prompt, n_prompt.saturating_add(max_tokens))
+            + backlog;
+        work + backlog + AUDIT_PHASES_RESERVED * phase
+    }
+
     fn next_request_work(&self) -> u64 {
         let Some((_, _, model_id, _, prompt_len, max_tokens, _)) = self.ai_request_queue.front() else { return 0 };
         let tier = keryx_miner::models::pom_tier_index(model_id, self.last_known_daa).unwrap_or(u8::MAX);
@@ -1236,6 +1277,21 @@ impl KeryxdHandler {
         // Earliest deadline first: every replay must still fit after the request and the ones
         // before it. Undrawn audits take their share but cannot start yet, so only a replay that
         // can start now, at or before the first overflow, makes it urgent.
+        // The next answer's audit chains behind the open ones of this key; past the node's span
+        // it is struck at once, so the open ones go first.
+        let inflight: std::collections::HashSet<&str> = self.opening_inflight.values().map(|o| o.response_txid.as_str()).collect();
+        let chain_end = self
+            .pending_traces
+            .iter()
+            .filter_map(|(t, p)| {
+                let d = p.draw.as_ref().filter(|d| d.audited)?;
+                let unfinished = !d.opened || inflight.contains(t.as_str()) || p.attn.as_ref().is_some_and(|a| a.next_phase_owed() || a.awaiting_draw().is_some());
+                unfinished.then_some(d.deadline_daa)
+            })
+            .max();
+        if jobs.iter().any(|(_, _, ready)| *ready) && chain_end.is_some_and(|end| end.saturating_add(self.next_request_span_cost()) > now.saturating_add(next_work).saturating_add(AUDIT_SPAN_DAA)) {
+            return true;
+        }
         let mut at = now.saturating_add(REPLAY_URGENT_BASE_DAA).saturating_add(next_work);
         let mut startable = false;
         jobs.into_iter().any(|(deadline, work, ready)| {
@@ -1481,6 +1537,10 @@ impl KeryxdHandler {
     /// the seed block of its current draw: one transaction per piece it bundles.
     async fn submit_opening(&mut self, response_txid: &str, seed_hash: &str, body: Vec<u8>) {
         let Some(d) = self.pending_traces.get(response_txid).and_then(|p| p.draw.as_ref()) else { return };
+        if d.seed_hash != seed_hash {
+            info!("Trace: opening of response {} built for a seed the node no longer awaits — dropped", response_txid);
+            return;
+        }
         let (deadline_daa, seed_daa) = (d.deadline_daa, d.seed_daa);
         let Some(pieces) = keryx_miner::trace_seq::unbundle(&body) else {
             warn!("Trace: malformed opening bundle for response {}", response_txid);
@@ -2015,7 +2075,14 @@ impl KeryxdHandler {
             if self.chain_restore_starts.iter().any(|h| h == accepted) || self.rebuild_pending_after(accepted) {
                 continue;
             }
-            let Some((seed_hash, daa, accepted_daa)) = seed_block_after(&self.chain_log, accepted) else { continue };
+            let stored = p.opening.as_ref().and_then(|o| self.chain_log.iter().find(|e| e.hash == o.seed_hash)).and_then(|e| Some((e.hash.as_str(), e.daa?)));
+            let accepted_at = self.chain_log.iter().find(|e| e.hash == accepted).and_then(|e| e.daa);
+            let Some((seed_hash, daa, accepted_daa)) = (match (stored, accepted_at) {
+                (Some((h, d)), Some(a)) => Some((h, d, a)),
+                _ => seed_block_after(&self.chain_log, accepted),
+            }) else {
+                continue;
+            };
             let (Some(txid_bytes), Some(seed_block)) = (hash32(txid), hash32(seed_hash)) else { continue };
             let seed = keryx_miner::trace::trace_seed(&seed_block, &txid_bytes);
             let audited = keryx_miner::trace::audit_all_active(accepted_daa) || keryx_miner::trace::audited(&seed);
@@ -2055,16 +2122,8 @@ impl KeryxdHandler {
             let Some(p) = self.pending_traces.get(txid) else { continue };
             let r = &p.trace.record;
             let work = keryx_miner::trace::service_work_daa(p.tier, r.n_prompt, r.n_pos.saturating_sub(r.n_prompt));
-            match keryx_miner::trace::chained_deadline(d.deadline_daa, &open, d.seed_daa, work) {
-                Some(deadline) => {
-                    d.deadline_daa = deadline;
-                    open.push(deadline);
-                }
-                None => {
-                    info!("Trace: response {} past the audit queue of this key — not audited", txid);
-                    d.audited = false;
-                }
-            }
+            d.deadline_daa = keryx_miner::trace::chained_deadline(d.deadline_daa, &open, d.seed_daa, work);
+            open.push(d.deadline_daa);
         }
         let mut children: Vec<String> = Vec::new();
         let held: std::collections::HashSet<String> = self
@@ -2112,6 +2171,147 @@ impl KeryxdHandler {
             if let Some(p) = self.pending_traces.get_mut(&txid) {
                 p.draw = Some(d);
             }
+        }
+    }
+
+    /// Asks the node which of the pending traces it awaits an opening for.
+    async fn poll_awaited_openings(&mut self) -> Result<(), Error> {
+        let now = self.last_known_daa;
+        let mut due: Vec<(u64, &String)> = self
+            .pending_traces
+            .iter()
+            .filter(|(_, p)| {
+                p.accepted_hash.is_some()
+                    && p.draw.as_ref().is_none_or(|d| {
+                        d.audited
+                            && (now <= d.deadline_daa + keryx_miner::trace::OPENING_BACKLOG_CAP_DAA
+                                || p.attn.as_ref().is_some_and(|a| a.next_phase_owed() || a.awaiting_draw().is_some()))
+                    })
+            })
+            .map(|(t, p)| (p.draw.as_ref().map_or(0, |d| d.deadline_daa), t))
+            .collect();
+        due.sort_unstable();
+        let response_txids: Vec<String> = due.into_iter().take(AWAITED_POLL_MAX).map(|(_, t)| t.clone()).collect();
+        if !response_txids.is_empty() {
+            self.client_send(GetAwaitedOpeningsRequestMessage { response_txids }).await?;
+        }
+        Ok(())
+    }
+
+    /// Takes the node's seed and deadline for each opening it awaits: the miner's own draw is
+    /// only an estimate of the node's ledger.
+    fn apply_awaited_openings(&mut self, resp: &crate::proto::GetAwaitedOpeningsResponseMessage) {
+        let mut changed: Vec<String> = Vec::new();
+        let mut resend: Vec<(String, keryx_miner::trace_store::StoredOpening, u64)> = Vec::new();
+        for o in resp.openings.iter() {
+            let idle = !self.opening_inflight.values().any(|f| f.response_txid == o.response_txid)
+                && self.replay_rx.as_ref().is_none_or(|j| j.response_txid != o.response_txid);
+            let (Some(txid_bytes), Some(seed)) = (hash32(&o.response_txid), hash32(&o.seed)) else { continue };
+            let Some(p) = self.pending_traces.get(&o.response_txid) else { continue };
+            let same_seed = p.draw.as_ref().is_some_and(|d| d.seed == seed);
+            let seeded = if same_seed {
+                None
+            } else {
+                let from = p.accepted_hash.as_deref().and_then(|h| self.chain_log.iter().position(|e| e.hash == h)).unwrap_or(0);
+                let Some(e) = self
+                    .chain_log
+                    .iter()
+                    .skip(from)
+                    .find(|e| hash32(&e.hash).is_some_and(|b| keryx_miner::trace::trace_seed(&b, &txid_bytes) == seed))
+                else {
+                    log::debug!("Trace: response {} — the node's seed block is not in the chain log yet", o.response_txid);
+                    continue;
+                };
+                Some((e.hash.clone(), e.daa.unwrap_or(0)))
+            };
+            let p = self.pending_traces.get_mut(&o.response_txid).unwrap();
+            if let Some((seed_hash, seed_daa)) = seeded {
+                info!("Trace: response {} — audit seeded by block {} as the node does, opening due by DAA {}", o.response_txid, seed_hash, o.deadline_daa);
+                let kept = p.opening.as_ref().is_some_and(|op| op.seed_hash == seed_hash);
+                p.draw = Some(TraceDraw {
+                    seed_hash,
+                    seed_daa,
+                    accepted_daa: o.accepted_daa,
+                    seed,
+                    audited: true,
+                    deadline_daa: o.deadline_daa,
+                    opened: kept,
+                    replay_failures: 0,
+                    retry_at: None,
+                });
+                if !kept {
+                    p.attn = None;
+                    p.opening = None;
+                    self.opening_inflight.retain(|_, f| f.response_txid != o.response_txid);
+                }
+                changed.push(o.response_txid.clone());
+                continue;
+            }
+            let d = p.draw.as_mut().unwrap();
+            let in_phases = p.attn.as_ref().is_some_and(|a| !a.path.is_empty());
+            if d.accepted_daa != o.accepted_daa {
+                d.accepted_daa = o.accepted_daa;
+                changed.push(o.response_txid.clone());
+            }
+            if !d.audited || (!in_phases && d.deadline_daa != o.deadline_daa) {
+                d.audited = true;
+                d.deadline_daa = o.deadline_daa;
+                changed.push(o.response_txid.clone());
+            }
+            if d.opened && idle && !in_phases && p.attn.is_none() {
+                match p.opening.as_ref().filter(|op| op.seed_hash == d.seed_hash) {
+                    Some(op) => resend.push((o.response_txid.clone(), op.clone(), o.deadline_daa)),
+                    None => {
+                        info!("Trace: the node still awaits the opening of response {} — replaying it", o.response_txid);
+                        d.opened = false;
+                        changed.push(o.response_txid.clone());
+                    }
+                }
+            }
+            if let Some(a) = p.attn.as_mut().filter(|_| in_phases) {
+                if !o.attention_path.is_empty() && a.path != o.attention_path {
+                    warn!("Trace: response {} — attention path {:?} differs from the node's {:?}", o.response_txid, a.path, o.attention_path);
+                }
+                if a.deadline_daa != o.deadline_daa {
+                    a.deadline_daa = o.deadline_daa;
+                    changed.push(o.response_txid.clone());
+                }
+            }
+        }
+        for (response_txid, op, deadline_daa) in resend {
+            info!("Trace: the node still awaits the opening of response {} — sending it again", response_txid);
+            for payload in std::iter::once(&op.payload).chain(op.extra.iter()) {
+                let tx = crate::proto::RpcTransaction {
+                    version: 0,
+                    inputs: vec![],
+                    outputs: vec![],
+                    lock_time: 0,
+                    subnetwork_id: keryx_inference::SUBNETWORK_ID_AI_OPENING_HEX.to_string(),
+                    gas: 0,
+                    payload: payload.clone(),
+                    mass: 0,
+                    verbose_data: None,
+                };
+                if let Some(txid) = Self::compute_rpc_txid(&tx) {
+                    let inflight = OpeningInflight {
+                        tx,
+                        response_txid: response_txid.clone(),
+                        deadline_daa,
+                        attempts: 1,
+                        last: std::time::Instant::now() - std::time::Duration::from_secs(60),
+                    };
+                    self.opening_inflight.insert(txid, inflight);
+                }
+            }
+        }
+        changed.dedup();
+        for o in resp.openings.iter() {
+            for f in self.opening_inflight.values_mut().filter(|f| f.response_txid == o.response_txid) {
+                f.deadline_daa = o.deadline_daa;
+            }
+        }
+        for txid in changed {
+            self.persist_trace(&txid);
         }
     }
 
@@ -2554,6 +2754,10 @@ impl KeryxdHandler {
                 }
             }
             Payload::NewBlockTemplateNotification(_) => self.client_get_block_template().await?,
+            Payload::GetAwaitedOpeningsResponse(resp) => match resp.error.as_ref() {
+                Some(e) => log::debug!("Trace: awaited openings unavailable: {}", e.message),
+                None => self.apply_awaited_openings(&resp),
+            },
             Payload::GetServiceStrikesResponse(resp) => match resp.error.as_ref() {
                 Some(e) => warn!("service-bond status unavailable: {}", e.message),
                 None => self.report_service_strikes(&resp),
@@ -2886,6 +3090,7 @@ impl KeryxdHandler {
             }
             Payload::GetInfoResponse(info) => {
                 info!("Keryxd version: {}", info.server_version);
+                self.node_awaited_openings = version_at_least(&info.server_version, AWAITED_OPENINGS_SINCE);
                 // Register for all notification types:
                 // - NewBlockTemplate drives the mining loop
                 // - BlockAdded lets us scan confirmed blocks for AiRequests
@@ -3176,6 +3381,14 @@ mod speeds {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn awaited_openings_need_a_recent_node() {
+        assert!(super::version_at_least("1.6.6", (1, 6, 6)));
+        assert!(super::version_at_least("1.7.0-PoM", (1, 6, 6)));
+        assert!(!super::version_at_least("1.6.5", (1, 6, 6)));
+        assert!(!super::version_at_least("", (1, 6, 6)));
+    }
+
     use super::PrivateRequest;
     use keryx_inference::{escrow_pubkey_of, open_response, seal_request, AiRequestPayload};
 
